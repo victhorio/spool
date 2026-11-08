@@ -1,14 +1,55 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    marker::PhantomData,
+};
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{
+    Deserialize, Deserializer,
+    de::{self, SeqAccess, Visitor},
+};
 use serde_json::value::RawValue;
 use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::error::ApiError;
+
+const MAX_MESSAGES: usize = 100_000;
+
+fn message_list<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Limited<T>(PhantomData<T>);
+
+    impl<'de, T: Deserialize<'de>> Visitor<'de> for Limited<T> {
+        type Value = Vec<T>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            write!(formatter, "an array of at most {MAX_MESSAGES} messages")
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, mut sequence: A) -> Result<Vec<T>, A::Error> {
+            let mut values = Vec::new();
+            while values.len() < MAX_MESSAGES {
+                match sequence.next_element()? {
+                    Some(value) => values.push(value),
+                    None => return Ok(values),
+                }
+            }
+            if sequence.next_element::<de::IgnoredAny>()?.is_some() {
+                return Err(de::Error::custom("message limit exceeded"));
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_seq(Limited(PhantomData))
+}
 
 #[derive(Deserialize)]
 struct Envelope {
@@ -19,13 +60,24 @@ struct Envelope {
     collector_version: String,
     captured_at: DateTime<Utc>,
     info: Box<RawValue>,
+    #[serde(deserialize_with = "message_list")]
     message_order: Vec<String>,
+    #[serde(deserialize_with = "message_list")]
     upsert_messages: Vec<Box<RawValue>>,
 }
 
 #[derive(Deserialize)]
 struct ObjectId {
     id: String,
+}
+
+impl ObjectId {
+    fn parse(document: &RawValue) -> Result<Self, ApiError> {
+        if !document.get().starts_with('{') {
+            return Err(ApiError::manifest());
+        }
+        serde_json::from_str(document.get()).map_err(|_| ApiError::manifest())
+    }
 }
 
 struct Message {
@@ -46,6 +98,9 @@ pub(crate) fn valid_id(id: &str) -> bool {
 
 impl Snapshot {
     pub fn parse(body: &[u8], session_id: &str) -> Result<Self, ApiError> {
+        if body.trim_ascii_start().first() != Some(&b'{') {
+            return Err(ApiError::malformed());
+        }
         let mut envelope: Envelope =
             serde_json::from_slice(body).map_err(|_| ApiError::malformed())?;
         if !valid_id(session_id)
@@ -67,8 +122,7 @@ impl Snapshot {
                     .ok_or_else(ApiError::malformed)
             })
             .transpose()?;
-        let info: ObjectId =
-            serde_json::from_str(envelope.info.get()).map_err(|_| ApiError::manifest())?;
+        let info = ObjectId::parse(&envelope.info)?;
         if info.id != session_id {
             return Err(ApiError::manifest());
         }
@@ -80,8 +134,7 @@ impl Snapshot {
         }
         let mut messages = HashMap::with_capacity(envelope.upsert_messages.len());
         for payload in std::mem::take(&mut envelope.upsert_messages) {
-            let message: ObjectId =
-                serde_json::from_str(payload.get()).map_err(|_| ApiError::manifest())?;
+            let message = ObjectId::parse(&payload)?;
             if !order.contains(message.id.as_str()) || messages.contains_key(&message.id) {
                 return Err(ApiError::manifest());
             }
@@ -125,7 +178,10 @@ pub(crate) async fn accept(
     snapshot: Snapshot,
 ) -> Result<Accepted, ApiError> {
     let envelope = &snapshot.envelope;
-    let mut tx = pool.begin().await?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|error| ApiError::database("snapshot.begin", error))?;
     let created = if snapshot.base.is_none() {
         sqlx::query(
             "INSERT INTO sessions \
@@ -141,7 +197,7 @@ pub(crate) async fn accept(
         .bind(&envelope.collector_version)
         .bind(envelope.captured_at)
         .execute(&mut *tx)
-        .await?
+        .await.map_err(|error| ApiError::database("snapshot.create", error))?
         .rows_affected() == 1
     } else {
         false
@@ -153,7 +209,8 @@ pub(crate) async fn accept(
     .bind(source)
     .bind(session)
     .fetch_optional(&mut *tx)
-    .await?;
+    .await
+    .map_err(|error| ApiError::database("snapshot.lock", error))?;
     let Some(current) = current else {
         return Err(ApiError::conflict(None));
     };
@@ -171,16 +228,16 @@ pub(crate) async fn accept(
             .checked_add(1)
             .ok_or_else(|| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "revision_exhausted"))?
     };
-    let existing: Vec<MessageRow> = sqlx::query_as(
+    let rows: Vec<MessageRow> = sqlx::query_as(
         "SELECT message_id, position, payload_hash FROM messages WHERE source_id = $1 AND session_id = $2",
     )
     .bind(source)
     .bind(session)
     .fetch_all(&mut *tx)
-    .await?;
-    let existing: HashMap<_, _> = existing
-        .into_iter()
-        .map(|message| (message.message_id.clone(), message))
+    .await.map_err(|error| ApiError::database("snapshot.messages", error))?;
+    let mut existing: HashMap<_, _> = rows
+        .iter()
+        .map(|message| (message.message_id.as_str(), message))
         .collect();
     let mut ids = Vec::new();
     let mut positions = Vec::new();
@@ -193,7 +250,7 @@ pub(crate) async fn accept(
         || existing.len() != envelope.message_order.len();
     for (position, id) in envelope.message_order.iter().enumerate() {
         let position = i32::try_from(position).map_err(|_| ApiError::manifest())?;
-        let old = existing.get(id);
+        let old = existing.remove(id.as_str());
         let supplied = snapshot.messages.get(id);
         if old.is_none() && supplied.is_none() {
             return Err(ApiError::manifest());
@@ -214,14 +271,19 @@ pub(crate) async fn accept(
     }
     // Resolve every manifest reference before any destructive write. The deferred
     // position constraint permits swaps without temporary positions or rewrites.
-    sqlx::query(
-        "DELETE FROM messages WHERE source_id = $1 AND session_id = $2 AND NOT (message_id = ANY($3::text[]))",
-    )
-    .bind(source)
-    .bind(session)
-    .bind(&envelope.message_order)
-    .execute(&mut *tx)
-    .await?;
+    if !existing.is_empty() {
+        let removed: Vec<_> = existing.into_keys().collect();
+        sqlx::query(
+            "DELETE FROM messages USING unnest($3::text[]) AS removed(id) \
+             WHERE source_id = $1 AND session_id = $2 AND message_id = removed.id",
+        )
+        .bind(source)
+        .bind(session)
+        .bind(&removed)
+        .execute(&mut *tx)
+        .await
+        .map_err(|error| ApiError::database("snapshot.delete", error))?;
+    }
     if !ids.is_empty() {
         sqlx::query(
             "INSERT INTO messages (source_id, session_id, message_id, position, payload, payload_hash) \
@@ -237,7 +299,7 @@ pub(crate) async fn accept(
         .bind(&payloads)
         .bind(&hashes)
         .execute(&mut *tx)
-        .await?;
+        .await.map_err(|error| ApiError::database("snapshot.upsert", error))?;
     }
     if !moved_ids.is_empty() {
         sqlx::query(
@@ -250,7 +312,8 @@ pub(crate) async fn accept(
         .bind(&moved_ids)
         .bind(&moved_positions)
         .execute(&mut *tx)
-        .await?;
+        .await
+        .map_err(|error| ApiError::database("snapshot.reorder", error))?;
     }
     if !created {
         sqlx::query(
@@ -268,9 +331,11 @@ pub(crate) async fn accept(
         .bind(&envelope.collector_version)
         .bind(envelope.captured_at)
         .execute(&mut *tx)
-        .await?;
+        .await.map_err(|error| ApiError::database("snapshot.update", error))?;
     }
-    tx.commit().await?;
+    tx.commit()
+        .await
+        .map_err(|error| ApiError::database("snapshot.commit", error))?;
     Ok(Accepted {
         revision,
         changed,

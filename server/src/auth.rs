@@ -50,7 +50,8 @@ pub(crate) async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> Result<U
         sqlx::query_scalar("SELECT token_hash FROM sources WHERE id = $1 AND revoked_at IS NULL")
             .bind(source)
             .fetch_optional(pool)
-            .await?;
+            .await
+            .map_err(|error| ApiError::database("auth.lookup", error))?;
     let actual = Sha256::digest(&secret);
     if !expected
         .as_deref()
@@ -61,6 +62,7 @@ pub(crate) async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> Result<U
     sqlx::query("UPDATE sources SET last_seen_at = now() WHERE id = $1")
         .bind(source)
         .execute(pool)
-        .await?;
+        .await
+        .map_err(|error| ApiError::database("auth.touch", error))?;
     Ok(source)
 }

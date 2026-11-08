@@ -89,13 +89,18 @@ Errors have shape `{"error":{"code":"…"}}`:
 - 422 `invalid_manifest`
 - 503 `busy` / `database_unavailable` / `unavailable`
 
-Uploads require `application/json`, no compression, and at most 64 MiB. Two
-uploads are admitted before body allocation; body reading has a 30-second limit.
+Uploads require an object envelope, object-valued info/messages, `application/json`,
+no compression, and at most 16 MiB. Each message array is limited to 100,000
+entries during decoding; exceeding that count returns 400 `malformed_request`.
+Two uploads are admitted before body allocation; body reading has a 30-second
+limit. These bounds budget for decoding and database work, not just wire bytes.
 Oversized sessions remain unsynced, never truncated. Retry transient connection,
 429 and 5xx failures with bounded backoff. Invalid credentials disable collection
 until reload; request-specific permanent errors are logged and left for a later
-sweep, without blocking other sessions. Logs contain IDs/counts, not transcripts
-or credentials. Source clocks do not arbitrate writes.
+sweep, without blocking other sessions. Logs contain IDs/counts and fixed
+operation/error classifications, not transcripts, credentials or raw error text.
+Database failures also record SQLSTATE when available; public errors stay generic.
+Source clocks do not arbitrate writes.
 
 ## Capture and retention
 

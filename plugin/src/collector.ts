@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { setTimeout as delay } from "node:timers/promises"
-import { OpenCode, isSessionNotFoundError, type OpenCodeClient } from "@opencode/client"
+import { ClientError, OpenCode, isSessionNotFoundError, type OpenCodeClient } from "@opencode/client"
 import { Service } from "@opencode/client/service"
 import type { Plugin } from "@opencode/plugin"
 import type { Config } from "./config"
@@ -10,6 +10,28 @@ interface Inventory { sessions: { session_id: string; revision: string; deleted:
 
 class SyncError extends Error {
   constructor(readonly code: string, readonly retryable = true, readonly revision?: string | null) { super(code) }
+}
+
+function errorCode(error: unknown): string {
+  if (error instanceof SyncError) return error.code
+  if (error instanceof ClientError) {
+    switch (error.reason) {
+      case "Transport": case "UnexpectedStatus": case "UnsupportedContentType": case "MalformedResponse": case "SseEventTooLarge":
+        return `sdk_${error.reason}`
+    }
+  }
+  if (error && typeof error === "object" && "_tag" in error) {
+    switch (error._tag) {
+      case "UnauthorizedError": case "InvalidRequestError": case "ServiceUnavailableError": case "LocationNotFoundError": case "InvalidCursorError": case "UnknownError":
+        return `sdk_${error._tag}`
+    }
+  }
+  if (error instanceof Error) {
+    if (error.name === "AbortError") return "aborted"
+    if (error.name === "TimeoutError") return "timeout"
+    if (error instanceof TypeError) return "type_error"
+  }
+  return "unexpected_error"
 }
 
 function digest(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex") }
@@ -34,6 +56,7 @@ export class Collector {
   private wake?: () => void
   private nextSweep = 0
   private failures = 0
+  private operation = "opencode_connect"
 
   constructor(private readonly config: Config, private readonly version: string) {}
 
@@ -82,8 +105,8 @@ export class Collector {
             this.activity.delete(id)
           } else this.mark(id)
         }
-      } catch {
-        if (!signal.aborted) this.log("event_stream_interrupted")
+      } catch (error) {
+        if (!signal.aborted) this.log("event_stream_interrupted", { code: errorCode(error) })
       }
       if (!signal.aborted) {
         this.nextSweep = 0
@@ -99,6 +122,7 @@ export class Collector {
 
   private async connect(): Promise<OpenCodeClient> {
     if (this.client) return this.client
+    this.operation = "opencode_connect"
     const endpoint = this.config.opencodeUrl
       ? { url: this.config.opencodeUrl, auth: { type: "basic" as const, username: "opencode", password: this.config.opencodePassword! } }
       : await Service.discover({ file: this.config.serviceFile, version: this.version })
@@ -131,6 +155,7 @@ export class Collector {
     const client = await this.connect()
     let cursor: string | null = null
     do {
+      this.operation = "inventory_read"
       const inventory: Inventory = await this.request(`sessions${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`)
       for (const item of inventory.sessions) {
         this.revisions.set(item.session_id, item.revision)
@@ -140,6 +165,7 @@ export class Collector {
     } while (cursor && !this.lifetime.signal.aborted)
     let localCursor: string | undefined
     do {
+      this.operation = "session_list"
       const page = await client.session.list({ limit: 200, ...(localCursor ? { cursor: localCursor } : {}) }, { signal: this.signal() })
       for (const session of page.data) if (!this.purged.has(session.id)) this.backfill.add(session.id)
       localCursor = page.cursor.next ?? undefined
@@ -150,10 +176,12 @@ export class Collector {
   private async capture(id: string): Promise<void> {
     const ctx = this.members.keys().next().value!
     const key = `${this.config.cachePrefix}${id}`
+    this.operation = "checkpoint_read"
     const saved = checkpoint(await ctx.storage.get(key))
     const base = this.revisions.get(id) ?? saved?.revision ?? null
     const known = saved?.revision === base ? saved.hashes : undefined
     const client = await this.connect()
+    this.operation = "session_export"
     const transcript = await client.experimental.session.export({ sessionID: id }, { signal: this.signal() })
     if (this.dirty.has(id)) return
     const hashes: Record<string, string> = Object.create(null)
@@ -161,6 +189,7 @@ export class Collector {
       hashes[message.id] = digest(message)
       return hashes[message.id] !== known?.[message.id]
     })
+    this.operation = "snapshot_upload"
     const result = await this.request<{ revision: string; changed: boolean }>(`sessions/${encodeURIComponent(id)}/snapshot`, {
       method: "POST",
       body: JSON.stringify({
@@ -175,6 +204,7 @@ export class Collector {
       }),
     })
     this.revisions.set(id, result.revision)
+    this.operation = "checkpoint_write"
     await ctx.storage.set(key, { revision: result.revision, hashes })
     this.log("captured", { session_id: id, revision: result.revision, messages: transcript.messages.length, uploaded_messages: upserts.length })
   }
@@ -227,7 +257,7 @@ export class Collector {
           this.purged.add(current)
           continue
         } else {
-          this.log("sync_failed", { session_id: current, code: error instanceof SyncError ? error.code : "connection_or_source_error" })
+          this.log("sync_failed", { session_id: current, operation: this.operation, code: errorCode(error) })
           if (error instanceof SyncError && !error.retryable) {
             if (!current || ["http_401", "http_403", "opencode_host_mismatch"].includes(error.code)) {
               this.log("disabled_until_reload")

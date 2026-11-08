@@ -44,6 +44,8 @@ then exercises the real plugin → HTTP → release container → PostgreSQL pat
 - Local deletion retention and purge without resurrection or cross-source damage.
 - Rust HTTP/CLI regressions against real PostgreSQL, including upload/purge races, rollback,
   raw JSON fidelity, credential rotation/revocation and request/admission limits.
+- Forced generic plans with 100,000-message confirmations, reversal and truncation;
+  collection-count limits, object shapes, and exact 16 MiB body-limit boundaries.
 
 The harness uses one-second sweeps to test reconciliation promptly. It uses a
 local HTTP fault proxy; no service dependencies or OpenCode exports are mocked.

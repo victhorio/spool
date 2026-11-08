@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::{auth, error::ApiError, snapshot};
 
-const MAX_BODY: usize = 64 * 1024 * 1024;
+const MAX_BODY: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 struct App {
@@ -116,7 +116,8 @@ async fn inventory(
     .bind(after)
     .bind(i64::from(limit) + 1)
     .fetch_all(&app.pool)
-    .await?;
+    .await
+    .map_err(|error| ApiError::database("inventory.fetch", error))?;
     let next_cursor = if rows.len() > usize::from(limit) {
         rows.pop();
         rows.last().map(|row| cursor(source, &row.session_id))

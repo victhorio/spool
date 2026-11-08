@@ -31,10 +31,25 @@ impl ApiError {
             revision: Some(current),
         }
     }
-}
 
-impl From<sqlx::Error> for ApiError {
-    fn from(_: sqlx::Error) -> Self {
+    pub fn database(operation: &'static str, error: sqlx::Error) -> Self {
+        let class = match &error {
+            sqlx::Error::Database(_) => "database",
+            sqlx::Error::Io(_) => "io",
+            sqlx::Error::Tls(_) => "tls",
+            sqlx::Error::PoolTimedOut => "pool_timeout",
+            sqlx::Error::PoolClosed => "pool_closed",
+            sqlx::Error::Protocol(_) => "protocol",
+            _ => "client",
+        };
+        let sqlstate = error.as_database_error().and_then(|error| error.code());
+        eprintln!(
+            "{}",
+            json!({
+                "event": "database_error", "operation": operation,
+                "class": class, "sqlstate": sqlstate,
+            })
+        );
         Self::new(StatusCode::SERVICE_UNAVAILABLE, "database_unavailable")
     }
 }

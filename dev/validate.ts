@@ -2,13 +2,14 @@ import assert from "node:assert/strict"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import path from "node:path"
 import { setTimeout as delay } from "node:timers/promises"
+import { isDeepStrictEqual } from "node:util"
 import { command, waitFor } from "./command"
 import { activate, mutateWithoutEvent, seed, type Host } from "./fixtures"
 import { LocalStack, type Source } from "./stack"
 
 interface Envelope {
   base_revision: string | null
-  info: { id: string }
+  info: { id: string; metadata?: unknown }
   message_order: string[]
   upsert_messages: { id: string }[]
 }
@@ -25,7 +26,7 @@ await mkdir(local, { recursive: true })
 const root = await mkdtemp(path.join(local, "validate-"))
 const stack = new LocalStack(root)
 const releaseSignals = stack.handleSignals()
-const records: { session: string; supplied: number; status: number }[] = []
+const records: { session: string; metadata: unknown; supplied: number; status: number }[] = []
 let intercept: ((body: Envelope, request: Request) => Promise<void>) | undefined
 let loseAcknowledgement: { session: string; mutate: () => void } | undefined
 const proxy = Bun.serve({
@@ -38,7 +39,7 @@ const proxy = Bun.serve({
     const response = await fetch(`${stack.url}${url.pathname}${url.search}`, {
       method: request.method, headers: request.headers, body, redirect: "error", signal: AbortSignal.timeout(5_000),
     }).catch(() => Response.json({ error: { code: "injected_outage" } }, { status: 503 }))
-    if (envelope) records.push({ session: envelope.info.id, supplied: envelope.upsert_messages.length, status: response.status })
+    if (envelope) records.push({ session: envelope.info.id, metadata: envelope.info.metadata, supplied: envelope.upsert_messages.length, status: response.status })
     if (envelope?.info.id === loseAcknowledgement?.session && loseAcknowledgement && response.ok) {
       const fault = loseAcknowledgement
       loseAcknowledgement = undefined
@@ -89,10 +90,14 @@ try {
   assert.equal(pluginLog.split('"event":"connected"').length - 1, 1, "two active Locations must share one collector")
   pass("real plugin exports ordered structured messages, inline attachment, tool results, Unicode and NUL")
 
+  const metadataStart = records.length
   await host.client.session.update({ sessionID: id, metadata: { fixture: { updated: true } } })
+  const metadata = (await host.client.session.get({ sessionID: id })).metadata
   let after = await converged(host, source, id)
   assert.deepEqual(after.messages.map((message) => message.xmin), before.messages.map((message) => message.xmin))
-  assert(records.some((record) => record.session === id && record.supplied === 0 && record.status === 200))
+  const metadataUpload = await waitFor("first accepted metadata upload", async () => records.slice(metadataStart).find((record) =>
+    record.session === id && record.status === 200 && isDeepStrictEqual(record.metadata, metadata)), 30_000, stack.signal)
+  assert.equal(metadataUpload.supplied, 0, "the first accepted upload carrying the new metadata must send no message bodies")
   pass("metadata-only captures send no message bodies and leave PostgreSQL message rows unchanged")
 
   const updated = (await host.client.session.get({ sessionID: id })).time.updated

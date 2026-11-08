@@ -106,6 +106,12 @@ async fn postgres_http_contract() {
         .execute(&admin)
         .await
         .unwrap();
+    sqlx::query(&format!(
+        "ALTER DATABASE {database} SET plan_cache_mode = force_generic_plan"
+    ))
+    .execute(&admin)
+    .await
+    .unwrap();
     let mut url = reqwest::Url::parse(&database_url).unwrap();
     url.set_path(&database);
     let pool = connect(url.as_str()).await.unwrap();
@@ -129,6 +135,7 @@ async fn postgres_http_contract() {
         let (_, outage_token) = harness.source("outage");
         isolation_and_sparse_mutations(&harness).await;
         revisions_and_races(&harness).await;
+        large_sessions(&harness).await;
         validation_and_raw_json(&harness).await;
         credentials_and_purge(&harness).await;
         admission_and_limits(&harness).await;
@@ -452,7 +459,31 @@ async fn validation_and_raw_json(h: &Harness) {
             StatusCode::BAD_REQUEST
         );
     }
+    let positional = json!([
+        "1", "opencode.v2", "test-upstream", "test-collector",
+        "2026-11-08T10:00:00Z", {"id": "valid"}, ["old"], []
+    ]);
+    assert_eq!(
+        h.post(&token, "valid", &positional).await.0,
+        StatusCode::BAD_REQUEST
+    );
+    for field in ["message_order", "upsert_messages"] {
+        let mut bad = good.clone();
+        bad[field] = if field == "message_order" {
+            json!(vec!["old"; 100_001])
+        } else {
+            json!(vec![json!({"id": "old"}); 100_001])
+        };
+        assert_eq!(
+            h.post(&token, "valid", &bad).await.0,
+            StatusCode::BAD_REQUEST
+        );
+    }
+    let mut array_info = good.clone();
+    array_info["info"] = json!(["valid"]);
     let invalids = [
+        array_info,
+        snapshot("valid", Some("1"), &["old"], json!([["old"]])),
         snapshot("wrong", Some("1"), &["old"], json!([])),
         snapshot("valid", Some("1"), &["old", "old"], json!([])),
         snapshot(
@@ -525,6 +556,58 @@ async fn validation_and_raw_json(h: &Harness) {
     .await
     .unwrap();
     assert_eq!(hash, Sha256::digest(raw_message.as_bytes()).as_slice());
+}
+
+async fn large_sessions(h: &Harness) {
+    let (source, token) = h.source("large session");
+    let order: Vec<_> = (0..100_000).map(|index| format!("m{index}")).collect();
+    let ids: Vec<_> = order.iter().map(String::as_str).collect();
+    let mut body = snapshot(
+        "large",
+        None,
+        &ids,
+        Value::Array(order.iter().map(|id| json!({"id": id})).collect()),
+    );
+    assert_eq!(h.post(&token, "large", &body).await.0, StatusCode::CREATED);
+    body["upsert_messages"] = json!([]);
+    let first = h.messages(source, "large").await;
+    for revision in 1..=6 {
+        body["base_revision"] = json!(revision.to_string());
+        assert_eq!(
+            h.post(&token, "large", &body).await,
+            (
+                StatusCode::OK,
+                json!({"revision": (revision + 1).to_string(), "changed": false})
+            )
+        );
+    }
+    assert_eq!(h.messages(source, "large").await, first);
+    body["base_revision"] = json!("7");
+    body["message_order"].as_array_mut().unwrap().reverse();
+    assert_eq!(h.post(&token, "large", &body).await.0, StatusCode::OK);
+    let reversed = h.messages(source, "large").await;
+    assert_eq!(
+        reversed
+            .iter()
+            .map(|row| (&row.0, row.1))
+            .collect::<Vec<_>>(),
+        order
+            .iter()
+            .rev()
+            .enumerate()
+            .map(|(position, id)| (id, position as i32))
+            .collect::<Vec<_>>()
+    );
+    body["base_revision"] = json!("8");
+    body["message_order"].as_array_mut().unwrap().truncate(3);
+    assert_eq!(h.post(&token, "large", &body).await.0, StatusCode::OK);
+    let rows = h.messages(source, "large").await;
+    assert_eq!(
+        rows.iter()
+            .map(|row| (row.0.as_str(), row.1))
+            .collect::<Vec<_>>(),
+        [("m99999", 0), ("m99998", 1), ("m99997", 2)]
+    );
 }
 
 async fn credentials_and_purge(h: &Harness) {
@@ -709,7 +792,7 @@ async fn admission_and_limits(h: &Harness) {
         .post(&url)
         .bearer_auth(&token)
         .header("content-type", "application/json")
-        .body(vec![b' '; 64 * 1024 * 1024 + 1])
+        .body(vec![b' '; 16 * 1024 * 1024 + 1])
         .send()
         .await
         .unwrap();
@@ -719,7 +802,7 @@ async fn admission_and_limits(h: &Harness) {
         .unwrap();
     chunked.write_all(format!("POST /v1/sync/sessions/limits/snapshot HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
     let chunk = vec![b' '; 1024 * 1024];
-    for _ in 0..64 {
+    for _ in 0..16 {
         chunked.write_all(b"100000\r\n").await.unwrap();
         chunked.write_all(&chunk).await.unwrap();
         chunked.write_all(b"\r\n").await.unwrap();
@@ -735,12 +818,14 @@ async fn admission_and_limits(h: &Harness) {
     .unwrap();
     assert!(response.starts_with("HTTP/1.1 413"));
     assert!(response.contains("payload_too_large"));
-    let large = snapshot(
+    let mut large = snapshot(
         "limits",
         None,
         &["large"],
-        json!([{"id": "large", "text": "x".repeat(3 * 1024 * 1024)}]),
+        json!([{"id": "large", "text": ""}]),
     );
+    let empty_length = serde_json::to_vec(&large).unwrap().len();
+    large["upsert_messages"][0]["text"] = json!("x".repeat(16 * 1024 * 1024 - empty_length));
     assert_eq!(
         h.post(&token, "limits", &large).await.0,
         StatusCode::CREATED
