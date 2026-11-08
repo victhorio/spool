@@ -1,0 +1,17 @@
+{
+  "name": "spool",
+  "private": true,
+  "type": "module",
+  "workspaces": ["plugin"],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "local:up": "bun dev/stack.ts up",
+    "local:down": "bun dev/stack.ts down",
+    "validate": "bun dev/validate.ts"
+  },
+  "devDependencies": {
+    "@opencode/client": "2.2.5",
+    "@types/bun": "1.4.4",
+    "typescript": "7.0.2"
+  }
+}
