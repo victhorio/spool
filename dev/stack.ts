@@ -3,7 +3,7 @@ import { chmod, mkdir, readdir } from "node:fs/promises"
 import path from "node:path"
 import { Service } from "@opencode/client/service"
 import { command, waitFor } from "./command"
-import { startOpenCode, opencodeVersion } from "./opencode"
+import { startOpenCode } from "./opencode"
 
 export interface Source { source_id: string; token: string }
 
@@ -103,7 +103,7 @@ export class LocalStack {
       const files = await readdir(state).catch(() => [])
       for (const file of files.filter((name) => /^service(?:-[\w.-]+)?\.json$/.test(name))) {
         const registration = path.join(state, file)
-        if (await Service.discover({ file: registration, version: opencodeVersion })) await Service.stop({ file: registration })
+        if (await Service.discover({ file: registration })) await Service.stop({ file: registration })
       }
     }
     await this.dockerCompose("down", ...(removeVolumes ? ["--volumes"] : []), "--remove-orphans")

@@ -1,7 +1,10 @@
 # Local development
 
-Requires Docker with Compose, Rust, Bun and **OpenCode 2.2.5** on PATH. Install
-JavaScript dependencies with `bun install --frozen-lockfile`.
+Requires Docker with Compose, Rust, Bun and OpenCode on PATH. Install JavaScript
+dependencies with `bun install --frozen-lockfile`. The harness runs the installed
+OpenCode and reports its version; SDK dependency pins do not restrict the host's
+release version. Compatibility depends on the public plugin, service, session
+list/export and event APIs exercised by validation.
 
 ## Persistent sandbox
 
@@ -15,8 +18,8 @@ Interrupting startup waits for in-flight container creation before cleaning up.
 
 OpenCode's authenticated registration, config, cache, data, HOME, XDG paths,
 temporary directory and plugin checkpoints all live under `.local/dev/`.
-Both the version check and server inherit only PATH, not model keys, personal
-configs or credentials, and run with an isolated working directory.
+The server inherits only PATH, not model keys, personal configs or credentials,
+and runs with an isolated working directory.
 Model downloads, updates and project config are disabled. The synthetic helpers
 in `dev/fixtures.ts` seed structured conversations through the import API without
 model calls. Do not use this sandbox to test against real conversations.
@@ -62,7 +65,7 @@ one. `bun run validate` supplies the local container URL automatically.
 
 ## Plugin configuration and hosting
 
-OpenCode 2.2.5 config uses a directory package (not its `.ts` entrypoint):
+OpenCode config uses a directory package (not its `.ts` entrypoint):
 
 ```json
 {

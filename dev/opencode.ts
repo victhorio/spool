@@ -3,9 +3,7 @@ import { mkdir, readdir } from "node:fs/promises"
 import path from "node:path"
 import { OpenCode } from "@opencode/client"
 import { Service } from "@opencode/client/service"
-import { command, waitFor } from "./command"
-
-export const opencodeVersion = "2.2.5"
+import { waitFor } from "./command"
 
 export async function startOpenCode(root: string, plugin: string, options: Record<string, unknown>, signal: AbortSignal) {
   signal.throwIfAborted()
@@ -29,8 +27,6 @@ export async function startOpenCode(root: string, plugin: string, options: Recor
     OPENCODE_FILEWATCHER_DISABLE: "1",
     OPENCODE_DISABLE_FFF: "1",
   }
-  const version = await command(["opencode", "--version"], cwd, env)
-  if (version !== `opencode v${opencodeVersion}`) throw new Error(`Validation requires OpenCode ${opencodeVersion}; found ${version}`)
   signal.throwIfAborted()
   const log = openSync(path.join(root, "opencode.log"), "a", 0o600)
   const child = Bun.spawn(["opencode", "serve", "--service", "--hostname", "127.0.0.1", "--port", "0"], {
@@ -58,7 +54,7 @@ export async function startOpenCode(root: string, plugin: string, options: Recor
       const files = await readdir(directory).catch(() => [])
       const registration = files.find((name) => /^service(?:-[\w.-]+)?\.json$/.test(name))
       if (!registration) return undefined
-      return Service.discover({ file: path.join(directory, registration), version: opencodeVersion })
+      return Service.discover({ file: path.join(directory, registration) })
     }, 30_000, signal)
     const client = OpenCode.make({
       baseUrl: endpoint.url,
@@ -68,7 +64,9 @@ export async function startOpenCode(root: string, plugin: string, options: Recor
         { preconnect: fetch.preconnect },
       ),
     })
-    if ((await client.server.info()).pid !== child.pid) throw new Error("Discovered a different OpenCode process")
+    const info = await client.server.info()
+    if (info.pid !== child.pid) throw new Error("Discovered a different OpenCode process")
+    console.log(`Isolated OpenCode ${info.version}`)
     return { child, client, endpoint, root, signal, stop }
   } catch (error) {
     await stop()

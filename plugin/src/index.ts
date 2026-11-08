@@ -10,7 +10,6 @@ const collectors = shared[registry] ??= new Map<string, Collector>()
 export default Plugin.define({
   id: "spool",
   async setup(ctx) {
-    if (ctx.app.version !== "2.2.5") throw new Error("Spool currently supports OpenCode 2.2.5")
     const config = await configure(ctx.options)
     const key = config.cachePrefix
     let collector = collectors.get(key)

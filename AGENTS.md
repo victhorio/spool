@@ -18,8 +18,9 @@ contract and live together so they can evolve together.
 
 [Ingestion](docs/ingestion.md) describes the consistency and wire contract.
 [Development](docs/development.md) covers the isolated local stack in `dev/`.
-The plugin is pinned to OpenCode 2.2.5; public exports, not its private SQLite
-schema, define what Spool archives.
+OpenCode's public exports, not its private SQLite schema, define what Spool
+archives. SDK dependencies are pinned for reproducible builds, not to restrict
+the host's release version.
 
 Efficiency is part of the project's appeal: avoid unnecessary work, copies, and
 allocations, and use measured workloads to guide more involved optimizations.

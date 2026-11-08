@@ -125,7 +125,7 @@ export class Collector {
     this.operation = "opencode_connect"
     const endpoint = this.config.opencodeUrl
       ? { url: this.config.opencodeUrl, auth: { type: "basic" as const, username: "opencode", password: this.config.opencodePassword! } }
-      : await Service.discover({ file: this.config.serviceFile, version: this.version })
+      : await Service.discover({ file: this.config.serviceFile })
     if (!endpoint) throw new SyncError("opencode_not_ready")
     const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) })
     const info = await client.server.info({ signal: this.signal() })
