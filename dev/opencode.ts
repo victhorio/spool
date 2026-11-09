@@ -5,10 +5,11 @@ import { OpenCode } from "@opencode/client"
 import { Service } from "@opencode/client/service"
 import { waitFor } from "./command"
 
-export async function startOpenCode(root: string, plugin: string, options: Record<string, unknown>, signal: AbortSignal) {
+export async function startOpenCode(root: string, plugin: string, options: Record<string, unknown>, signal: AbortSignal,
+  extraPlugins: { package: string; options?: Record<string, unknown> }[] = []) {
   signal.throwIfAborted()
   await Promise.all(["home", "config", "state", "data", "cache", "tmp", "project-a", "project-b"].map((name) => mkdir(path.join(root, name), { recursive: true })))
-  await Bun.write(path.join(root, "config", "opencode.json"), JSON.stringify({ plugins: [{ package: plugin, options }] }))
+  await Bun.write(path.join(root, "config", "opencode.json"), JSON.stringify({ plugins: [{ package: plugin, options }, ...extraPlugins] }))
   const cwd = path.join(root, "home")
   const env = {
     PATH: process.env.PATH,

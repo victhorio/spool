@@ -8,6 +8,7 @@
     "web:build": "bun run --cwd web build",
     "web:validate": "bun dev/web-validate.ts",
     "reader:validate": "bun dev/reader-validate.ts",
+    "retrieval:validate": "bun dev/retrieval-validate.ts",
     "local:up": "bun dev/stack.ts up",
     "local:down": "bun dev/stack.ts down",
     "validate": "bun dev/validate.ts"

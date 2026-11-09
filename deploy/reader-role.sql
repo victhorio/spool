@@ -17,8 +17,11 @@ $$;
 
 GRANT USAGE ON SCHEMA public TO spool_reader;
 GRANT SELECT (id, label) ON public.sources TO spool_reader;
-GRANT SELECT (source_id, session_id, revision, info, received_at, deleted_at)
+GRANT SELECT (source_id, session_id, revision, info, captured_at, received_at, deleted_at,
+    retrieval_title, repository, activity)
     ON public.sessions TO spool_reader;
-GRANT SELECT (source_id, session_id, position, payload) ON public.messages TO spool_reader;
+GRANT SELECT (source_id, session_id, message_id, position, payload, retrieval_role,
+    retrieval_text, conversation_text, tool_text, conversation_spans, tool_spans)
+    ON public.messages TO spool_reader;
 
 COMMIT;

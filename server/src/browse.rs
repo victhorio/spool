@@ -59,6 +59,7 @@ pub fn browse_router(pool: PgPool, assets: impl AsRef<FilePath>) -> anyhow::Resu
         .route("/healthz", get(health))
         .route("/api/sessions", get(sessions))
         .route("/api/sources/{source}/sessions/{session}", get(session))
+        .merge(crate::retrieval::routes())
         .route_service("/", ServeFile::new(index.clone()))
         .route_service("/index.html", ServeFile::new(index))
         .nest_service("/assets", ServeDir::new(assets.join("assets")))

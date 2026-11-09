@@ -1,8 +1,8 @@
 # Spool
 
 Spool archives coding-agent sessions across machines, starting with OpenCode.
-It captures sessions and provides a read-only local browser. Agent search tools,
-delegated readers, and session resume remain out of scope.
+It captures sessions and provides a read-only browser and agent search/read tools.
+Built-in reader-agent orchestration and session resume remain out of scope.
 
 ## Architecture
 
@@ -12,12 +12,14 @@ source-scoped bearer tokens are not.
 
 `server/` owns authentication, validation, and durable storage, with SQL migrations
 in `server/migrations/`. `plugin/` contains the TypeScript OpenCode plugin,
-which owns capture, backfill, and retrying uploads. Keep OpenCode-specific parsing
-in the plugin and `web/` reader rather than the database. The unauthenticated
-`browse` listener is loopback/tailnet-only, separate from public ingestion.
+which owns capture, repository discovery, OpenCode text projections, uploads and
+tool/skill registration. Keep OpenCode-specific parsing in the plugin and `web/`
+reader rather than the database. The unauthenticated `browse` listener hosts
+both reader APIs on loopback/tailnet only, separate from public ingestion.
 
 [Ingestion](docs/ingestion.md) describes the consistency and wire contract.
 [Browser](docs/browser.md) covers the reader's access boundary and API.
+[Retrieval](docs/retrieval.md) covers repository identity and agent tools.
 [Development](docs/development.md) covers the isolated local stack in `dev/`.
 OpenCode's public exports, not its private SQLite schema, define what Spool
 archives. SDK dependencies are pinned for reproducible builds, not to restrict
@@ -41,7 +43,9 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 bun install --frozen-lockfile
 bun run typecheck
+bun test plugin
 bun run validate
+bun run retrieval:validate
 bun run web:validate
 ```
 

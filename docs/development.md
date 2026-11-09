@@ -24,8 +24,10 @@ Model downloads, updates and project config are disabled. The synthetic helpers
 in `dev/fixtures.ts` seed structured conversations through the import API without
 model calls. Do not use this sandbox to test against real conversations.
 
-Compose caps database memory at 256 MiB and service memory at 512 MiB. OpenCode
-runs natively to exercise the installed runtime without another heavy image.
+Compose caps database memory at 1 GiB and service memory at 512 MiB. Concurrent
+64 MiB projected uploads exhausted the former 256 MiB database cap; wire limits
+are not a database-memory budget. OpenCode runs natively to exercise the
+installed runtime without another heavy image.
 The `dev/stack.ts` LocalStack API lets a script provision another source/store,
 execute operator commands or inspect isolated PostgreSQL. Each root gets its
 own Compose project and volume. The fixed local-only DB password in Compose is
@@ -48,7 +50,8 @@ then exercises the real plugin → HTTP → release container → PostgreSQL pat
 - Rust HTTP/CLI regressions against real PostgreSQL, including upload/purge races, rollback,
   raw JSON fidelity, credential rotation/revocation and request/admission limits.
 - Forced generic plans with 100,000-message confirmations, reversal and truncation;
-  collection-count limits, object shapes, and exact 16 MiB body-limit boundaries.
+  collection-count limits, object shapes, and exact 16 MiB archive / 64 MiB
+  projected-envelope boundaries.
 
 The harness uses one-second sweeps to test reconciliation promptly. It uses a
 local HTTP fault proxy; no service dependencies or OpenCode exports are mocked.
@@ -69,6 +72,15 @@ actual userspace Tailscale forwarding with a local, credential-free control plan
 on an egress-isolated network. See [reader deployment](reader-deployment.md) for
 its access boundary, covered scenarios and separate production go-live checks.
 
+`bun run retrieval:validate` uses isolated OpenCode stores, real Git checkouts,
+worktrees and clones, and Rust/PostgreSQL to exercise repository capture and the
+three [retrieval tools](retrieval.md). A deterministic AI SDK fixture runs the
+actual General agent loop through skill loading, find, search and read without
+calling a model. It verifies runtime schemas, permissions and evidence delivery,
+not whether a model chooses the right search or delegation. Explore permissions
+remain unchanged. The fixture also checks giant-message continuation, stale
+revisions, missing projections, removed worktrees and reader outages.
+
 ## Plugin configuration and hosting
 
 OpenCode config uses a directory package (not its `.ts` entrypoint):
@@ -87,6 +99,9 @@ OpenCode config uses a directory package (not its `.ts` entrypoint):
 
 Store the source token in that private file (mode 0600), not tracked config.
 Options also accept `sweepIntervalMs` (1000–86400000, default 900000).
+Set `readerUrl` to a literal loopback/Tailscale HTTP reader address to expose
+retrieval tools and the bundled skill. Optional `repositoryRemote` selects a
+fetch remote instead of the default origin/sole-remote selection.
 Managed OpenCode services are discovered without starting another host; the
 collector verifies the discovered server PID equals its own process. For a
 nondefault registration, set `serviceFile`; for an unmanaged server, set both
@@ -99,4 +114,7 @@ For Railway, build `server/Dockerfile` from the repository root and supply
 `PORT` (default 8080), and binds `BIND_ADDR` (default 0.0.0.0). Use `/healthz`
 for readiness. The image runs as non-root. Operator CLI commands use the same
 binary and database, not a public admin endpoint. Deployment, TLS, backups and
-real-client installation still need to be configured; nothing deploys implicitly.
+real-client installation are separate operator actions. The production ingestion
+service is connected to GitHub `main`: pushing there can trigger deployment.
+Push review branches when deployment is deferred; do not change the deployment
+integration merely to publish code.

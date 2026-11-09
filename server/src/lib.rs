@@ -3,6 +3,7 @@ mod auth;
 mod browse;
 mod error;
 mod http;
+mod retrieval;
 mod snapshot;
 
 use std::time::Duration;

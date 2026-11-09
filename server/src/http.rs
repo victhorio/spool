@@ -18,9 +18,7 @@ use sqlx::{FromRow, PgPool};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::{auth, error::ApiError, snapshot};
-
-const MAX_BODY: usize = 16 * 1024 * 1024;
+use crate::{auth, error::ApiError, snapshot, snapshot::MAX_BODY};
 
 #[derive(Clone)]
 struct App {

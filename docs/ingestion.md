@@ -8,8 +8,9 @@ retains the archive; a captured committed undo replaces its contents.
 
 The plugin owns enumeration, export, content hashing, retries and checkpoints.
 The server authenticates, validates the envelope and writes atomically. Raw
-OpenCode objects remain opaque except for IDs. Three tables in
-`server/migrations/0001_archive.sql` hold sources, sessions and ordered messages.
+OpenCode objects remain opaque except for IDs. Tables in `server/migrations/`
+hold sources, sessions and ordered messages, with generic text projections for
+[agent retrieval](retrieval.md) supplied by the collector.
 Raw documents use PostgreSQL `json`: `jsonb` rejects valid escaped NUL strings.
 Do not blindly cast archived documents to `jsonb` for future search.
 
@@ -41,7 +42,7 @@ Admin commands require direct database access; there is no enrollment endpoint.
   Cursors are opaque, source-bound keysets, not frozen inventory snapshots.
 - `POST /v1/sync/sessions/{session_id}/snapshot`: conditional snapshot acceptance.
 
-Every upload field is required, including nullable `base_revision`:
+Every archival field is required, including nullable `base_revision`:
 
 ```json
 {
@@ -57,6 +58,18 @@ Every upload field is required, including nullable `base_revision`:
 ```
 
 The example abbreviates `info`; collectors send the complete exported object.
+The optional `retrieval` member contains version 1 metadata (`title`, nullable
+`repository`, epoch-millisecond `activity`) and `messages`, each with `id`, `role`,
+`text`, `conversation`, `tools`, `conversation_spans` and `tool_spans`. Spans are
+ordered, non-overlapping `[start, end]` UTF-8 byte ranges into `text`, start
+inclusive and end exclusive. Each list's slices joined with newlines must equal
+its corresponding search text; ranges cannot split a Unicode scalar. Projection
+IDs must correspond exactly to `upsert_messages`.
+Metadata and projections are committed with the raw snapshot;
+projection-only changes do not set `changed`. A session becomes searchable only
+when all current messages have projections. Uploads without `retrieval` remain
+accepted but clear session retrieval metadata and changed-message projections.
+
 `message_order` is the entire desired list in export order, never ID/time order.
 Omitted IDs are removed; `[]` is a valid empty transcript. Bodies are complete
 objects. Unchanged existing bodies may be omitted from `upsert_messages`, but
@@ -89,9 +102,12 @@ Errors have shape `{"error":{"code":"…"}}`:
 - 422 `invalid_manifest`
 - 503 `busy` / `database_unavailable` / `unavailable`
 
-Uploads require an object envelope, object-valued info/messages, `application/json`,
-no compression, and at most 16 MiB. Each message array is limited to 100,000
-entries during decoding; exceeding that count returns 400 `malformed_request`.
+Uploads require an object envelope, object-valued info/messages, `application/json`
+and no compression. The archive excluding the complete optional `retrieval`
+member is limited to 16 MiB; the full envelope including projections is limited
+to 64 MiB. Unknown envelope fields count toward the archival limit. Each message
+array, including projections, is limited to 100,000 entries during decoding;
+exceeding that count returns 400 `malformed_request`.
 Two uploads are admitted before body allocation; body reading has a 30-second
 limit. These bounds budget for decoding and database work, not just wire bytes.
 Oversized sessions remain unsynced, never truncated. Retry transient connection,
@@ -117,6 +133,6 @@ leaves a revisioned tombstone, including for a previously absent session. Future
 uploads receive 410. Backups/WAL retain old content until their expiry: this is
 not immediate physical erasure. Configure and test database backups before
 treating Spool as the only surviving archive. Public ingestion exposes no reads;
-the separate local/tailnet [browser](browser.md) has a read-only API. Agent search,
-a capture daemon, blob fetching, automatic redaction and historical snapshots
-remain out of scope.
+the separate local/tailnet listener hosts the read-only [browser](browser.md) and
+[agent retrieval](retrieval.md). A capture daemon, blob fetching, automatic
+redaction and historical snapshots remain out of scope.

@@ -32,6 +32,14 @@ impl ApiError {
         }
     }
 
+    pub fn session_changed(current: i64) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "session_changed",
+            revision: Some(Some(current)),
+        }
+    }
+
     pub fn database(operation: &'static str, error: sqlx::Error) -> Self {
         let class = match &error {
             sqlx::Error::Database(_) => "database",

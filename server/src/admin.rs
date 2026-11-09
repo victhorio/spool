@@ -88,6 +88,7 @@ pub async fn purge_session(pool: &PgPool, source: Uuid, session: &str) -> anyhow
         .await?;
     sqlx::query(
         "UPDATE sessions SET revision = $3, info = NULL, info_hash = NULL, \
+         retrieval_title = NULL, repository = NULL, activity = NULL, \
          deleted_at = COALESCE(deleted_at, now()), received_at = now() \
          WHERE source_id = $1 AND session_id = $2",
     )

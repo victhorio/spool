@@ -4,8 +4,17 @@ import { ClientError, OpenCode, isSessionNotFoundError, type OpenCodeClient } fr
 import { Service } from "@opencode/client/service"
 import type { Plugin } from "@opencode/plugin"
 import type { Config } from "./config"
+import { projectRetrieval } from "./projection"
+import { resolveRepository } from "./repository"
 
-interface Checkpoint { revision: string; hashes: Record<string, string> }
+interface Checkpoint {
+  revision: string | null
+  hashes: Record<string, string>
+  projectionVersion?: 1 | 2
+  directory?: string
+  repository?: string | null
+  remote?: string
+}
 interface Inventory { sessions: { session_id: string; revision: string; deleted: boolean }[]; next_cursor: string | null }
 
 class SyncError extends Error {
@@ -37,7 +46,7 @@ function errorCode(error: unknown): string {
 function digest(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex") }
 
 function checkpoint(value: unknown): Checkpoint | undefined {
-  if (!value || typeof value !== "object" || !("revision" in value) || typeof value.revision !== "string" || !("hashes" in value)) return undefined
+  if (!value || typeof value !== "object" || !("revision" in value) || (typeof value.revision !== "string" && value.revision !== null) || !("hashes" in value)) return undefined
   const hashes = value.hashes
   if (!hashes || typeof hashes !== "object" || Array.isArray(hashes) || !Object.values(hashes).every((hash) => typeof hash === "string")) return undefined
   return value as Checkpoint
@@ -49,7 +58,7 @@ export class Collector {
   private readonly dirty = new Set<string>()
   private readonly backfill = new Set<string>()
   private readonly activity = new Map<string, number>()
-  private readonly revisions = new Map<string, string>()
+  private readonly revisions = new Map<string, string | null>()
   private readonly purged = new Set<string>()
   private client?: OpenCodeClient
   private running?: Promise<void>
@@ -178,11 +187,23 @@ export class Collector {
     const key = `${this.config.cachePrefix}${id}`
     this.operation = "checkpoint_read"
     const saved = checkpoint(await ctx.storage.get(key))
-    const base = this.revisions.get(id) ?? saved?.revision ?? null
-    const known = saved?.revision === base ? saved.hashes : undefined
+    const base = this.revisions.has(id) ? this.revisions.get(id)! : saved?.revision ?? null
+    const known = saved?.revision === base && saved.projectionVersion === 2 ? saved.hashes : undefined
     const client = await this.connect()
     this.operation = "session_export"
     const transcript = await client.experimental.session.export({ sessionID: id }, { signal: this.signal() })
+    // Exported session location is historical session metadata, unlike the active plugin Location.
+    const directory = transcript.info.location.directory
+    const identity = await resolveRepository(directory, this.config.repositoryRemote)
+    const previousRepository = saved?.directory === directory && saved.remote === this.config.repositoryRemote &&
+      typeof saved.repository === "string" && !saved.repository.includes("\0") && Buffer.byteLength(saved.repository) <= 1024 ? saved.repository : null
+    const repository = identity.available ? identity.repository : previousRepository
+    const capturedIdentity = { directory, repository, ...(this.config.repositoryRemote ? { remote: this.config.repositoryRemote } : {}) }
+    if (identity.available && (saved?.directory !== directory || saved.repository !== repository || saved.remote !== this.config.repositoryRemote)) {
+      // Keep observed identity even if upload fails and the checkout disappears before a retry/restart.
+      this.operation = "checkpoint_write"
+      await ctx.storage.set(key, { revision: saved?.revision ?? base, hashes: saved?.hashes ?? {}, ...(saved?.projectionVersion === 1 || saved?.projectionVersion === 2 ? { projectionVersion: saved.projectionVersion } : {}), ...capturedIdentity })
+    }
     if (this.dirty.has(id)) return
     const hashes: Record<string, string> = Object.create(null)
     const upserts = transcript.messages.filter((message) => {
@@ -201,11 +222,12 @@ export class Collector {
         info: transcript.info,
         message_order: transcript.messages.map((message) => message.id),
         upsert_messages: upserts,
+        retrieval: projectRetrieval(transcript, upserts, repository),
       }),
     })
     this.revisions.set(id, result.revision)
     this.operation = "checkpoint_write"
-    await ctx.storage.set(key, { revision: result.revision, hashes })
+    await ctx.storage.set(key, { revision: result.revision, hashes, projectionVersion: 2, ...capturedIdentity })
     this.log("captured", { session_id: id, revision: result.revision, messages: transcript.messages.length, uploaded_messages: upserts.length })
   }
 
@@ -248,10 +270,7 @@ export class Collector {
         if (this.lifetime.signal.aborted) break
         if (isSessionNotFoundError(error)) continue
         if (error instanceof SyncError && error.code === "revision_conflict" && current) {
-          if (error.revision) this.revisions.set(current, error.revision)
-          else this.revisions.delete(current)
-          const ctx = this.members.keys().next().value
-          await ctx?.storage.remove(`${this.config.cachePrefix}${current}`).catch(() => {})
+          this.revisions.set(current, error.revision ?? null)
           this.dirty.add(current)
         } else if (error instanceof SyncError && error.code === "purged" && current) {
           this.purged.add(current)

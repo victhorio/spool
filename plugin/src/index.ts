@@ -1,6 +1,7 @@
 import { Plugin } from "@opencode/plugin"
 import { Collector } from "./collector"
 import { configure } from "./config"
+import { registerRetrieval } from "./retrieval"
 
 // OpenCode re-evaluates local modules per Location; the registry must outlive imports.
 const registry = Symbol.for("spool.collectors.v1")
@@ -19,6 +20,7 @@ export default Plugin.define({
     } else if (!collector.matches(config)) {
       throw new Error("Conflicting Spool configuration for the same source; reload all plugin instances after changing credentials or options")
     }
+    await registerRetrieval(ctx, config.readerUrl)
     const remove = collector.attach(ctx)
     return async () => {
       if (await remove() && collectors.get(key) === collector) collectors.delete(key)

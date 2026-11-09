@@ -496,8 +496,6 @@ async fn reader_privileges(database_url: &str, role: &str) {
         "SELECT info_hash FROM sessions",
         "SELECT upstream_version FROM sessions",
         "SELECT collector_version FROM sessions",
-        "SELECT captured_at FROM sessions",
-        "SELECT message_id FROM messages",
         "SELECT payload_hash FROM messages",
         "SELECT * FROM sources",
         "SELECT * FROM sessions",
