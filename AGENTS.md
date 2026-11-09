@@ -1,8 +1,8 @@
 # Spool
 
 Spool archives coding-agent sessions across machines, starting with OpenCode.
-The first milestone is reliable capture, upload, and storage. Search tools,
-delegated readers, and session resume are out of scope for now.
+It captures sessions and provides a read-only local browser. Agent search tools,
+delegated readers, and session resume remain out of scope.
 
 ## Architecture
 
@@ -13,10 +13,11 @@ source-scoped bearer tokens are not.
 `server/` owns authentication, validation, and durable storage, with SQL migrations
 in `server/migrations/`. `plugin/` contains the TypeScript OpenCode plugin,
 which owns capture, backfill, and retrying uploads. Keep OpenCode-specific parsing
-in the plugin rather than the database. The two components share an ingestion
-contract and live together so they can evolve together.
+in the plugin and `web/` reader rather than the database. The unauthenticated
+`browse` listener is loopback/tailnet-only, separate from public ingestion.
 
 [Ingestion](docs/ingestion.md) describes the consistency and wire contract.
+[Browser](docs/browser.md) covers the reader's access boundary and API.
 [Development](docs/development.md) covers the isolated local stack in `dev/`.
 OpenCode's public exports, not its private SQLite schema, define what Spool
 archives. SDK dependencies are pinned for reproducible builds, not to restrict
@@ -41,7 +42,10 @@ cargo clippy --workspace --all-targets -- -D warnings
 bun install --frozen-lockfile
 bun run typecheck
 bun run validate
+bun run web:validate
 ```
 
 `bun run validate` includes Rust HTTP/CLI tests against real isolated PostgreSQL.
 Plain `cargo test` skips those tests without `SPOOL_TEST_DATABASE_URL`.
+`bun run web:validate` builds and exercises the reader in headless Chrome against
+a synthetic archive, not the user's preview database.

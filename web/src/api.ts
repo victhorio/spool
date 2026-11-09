@@ -1,0 +1,51 @@
+export type Document = Record<string, unknown>
+
+export function object(value: unknown): value is Document {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+}
+
+export interface Session {
+  source_id: string
+  source_label: string
+  session_id: string
+  revision: string
+  info: Document
+  received_at: string
+}
+
+export interface SessionPage {
+  sessions: Session[]
+  sources: { source_id: string; source_label: string }[]
+  next_cursor: string | null
+}
+
+export interface Transcript extends Session {
+  messages: (Document & { id: string })[]
+  next_cursor: string | null
+}
+
+export class ArchiveError extends Error {
+  constructor(readonly status: number) {
+    super(
+      status === 409
+        ? "This session changed. Reload it to read the latest version."
+        : status === 404
+          ? "This session is no longer in the archive."
+          : "Couldn’t load the archive. Please try again.",
+    )
+  }
+}
+
+export async function read<T>(path: string, signal?: AbortSignal): Promise<T> {
+  const response = await fetch(path, { signal, cache: "no-store" })
+  if (!response.ok) throw new ArchiveError(response.status)
+  return response.json() as Promise<T>
+}
+
+export function sessionPath(session: Pick<Session, "source_id" | "session_id">): string {
+  return `/api/sources/${encodeURIComponent(session.source_id)}/sessions/${encodeURIComponent(session.session_id)}`
+}
+
+export function sessionKey(session: Pick<Session, "source_id" | "session_id">): string {
+  return `${session.source_id}/${session.session_id}`
+}

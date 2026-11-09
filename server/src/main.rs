@@ -1,9 +1,11 @@
-use std::{env, net::IpAddr};
+use std::{env, net::IpAddr, path::PathBuf};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use serde_json::json;
-use spool_server::{admin, connect, migrate, router};
+use spool_server::{
+    admin, browse_router, connect, connect_browse, migrate, router, validate_browse_bind,
+};
 use uuid::Uuid;
 
 #[derive(Parser)]
@@ -17,6 +19,17 @@ struct Cli {
 enum Command {
     /// Serve HTTP; applies pending migrations before listening (the default).
     Serve,
+    /// Read-only, unauthenticated browser for loopback/tailnet only; never runs migrations.
+    Browse {
+        /// Loopback or Tailscale IP only; use the literal IP URL (or localhost), not DNS/proxies.
+        #[arg(long, default_value = "127.0.0.1")]
+        bind: IpAddr,
+        #[arg(long, default_value_t = 8090)]
+        port: u16,
+        /// Built frontend directory containing index.html.
+        #[arg(long, default_value = "web/dist")]
+        assets: PathBuf,
+    },
     /// Apply pending database migrations and exit.
     Migrate,
     /// Manage source credentials using direct database access.
@@ -53,9 +66,28 @@ enum SessionCommand {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+    let command = cli.command.unwrap_or(Command::Serve);
+    if let Command::Browse { bind, .. } = &command {
+        validate_browse_bind(*bind)?;
+    }
     let database_url = env::var("DATABASE_URL").context("DATABASE_URL is required")?;
-    let pool = connect(&database_url).await?;
-    match cli.command.unwrap_or(Command::Serve) {
+    let pool = if matches!(command, Command::Browse { .. }) {
+        connect_browse(&database_url).await?
+    } else {
+        connect(&database_url).await?
+    };
+    match command {
+        Command::Browse { bind, port, assets } => {
+            let app = browse_router(pool.clone(), assets)?;
+            let listener = tokio::net::TcpListener::bind((bind, port)).await?;
+            eprintln!(
+                "Spool browse (read-only, unauthenticated; loopback/tailnet only) at http://{}",
+                listener.local_addr()?
+            );
+            axum::serve(listener, app)
+                .with_graceful_shutdown(shutdown())
+                .await?;
+        }
         Command::Serve => {
             migrate(&pool).await?;
             let bind: IpAddr = env::var("BIND_ADDR")

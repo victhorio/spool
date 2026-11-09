@@ -116,5 +116,7 @@ shell/compaction messages. Its separate source reads are not one transaction.
 leaves a revisioned tombstone, including for a previously absent session. Future
 uploads receive 410. Backups/WAL retain old content until their expiry: this is
 not immediate physical erasure. Configure and test database backups before
-treating Spool as the only surviving archive. No retrieval/search API, daemon,
-blob fetching, automatic redaction or historical snapshots exist in this version.
+treating Spool as the only surviving archive. Public ingestion exposes no reads;
+the separate local/tailnet [browser](browser.md) has a read-only API. Agent search,
+a capture daemon, blob fetching, automatic redaction and historical snapshots
+remain out of scope.

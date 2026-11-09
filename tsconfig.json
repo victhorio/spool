@@ -3,11 +3,12 @@
     "target": "ESNext",
     "module": "Preserve",
     "moduleResolution": "Bundler",
+    "jsx": "react-jsx",
     "types": ["bun"],
     "strict": true,
     "noEmit": true,
     "verbatimModuleSyntax": true,
     "skipLibCheck": true
   },
-  "include": ["plugin/**/*.ts", "dev/**/*.ts"]
+  "include": ["plugin/**/*.ts", "dev/**/*.ts", "web/**/*.ts", "web/**/*.tsx"]
 }

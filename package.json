@@ -2,9 +2,11 @@
   "name": "spool",
   "private": true,
   "type": "module",
-  "workspaces": ["plugin"],
+  "workspaces": ["plugin", "web"],
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "web:build": "bun run --cwd web build",
+    "web:validate": "bun dev/web-validate.ts",
     "local:up": "bun dev/stack.ts up",
     "local:down": "bun dev/stack.ts down",
     "validate": "bun dev/validate.ts"
