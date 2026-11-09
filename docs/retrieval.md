@@ -38,13 +38,9 @@ names are never used to guess its repository.
 
 ## Configuration and access
 
-Add `readerUrl` alongside the existing ingestion `url` and `tokenFile`:
-
-```json
-{
-  "readerUrl": "http://100.64.1.2:8090"
-}
-```
+Follow [client setup](client-setup.md) on each machine for the complete plugin
+entry, the private reader address, reload requirements and verification. An active
+capture plugin alone does not establish retrieval readiness.
 
 Reader URLs must use HTTP and a literal loopback or Tailscale address, with no
 credentials, path, query or fragment. DNS names and public/LAN addresses are

@@ -83,36 +83,12 @@ not whether a model chooses the right search or delegation. Explore permissions
 remain unchanged. The fixture also checks giant-message continuation, stale
 revisions, missing projections, removed worktrees and reader outages.
 
-## Plugin configuration and hosting
+## Installed clients and server hosting
 
-OpenCode config uses a directory package (not its `.ts` entrypoint):
-
-```json
-{
-  "plugins": [{
-    "package": "/absolute/path/to/spool/plugin",
-    "options": {
-      "url": "https://your-spool-host",
-      "tokenFile": "~/.config/spool/source.token"
-    }
-  }]
-}
-```
-
-Store the source token in that private file (mode 0600), not tracked config.
-The former `sweepIntervalMs` option is accepted for compatibility but ignored;
-idle archives no longer run periodic sweeps. Startup and reconnect reconcile
-metadata/revisions; `/spool-repair` explicitly requests a full content audit
-across this source's local sessions. See [capture and retention](ingestion.md#capture-and-retention).
-Set `readerUrl` to a literal loopback/Tailscale HTTP reader address to expose
-retrieval tools and the bundled skill. Optional `repositoryRemote` selects a
-fetch remote instead of the default origin/sole-remote selection.
-Managed OpenCode services are discovered without starting another host; the
-collector verifies the discovered server PID equals its own process. For a
-nondefault registration, set `serviceFile`; for an unmanaged server, set both
-`opencodeUrl` and `opencodePasswordFile`. Explicit endpoints must still identify
-the current host. Discovery and uploads run in the background, not in model/tool
-hooks. HTTP is accepted only on loopback; remote endpoints require HTTPS.
+Use [client setup](client-setup.md) for an actual OpenCode installation, including
+both ingestion and private reader configuration, reloads and retrieval checks.
+The sandbox above uses isolated settings and does not configure your installed
+client.
 
 For Railway, build `server/Dockerfile` from the repository root and supply
 `DATABASE_URL`. Default command serves and migrates before listening, honors

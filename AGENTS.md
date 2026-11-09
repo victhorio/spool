@@ -17,6 +17,7 @@ tool/skill registration. Keep OpenCode-specific parsing in the plugin and `web/`
 reader rather than the database. The unauthenticated `browse` listener hosts
 both reader APIs on loopback/tailnet only, separate from public ingestion.
 
+[Client setup](docs/client-setup.md) covers capture and retrieval on each machine.
 [Ingestion](docs/ingestion.md) describes the consistency and wire contract.
 [Browser](docs/browser.md) covers the reader's access boundary and API.
 [Retrieval](docs/retrieval.md) covers repository identity and agent tools.
