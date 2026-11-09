@@ -2,12 +2,6 @@ import { execFile } from "node:child_process"
 import { stat } from "node:fs/promises"
 import path from "node:path"
 
-export interface RepositoryIdentity {
-  repository: string | null
-  // Unavailable paths/processes are not evidence that a previously captured remote changed.
-  available: boolean
-}
-
 export function normalizeRepository(remote: string): string | null {
   if (!remote || /[\s\0]/u.test(remote)) return null
   const scp = /^(?:[^/@:]+@)?(\[[^\]]+\]|[^/:]+):(.+)$/.exec(remote)
@@ -37,14 +31,14 @@ function git(directory: string, args: string[]): Promise<string> {
   })
 }
 
-export async function resolveRepository(directory: unknown, remote?: string): Promise<RepositoryIdentity> {
-  if (typeof directory !== "string" || !path.isAbsolute(directory) || directory.includes("\0")) return { repository: null, available: false }
+export async function resolveRepository(directory: unknown, remote?: string): Promise<string | null> {
+  if (typeof directory !== "string" || !path.isAbsolute(directory) || directory.includes("\0")) return null
   try {
-    if (!(await stat(directory)).isDirectory()) return { repository: null, available: false }
+    if (!(await stat(directory)).isDirectory()) return null
     const names = (await git(directory, ["remote"])).split("\n").filter(Boolean)
     const selected = remote ?? (names.includes("origin") ? "origin" : names.length === 1 ? names[0] : undefined)
-    if (!selected || !names.includes(selected)) return { repository: null, available: true }
+    if (!selected || !names.includes(selected)) return null
     const fetchURL = await git(directory, ["remote", "get-url", "--", selected])
-    return { repository: normalizeRepository(fetchURL), available: true }
-  } catch { return { repository: null, available: false } }
+    return normalizeRepository(fetchURL)
+  } catch { return null }
 }

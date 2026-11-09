@@ -593,7 +593,7 @@ pub(crate) async fn accept(
          (SELECT 1 FROM messages WHERE source_id = $1 AND session_id = $2 AND \
          (retrieval_role IS NULL OR retrieval_text IS NULL OR conversation_text IS NULL OR tool_text IS NULL \
          OR conversation_spans IS NULL OR tool_spans IS NULL)) \
-         THEN $3 ELSE NULL END, repository = $4, activity = $5 \
+         THEN $3 ELSE NULL END, repository = COALESCE(NULLIF($4, ''), repository), activity = $5 \
          WHERE source_id = $1 AND session_id = $2",
     )
     .bind(source)

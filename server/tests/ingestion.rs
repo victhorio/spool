@@ -597,6 +597,43 @@ async fn validation_and_raw_json(h: &Harness) {
 }
 
 async fn retrieval_projections(h: &Harness) {
+    let (retained_source, retained_token) = h.source("repository retention");
+    let mut retained = snapshot("retained", None, &["m"], json!([{"id": "m"}]));
+    retained["retrieval"] = retrieval(json!([projection("m", "retained evidence")]));
+    for (index, (repository, expected)) in [
+        (Value::Null, Value::Null),
+        (json!("example.test/first"), json!("example.test/first")),
+        (Value::Null, json!("example.test/first")),
+        (json!(""), json!("example.test/first")),
+        (
+            json!("example.test/replacement"),
+            json!("example.test/replacement"),
+        ),
+        (Value::Null, json!("example.test/replacement")),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        retained["base_revision"] = if index == 0 {
+            Value::Null
+        } else {
+            json!(index.to_string())
+        };
+        retained["retrieval"]["repository"] = repository;
+        assert_eq!(
+            h.post(&retained_token, "retained", &retained).await.0,
+            if index == 0 {
+                StatusCode::CREATED
+            } else {
+                StatusCode::OK
+            }
+        );
+        assert_eq!(
+            h.projection(retained_source, "retained").await["repository"],
+            expected
+        );
+    }
+
     let (source, token) = h.source("retrieval");
     let (other, other_token) = h.source("independent retrieval");
     let raw = json!([{"id": "m1", "opaque": true}, {"id": "m2", "text": "raw\0NUL"}]);
@@ -732,7 +769,7 @@ async fn retrieval_projections(h: &Harness) {
     assert_eq!(h.messages(source, "projected").await, rows);
     let metadata = h.projection(source, "projected").await;
     assert_eq!(metadata["title"], "Metadata only");
-    assert!(metadata["repository"].is_null());
+    assert_eq!(metadata["repository"], "/synthetic/repo");
     assert_eq!(metadata["activity"], 8_640_000_000_000_000_i64);
 
     body["base_revision"] = json!("4");
@@ -773,9 +810,8 @@ async fn retrieval_projections(h: &Harness) {
     body.as_object_mut().unwrap().remove("retrieval");
     assert_eq!(h.post(&token, "projected", &body).await.1["changed"], false);
     let legacy = h.projection(source, "projected").await;
-    assert!(
-        legacy["title"].is_null() && legacy["repository"].is_null() && legacy["activity"].is_null()
-    );
+    assert!(legacy["title"].is_null() && legacy["activity"].is_null());
+    assert_eq!(legacy["repository"], "/synthetic/repo");
     assert_eq!(h.messages(source, "projected").await, reordered[..1]);
     body["base_revision"] = json!("9");
     body["upsert_messages"] = json!([{"id": "m2", "changed": true}]);

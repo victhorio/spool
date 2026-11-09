@@ -68,7 +68,11 @@ IDs must correspond exactly to `upsert_messages`.
 Metadata and projections are committed with the raw snapshot;
 projection-only changes do not set `changed`. A session becomes searchable only
 when all current messages have projections. Uploads without `retrieval` remain
-accepted but clear session retrieval metadata and changed-message projections.
+accepted but clear the search title, activity and changed-message projections.
+Repository identity is retained unless a nonempty replacement is supplied:
+null, an empty string and absent retrieval metadata mean unknown, not removal.
+This preserves known assignments even if a collector loses its local checkpoint.
+Explicit session purge still clears the repository along with the archive.
 
 `message_order` is the entire desired list in export order, never ID/time order.
 Omitted IDs are removed; `[]` is a valid empty transcript. Bodies are complete

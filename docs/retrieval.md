@@ -10,13 +10,14 @@ navigation, optional delegation, evidence and archive limitations.
 The collector reads the session's exported directory, not the active plugin
 Location. It selects the fetch remote `origin`, or the sole remote when there is
 no origin. `repositoryRemote` explicitly selects another remote; an ambiguous
-selection remains unassigned rather than choosing an upstream or branch remote.
+selection supplies no new identity rather than choosing an upstream or branch
+remote.
 
 SSH and HTTPS forms such as `git@github.com:owner/repo.git` and
 `https://github.com/owner/repo.git` normalize to `github.com/owner/repo`. Transport
 credentials, default transport ports and `.git` suffixes are not identity.
 Meaningful custom ports and case-sensitive repository paths are retained;
-GitHub repository paths are case-insensitive. Local/file remotes are unassigned.
+GitHub repository paths are case-insensitive. Local/file remotes supply no identity.
 No GitHub API, `gh`, network access or host-alias resolution is involved.
 
 Worktrees normally share remotes; independent clones on different machines
@@ -25,10 +26,14 @@ remain separate. Remote renames, repository transfers and SSH aliases are not
 automatically merged. No alias-management feature is included in this version.
 
 Successful captures retain the observed repository in the local checkpoint.
-If that same session directory later disappears, subsequent captures retain
-the known identity. An available repository with a changed remote is observed
-again, not pinned forever to the old remote. A historical worktree that was
-already gone before any identity was captured remains unassigned; directory
+Unknown discovery never clears a known association: deleted/unreadable worktrees,
+missing/ambiguous/unusable remotes, and directory or remote-selection changes
+retain the session's saved identity. A positively discovered repository may fill
+an empty assignment or replace an existing one. The server also preserves its
+known association when an upload supplies null, an empty string, or no retrieval
+metadata, protecting archives when local checkpoints are lost. Explicit session
+purge still clears the association along with its content. A historical worktree
+with no identity ever captured or manually assigned remains unassigned; directory
 names are never used to guess its repository.
 
 ## Configuration and access
@@ -131,8 +136,9 @@ describes the latest captured export, not proof of current source state.
 The migration adds nullable projection columns and indexes without interpreting
 or backfilling old exports. New plugin checkpoints force a complete projected
 capture once, then retain sparse message deltas. Older collectors remain
-accepted, but their unprojected uploads invalidate session search metadata to
-prevent stale results. Raw archival JSON and the browser remain available.
+accepted, but their unprojected uploads invalidate the session's search title
+and activity to prevent stale results, not its known repository association.
+Raw archival JSON and the browser remain available.
 
 Deploy server migrations and updated reader privileges before activating the
 new plugin. An existing `spool_reader` needs the added column SELECT grants from

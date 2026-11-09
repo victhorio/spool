@@ -224,12 +224,11 @@ export class Collector {
     const transcript = await client.experimental.session.export({ sessionID: id }, { signal: this.signal() })
     // Exported session location is historical session metadata, unlike the active plugin Location.
     const directory = transcript.info.location.directory
-    const identity = await resolveRepository(directory, this.config.repositoryRemote)
-    const previousRepository = saved?.directory === directory && saved.remote === this.config.repositoryRemote &&
-      typeof saved.repository === "string" && !saved.repository.includes("\0") && Buffer.byteLength(saved.repository) <= 1024 ? saved.repository : null
-    const repository = identity.available ? identity.repository : previousRepository
+    const previousRepository = typeof saved?.repository === "string" && saved.repository.length > 0 &&
+      !saved.repository.includes("\0") && Buffer.byteLength(saved.repository) <= 1024 ? saved.repository : null
+    const repository = await resolveRepository(directory, this.config.repositoryRemote) ?? previousRepository
     const capturedIdentity = { directory, repository, ...(this.config.repositoryRemote ? { remote: this.config.repositoryRemote } : {}) }
-    if (identity.available && (saved?.directory !== directory || saved.repository !== repository || saved.remote !== this.config.repositoryRemote)) {
+    if (saved?.directory !== directory || saved.repository !== repository || saved.remote !== this.config.repositoryRemote) {
       // Keep observed identity even if upload fails and the checkout disappears before a retry/restart.
       this.operation = "checkpoint_write"
       const { remote: _remote, ...previous } = saved ?? {}

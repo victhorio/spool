@@ -154,6 +154,18 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
     expect(exports).toBe(switched.exports + 1)
     expect(uploads).toHaveLength(switched.uploads)
     expect(checkpoints.get("fixture/ses_synthetic")).toEqual(withoutOverride)
+    for (const remotes of [[], ["first", "second"], ["origin"]]) {
+      git("remote", "remove", "origin")
+      for (const name of remotes) git("remote", "add", name, "../unusable-local-remote")
+      const unknown = { exports, uploads: uploads.length, checkpoint: checkpoints.get("fixture/ses_synthetic") }
+      collector.repair()
+      await Bun.sleep(400)
+      expect(exports).toBe(unknown.exports + 1)
+      expect(uploads).toHaveLength(unknown.uploads)
+      expect(checkpoints.get("fixture/ses_synthetic")).toBe(unknown.checkpoint)
+      for (const name of remotes) git("remote", "remove", name)
+      git("remote", "add", "origin", "git@github.com:Captured/Repository.git")
+    }
     loseAcknowledgement = true
     git("remote", "set-url", "origin", "https://new.example/Actual/Origin.git")
     collector.repair()
@@ -163,6 +175,7 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
     remove = undefined
     await stop()
     await rm(directory, { recursive: true, force: true })
+    config.repositoryRemote = "unavailable-override"
     const deleted = uploads.length
     remove = new Collector(config, "2.2.5").attach(ctx)
     expect((await next(() => true, deleted)).retrieval.repository).toBe("new.example/Actual/Origin")
@@ -173,6 +186,9 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
     const retry = uploads.findLast((upload) => upload.base_revision === null)!
     expect(retry.upsert_messages).toHaveLength(1)
     expect(retry.retrieval.repository).toBe("new.example/Actual/Origin")
+    transcript.info.location.directory = path.join(root, "different-missing-worktree")
+    emit()
+    expect((await next((upload) => (upload.info as SessionTransferData["info"]).location.directory === transcript.info.location.directory)).retrieval.repository).toBe("new.example/Actual/Origin")
     await Bun.sleep(100)
     await remove()
     const restarted = { exports, uploads: uploads.length }
