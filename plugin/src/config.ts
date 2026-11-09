@@ -9,7 +9,6 @@ export interface Config {
   token: string
   sourceID: string
   cachePrefix: string
-  sweepIntervalMs: number
   serviceFile?: string
   opencodeUrl?: string
   opencodePassword?: string
@@ -60,8 +59,9 @@ export async function configure(options: Record<string, unknown>): Promise<Confi
   const token = (await readFile(filename(options.tokenFile, "tokenFile"), "utf8")).trim()
   const match = /^spool_v1\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/.exec(token)
   if (!match) throw new Error("Spool tokenFile does not contain a valid source token")
-  const sweepIntervalMs = options.sweepIntervalMs ?? 15 * 60_000
-  if (typeof sweepIntervalMs !== "number" || !Number.isSafeInteger(sweepIntervalMs) || sweepIntervalMs < 1_000 || sweepIntervalMs > 86_400_000) {
+  // Accepted for existing installations; automatic full-content sweeps no longer run.
+  const sweepIntervalMs = options.sweepIntervalMs
+  if (sweepIntervalMs !== undefined && (typeof sweepIntervalMs !== "number" || !Number.isSafeInteger(sweepIntervalMs) || sweepIntervalMs < 1_000 || sweepIntervalMs > 86_400_000)) {
     throw new Error("Spool sweepIntervalMs must be an integer between 1000 and 86400000")
   }
   if (options.serviceFile !== undefined && options.opencodeUrl !== undefined) throw new Error("Choose either serviceFile or opencodeUrl")
@@ -72,7 +72,6 @@ export async function configure(options: Record<string, unknown>): Promise<Confi
     token,
     sourceID,
     cachePrefix: `v1/${createHash("sha256").update(`${destination}\0${sourceID}`).digest("hex")}/`,
-    sweepIntervalMs,
     readerUrl,
     repositoryRemote,
     serviceFile: options.serviceFile === undefined ? undefined : filename(options.serviceFile, "serviceFile"),

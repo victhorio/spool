@@ -112,21 +112,39 @@ Two uploads are admitted before body allocation; body reading has a 30-second
 limit. These bounds budget for decoding and database work, not just wire bytes.
 Oversized sessions remain unsynced, never truncated. Retry transient connection,
 429 and 5xx failures with bounded backoff. Invalid credentials disable collection
-until reload; request-specific permanent errors are logged and left for a later
-sweep, without blocking other sessions. Logs contain IDs/counts and fixed
-operation/error classifications, not transcripts, credentials or raw error text.
+until reload; request-specific permanent errors are logged and left for another
+source event, reload or explicit repair, without blocking other sessions. Logs
+contain IDs/counts and fixed operation/error classifications, not transcripts,
+credentials or raw error text.
 Database failures also record SQLSTATE when available; public errors stay generic.
 Source clocks do not arbitrate writes.
 
 ## Capture and retention
 
 The plugin coalesces events across loaded Locations and prioritizes dirty
-sessions over backfill. Startup and periodic full content sweeps (default 15
-minutes) reconcile missed events; timestamp/count shortcuts would miss in-place
-edits. One session at a time bounds local work. The plugin runs only while a
-Location has loaded it. An always-on cloud backend does not make a closed client
-capture content. Export excludes unfinished assistants and running
-shell/compaction messages. Its separate source reads are not one transaction.
+sessions over backfill. Startup, Location attachment and reconnect list local
+session metadata and central inventory. Only missing, changed, revision-mismatched
+or outdated-checkpoint sessions are queued. Unchanged message bodies are not
+exported or hashed, and their checkpoints and archives are not rewritten.
+There is no periodic audit or polling timer. Event-triggered captures export and
+hash that session, but skip uploads and checkpoint writes when its info, ordered
+messages and repository are unchanged at the acknowledged revision. Existing
+checkpoints capture once to seed these change markers, retaining message hashes
+and repository identity.
+
+Run `/spool-repair` in OpenCode to queue a full audit of this source's local
+sessions in the background, without a model call. It re-exports content and
+rechecks Git identity, uploading only changed snapshots. Use it for suspected
+missed changes, silent in-place edits that change neither metadata nor events,
+or remote changes without session activity. Repeated requests coalesce; normal
+session events retain priority. `reconciled` logs report queued counts, not
+completion; `captured` logs report uploads. The command cannot recover a session
+already deleted from the local store or resurrect a centrally purged archive.
+
+One session at a time bounds local work. The plugin runs only while a Location
+has loaded it. An always-on cloud backend does not make a closed client capture
+content. Export excludes unfinished assistants and running shell/compaction
+messages. Its separate source reads are not one transaction.
 
 `spool-server session purge <source-uuid> <session-id>` removes info/messages and
 leaves a revisioned tombstone, including for a previously absent session. Future

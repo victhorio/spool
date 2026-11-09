@@ -13,6 +13,7 @@ test("public configuration keeps retrieval opt-in and validates its options", as
     await writeFile(tokenFile, `spool_v1.00000000-0000-0000-0000-000000000001.${"A".repeat(43)}`)
     const options = { url: "http://127.0.0.1:8377", tokenFile }
     expect((await configure(options)).readerUrl).toBeUndefined()
+    expect(await configure({ ...options, sweepIntervalMs: 1000 })).toEqual(await configure(options))
     const configured = await configure({ ...options, readerUrl: "http://100.64.1.2:8378/", repositoryRemote: "archive-origin" })
     expect(configured.readerUrl).toBe("http://100.64.1.2:8378")
     expect(configured.repositoryRemote).toBe("archive-origin")

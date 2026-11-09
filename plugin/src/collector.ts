@@ -11,6 +11,8 @@ interface Checkpoint {
   revision: string | null
   hashes: Record<string, string>
   projectionVersion?: 1 | 2
+  infoHash?: string
+  snapshotHash?: string
   directory?: string
   repository?: string | null
   remote?: string
@@ -63,7 +65,8 @@ export class Collector {
   private client?: OpenCodeClient
   private running?: Promise<void>
   private wake?: () => void
-  private nextSweep = 0
+  private reconcileRequested = true
+  private repairRequested = false
   private failures = 0
   private operation = "opencode_connect"
 
@@ -78,6 +81,8 @@ export class Collector {
   attach(ctx: Plugin.Context): () => Promise<boolean> {
     const events = new AbortController()
     this.members.set(ctx, { events, task: this.subscribe(ctx, events.signal) })
+    this.reconcileRequested = true
+    this.wake?.()
     this.running ??= this.run()
     return async () => {
       events.abort()
@@ -93,6 +98,11 @@ export class Collector {
 
   private log(event: string, fields: Record<string, unknown> = {}): void {
     console.info(JSON.stringify({ component: "spool", event, ...fields }))
+  }
+
+  repair(): void {
+    this.repairRequested = true
+    this.wake?.()
   }
 
   private mark(id: string): void {
@@ -118,9 +128,10 @@ export class Collector {
         if (!signal.aborted) this.log("event_stream_interrupted", { code: errorCode(error) })
       }
       if (!signal.aborted) {
-        this.nextSweep = 0
-        this.wake?.()
         await delay(1_000, undefined, { signal }).catch(() => {})
+        if (signal.aborted) break
+        this.reconcileRequested = true
+        this.wake?.()
       }
     }
   }
@@ -160,26 +171,45 @@ export class Collector {
     return result as T
   }
 
-  private async sweep(): Promise<void> {
+  private async reconcile(full: boolean): Promise<void> {
     const client = await this.connect()
+    const remote = new Map<string, { revision: string; deleted: boolean }>()
     let cursor: string | null = null
     do {
       this.operation = "inventory_read"
       const inventory: Inventory = await this.request(`sessions${cursor ? `?cursor=${encodeURIComponent(cursor)}` : ""}`)
       for (const item of inventory.sessions) {
-        this.revisions.set(item.session_id, item.revision)
+        remote.set(item.session_id, item)
         if (item.deleted) this.purged.add(item.session_id)
       }
       cursor = inventory.next_cursor
     } while (cursor && !this.lifetime.signal.aborted)
+    const ctx = this.members.keys().next().value!
     let localCursor: string | undefined
+    let queued = 0
     do {
       this.operation = "session_list"
       const page = await client.session.list({ limit: 200, ...(localCursor ? { cursor: localCursor } : {}) }, { signal: this.signal() })
-      for (const session of page.data) if (!this.purged.has(session.id)) this.backfill.add(session.id)
+      for (const session of page.data) {
+        const revision = remote.get(session.id)?.revision ?? null
+        this.revisions.set(session.id, revision)
+        if (this.purged.has(session.id)) {
+          this.dirty.delete(session.id)
+          this.backfill.delete(session.id)
+          this.activity.delete(session.id)
+          continue
+        }
+        this.operation = "checkpoint_read"
+        const saved = checkpoint(await ctx.storage.get(`${this.config.cachePrefix}${session.id}`))
+        if (full || !revision || saved?.revision !== revision || saved.projectionVersion !== 2 ||
+            saved.infoHash !== digest(session) || saved.remote !== this.config.repositoryRemote) {
+          this.backfill.add(session.id)
+          queued++
+        }
+      }
       localCursor = page.cursor.next ?? undefined
     } while (localCursor && !this.lifetime.signal.aborted)
-    this.nextSweep = Date.now() + this.config.sweepIntervalMs
+    this.log("reconciled", { full, queued })
   }
 
   private async capture(id: string): Promise<void> {
@@ -202,7 +232,8 @@ export class Collector {
     if (identity.available && (saved?.directory !== directory || saved.repository !== repository || saved.remote !== this.config.repositoryRemote)) {
       // Keep observed identity even if upload fails and the checkout disappears before a retry/restart.
       this.operation = "checkpoint_write"
-      await ctx.storage.set(key, { revision: saved?.revision ?? base, hashes: saved?.hashes ?? {}, ...(saved?.projectionVersion === 1 || saved?.projectionVersion === 2 ? { projectionVersion: saved.projectionVersion } : {}), ...capturedIdentity })
+      const { remote: _remote, ...previous } = saved ?? {}
+      await ctx.storage.set(key, { ...previous, revision: saved?.revision ?? base, hashes: saved?.hashes ?? {}, ...capturedIdentity })
     }
     if (this.dirty.has(id)) return
     const hashes: Record<string, string> = Object.create(null)
@@ -210,6 +241,9 @@ export class Collector {
       hashes[message.id] = digest(message)
       return hashes[message.id] !== known?.[message.id]
     })
+    const infoHash = digest(transcript.info)
+    const snapshotHash = digest([infoHash, transcript.messages.map((message) => [message.id, hashes[message.id]]), repository])
+    if (known && saved?.snapshotHash === snapshotHash) return
     this.operation = "snapshot_upload"
     const result = await this.request<{ revision: string; changed: boolean }>(`sessions/${encodeURIComponent(id)}/snapshot`, {
       method: "POST",
@@ -227,11 +261,11 @@ export class Collector {
     })
     this.revisions.set(id, result.revision)
     this.operation = "checkpoint_write"
-    await ctx.storage.set(key, { revision: result.revision, hashes, projectionVersion: 2, ...capturedIdentity })
+    await ctx.storage.set(key, { revision: result.revision, hashes, projectionVersion: 2, infoHash, snapshotHash, ...capturedIdentity })
     this.log("captured", { session_id: id, revision: result.revision, messages: transcript.messages.length, uploaded_messages: upserts.length })
   }
 
-  private async wait(milliseconds: number): Promise<void> {
+  private async wait(milliseconds?: number): Promise<void> {
     if (this.lifetime.signal.aborted) return
     await new Promise<void>((resolve) => {
       const finish = () => {
@@ -240,7 +274,7 @@ export class Collector {
         this.wake = undefined
         resolve()
       }
-      const timer = setTimeout(finish, Math.max(1, milliseconds))
+      const timer = milliseconds === undefined ? undefined : setTimeout(finish, Math.max(1, milliseconds))
       this.wake = finish
       this.lifetime.signal.addEventListener("abort", finish, { once: true })
     })
@@ -250,17 +284,28 @@ export class Collector {
     while (!this.lifetime.signal.aborted) {
       let current: string | undefined
       try {
-        if (Date.now() >= this.nextSweep) await this.sweep()
+        if (this.reconcileRequested || this.repairRequested) {
+          const full = this.repairRequested
+          this.reconcileRequested = this.repairRequested = false
+          try { await this.reconcile(full) } catch (error) {
+            this.reconcileRequested = true
+            this.repairRequested ||= full
+            throw error
+          }
+        }
         const now = Date.now()
-        let wait = this.nextSweep - now
+        let wait: number | undefined
         pending: for (const queue of [this.dirty, this.backfill]) {
           for (const id of queue) {
             const settle = (this.activity.get(id) ?? 0) + 250 - now
             if (settle <= 0) { current = id; break pending }
-            wait = Math.min(wait, settle)
+            wait = Math.min(wait ?? Infinity, settle)
           }
         }
-        if (!current) { await this.wait(wait); continue }
+        if (!current) {
+          if (!this.reconcileRequested && !this.repairRequested) await this.wait(wait)
+          continue
+        }
         this.dirty.delete(current)
         this.backfill.delete(current)
         this.activity.delete(current)
@@ -286,6 +331,7 @@ export class Collector {
           }
           if (current) this.backfill.add(current)
           this.client = undefined
+          this.reconcileRequested = true
         }
         const backoff = Math.min(30_000, 500 * 2 ** Math.min(this.failures++, 6))
         await delay(backoff, undefined, { signal: this.lifetime.signal }).catch(() => {})

@@ -82,11 +82,11 @@ export class LocalStack {
     return source
   }
 
-  async openCode(label: string, source: Source, url = this.url, sweepIntervalMs = 15 * 60_000) {
+  async openCode(label: string, source: Source, url = this.url) {
     const tokenFile = path.join(this.root, `${label}.token`)
     await Bun.write(tokenFile, source.token)
     await chmod(tokenFile, 0o600)
-    const host = await startOpenCode(path.join(this.root, `opencode-${label}`), path.join(repository, "plugin"), { url, tokenFile, sweepIntervalMs }, this.signal)
+    const host = await startOpenCode(path.join(this.root, `opencode-${label}`), path.join(repository, "plugin"), { url, tokenFile }, this.signal)
     this.hosts.push(host)
     return host
   }

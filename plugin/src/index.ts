@@ -21,6 +21,12 @@ export default Plugin.define({
       throw new Error("Conflicting Spool configuration for the same source; reload all plugin instances after changing credentials or options")
     }
     await registerRetrieval(ctx, config.readerUrl)
+    const active = collector
+    await ctx.command.transform((editor) => editor.add({
+      name: "spool-repair",
+      description: "Re-export all local sessions to repair missed archive changes; runs in the background without a model call",
+      execute: async () => { active.repair() },
+    }))
     const remove = collector.attach(ctx)
     return async () => {
       if (await remove() && collectors.get(key) === collector) collectors.delete(key)

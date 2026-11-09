@@ -36,7 +36,7 @@ async function host(label: string, source: Source, withReader = true) {
   await Bun.write(tokenFile, source.token)
   await chmod(tokenFile, 0o600)
   const value = await startOpenCode(path.join(root, label), path.join(repository, "plugin"), {
-    url: runtime.url, tokenFile, sweepIntervalMs: 1_000, ...(withReader ? { readerUrl: runtime.readerUrl } : {}),
+    url: runtime.url, tokenFile, ...(withReader ? { readerUrl: runtime.readerUrl } : {}),
   }, runtime.signal, [{ package: path.join(repository, "dev", "retrieval-fixture"), options: { query: agentQuery, expectedText: evidence } }])
   hosts.push(value)
   return value

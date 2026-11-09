@@ -40,8 +40,9 @@ then exercises the real plugin → HTTP → release container → PostgreSQL pat
 
 - Structured ordered exports with tools, reasoning, an inline attachment and NUL.
 - Metadata-only deltas with unchanged message-row versions.
-- Eventless mutations with unchanged timestamps/counts, repaired by sweeps.
-- A hot session cannot starve other captures; events work without fast sweeps.
+- Explicit `/spool-repair` for eventless edits with unchanged timestamps/counts;
+  unchanged audits do not upload confirmations or advance revisions.
+- A hot session cannot starve other captures; there are no periodic full sweeps.
 - One collector across Locations, restart checkpoints/backfill and independent stores.
 - Staged and committed undo, including removal of the committed tail.
 - A genuine competing acceptance/409, with source mutation before recapture.
@@ -53,8 +54,9 @@ then exercises the real plugin → HTTP → release container → PostgreSQL pat
   collection-count limits, object shapes, and exact 16 MiB archive / 64 MiB
   projected-envelope boundaries.
 
-The harness uses one-second sweeps to test reconciliation promptly. It uses a
-local HTTP fault proxy; no service dependencies or OpenCode exports are mocked.
+The harness checks startup reconciliation skips unchanged sessions but captures
+changed metadata and missing sessions. It uses a local HTTP fault proxy;
+no service dependencies or OpenCode exports are mocked.
 Only the missed-event fixture writes private SQLite directly, within its isolated
 test store; production capture uses the public export API. There are no live
 model calls. Containers/volumes are removed on completion. Successful runs
@@ -98,7 +100,10 @@ OpenCode config uses a directory package (not its `.ts` entrypoint):
 ```
 
 Store the source token in that private file (mode 0600), not tracked config.
-Options also accept `sweepIntervalMs` (1000–86400000, default 900000).
+The former `sweepIntervalMs` option is accepted for compatibility but ignored;
+idle archives no longer run periodic sweeps. Startup and reconnect reconcile
+metadata/revisions; `/spool-repair` explicitly requests a full content audit
+across this source's local sessions. See [capture and retention](ingestion.md#capture-and-retention).
 Set `readerUrl` to a literal loopback/Tailscale HTTP reader address to expose
 retrieval tools and the bundled skill. Optional `repositoryRemote` selects a
 fetch remote instead of the default origin/sole-remote selection.

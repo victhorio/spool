@@ -79,7 +79,7 @@ function pass(name: string) { passed.push(name); console.log(`PASS ${name}`) }
 try {
   await stack.up()
   const source = await stack.source("primary")
-  let host = await stack.openCode("primary", source, proxy.url.origin, 1_000)
+  let host = await stack.openCode("primary", source, proxy.url.origin)
   await activate(host)
   await activate(host, "project-b")
   const id = "ses_spool_primary"
@@ -103,8 +103,20 @@ try {
   const updated = (await host.client.session.get({ sessionID: id })).time.updated
   mutateWithoutEvent(host, id, "Missed-event edit, same ID, same count, unchanged timestamp")
   assert.equal((await host.client.session.get({ sessionID: id })).time.updated, updated)
+  const silentStart = records.length
+  await delay(1_500)
+  assert.equal(records.length, silentStart, "silent source edits must not trigger background full audits")
+  const commands = await host.client.command.list({ location: { directory: path.join(host.root, "project-a") } })
+  assert(commands.data.some((command) => command.name === "spool-repair"))
+  await host.client.session.command({ sessionID: id, name: "spool-repair", text: "" })
   await converged(host, source, id)
-  pass("periodic sweep repairs an in-place mutation without source events or timestamp changes")
+  const repaired = await archived(source, id)
+  const repairStart = records.length
+  await host.client.session.command({ sessionID: id, name: "spool-repair", text: "" })
+  await delay(1_500)
+  assert.equal(records.length, repairStart, "an unchanged full audit must not upload confirmations")
+  assert.deepEqual(await archived(source, id), repaired)
+  pass("explicit /spool-repair recovers a silent in-place edit; unchanged audits do not upload or advance revisions")
 
   const idB = "ses_spool_other_location"
   await seed(host, idB, "project-b")
@@ -179,16 +191,21 @@ try {
   await host.stop()
   const restartStart = records.length
   // Nothing can be uploaded until a Location loads the plugin in the new process.
-  host = await stack.openCode("primary", source, proxy.url.origin, 1_000)
+  host = await stack.openCode("primary", source, proxy.url.origin)
   const offline = "ses_spool_backfill"
   await seed(host, offline)
+  await host.client.session.update({ sessionID: idB, title: "Changed before plugin activation" })
   assert.equal(await archived(source, offline), undefined)
   await activate(host)
   before = await converged(host, source, id)
+  await converged(host, source, idB)
   await converged(host, source, offline)
-  const restarted = await waitFor("restart capture", async () => records.slice(restartStart).find((record) => record.session === id && record.status === 200), 30_000, stack.signal)
-  assert.equal(restarted.supplied, 0, "first capture after restart should use its persisted checkpoint")
-  pass("OpenCode restart preserves checkpoints and backfills sessions created before plugin activation")
+  await delay(1_500)
+  assert(!records.slice(restartStart).some((record) => record.session === id), "unchanged sessions must not be uploaded on restart")
+  const restarted = records.slice(restartStart).find((record) => record.session === idB && record.status === 200)
+  assert(restarted)
+  assert.equal(restarted.supplied, 0, "changed metadata after restart should retain sparse message deltas")
+  pass("startup skips unchanged sessions, captures changed metadata and backfills sessions created before activation")
 
   const second = await stack.source("second")
   const secondHost = await stack.openCode("second", second, proxy.url.origin)
@@ -199,9 +216,9 @@ try {
   assert.deepEqual(after.messages, before.messages)
   pass("two isolated OpenCode stores with identical IDs remain source-scoped")
 
-  await secondHost.client.session.update({ sessionID: id, title: "Event-driven capture before the next 15-minute sweep" })
+  await secondHost.client.session.update({ sessionID: id, title: "Event-driven capture without periodic sweeps" })
   await converged(secondHost, second, id, 5_000)
-  pass("source events trigger capture independently of periodic reconciliation")
+  pass("source events trigger capture without periodic reconciliation")
 
   await host.client.session.remove({ sessionID: offline })
   await delay(1_500)

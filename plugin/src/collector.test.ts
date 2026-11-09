@@ -17,7 +17,7 @@ interface Upload {
   retrieval: Retrieval
 }
 
-test.each([undefined, 1])("collector upgrades projection checkpoint %s, sends sparse deltas and retains deleted-session repository", async (projectionVersion) => {
+test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on demand and retains deleted-worktree identity", async (projectionVersion) => {
   const root = await mkdtemp(path.join(tmpdir(), "spool-capture-"))
   const directory = path.join(root, "historical-session")
   const git = (...args: string[]) => execFileSync("git", args, { cwd: directory, timeout: 5_000, stdio: "pipe" })
@@ -37,11 +37,14 @@ test.each([undefined, 1])("collector upgrades projection checkpoint %s, sends sp
   let conflict = false
   let conflicted = false
   let loseAcknowledgement = false
+  let exports = 0
+  let lists = 0
+  let onList: (() => Promise<void>) | undefined
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const pathname = new URL(request.url).pathname
     if (pathname === "/api/info") return Response.json({ pid: process.pid })
-    if (pathname === "/api/session") return Response.json({ data: [transcript.info], cursor: {} })
-    if (pathname === "/api/experimental/session/ses_synthetic/export") return Response.json({ data: transcript })
+    if (pathname === "/api/session") { lists++; await onList?.(); return Response.json({ data: [transcript.info], cursor: {} }) }
+    if (pathname === "/api/experimental/session/ses_synthetic/export") { exports++; return Response.json({ data: transcript }) }
     if (request.method === "GET") return Response.json({ sessions: revision ? [{ session_id: "ses_synthetic", revision, deleted: false }] : [], next_cursor: null })
     const body = await request.json() as Upload
     uploads.push(body)
@@ -59,18 +62,30 @@ test.each([undefined, 1])("collector upgrades projection checkpoint %s, sends sp
     return Response.json({ revision, changed: true })
   } })
   const config: Config = {
-    url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", sweepIntervalMs: 30,
-    opencodeUrl: server.url.origin,
+    url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/",
+    opencodeUrl: server.url.origin, repositoryRemote: "origin",
   }
+  const events: string[] = []
+  let wake: (() => void) | undefined
+  const emit = (type = "session.metadata.updated") => { events.push(type); wake?.() }
   const ctx = {
     // Deliberately different: capture must not probe the active plugin's Location.
     location: { directory: root },
     storage: { get: async (key: string) => checkpoints.get(key), set: async (key: string, value: unknown) => { checkpoints.set(key, value) } },
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
-      await new Promise<void>((resolve) => { signal.addEventListener("abort", () => resolve(), { once: true }) })
+      const abort = () => wake?.()
+      signal.addEventListener("abort", abort, { once: true })
+      try {
+        while (!signal.aborted) {
+          const type = events.shift()
+          if (!type) { await new Promise<void>((resolve) => { wake = resolve }); continue }
+          if (type === "disconnect") return
+          yield { type, durable: { aggregateID: "ses_synthetic" } }
+        }
+      } finally { signal.removeEventListener("abort", abort) }
     } },
   } as unknown as Plugin.Context
-  const collector = new Collector(config, "2.2.5")
+  let collector = new Collector(config, "2.2.5")
   let remove: (() => Promise<boolean>) | undefined = collector.attach(ctx)
   async function next(predicate: (upload: Upload) => boolean, after = 0): Promise<Upload> {
     const deadline = Date.now() + 3_000
@@ -83,27 +98,65 @@ test.each([undefined, 1])("collector upgrades projection checkpoint %s, sends sp
   }
   try {
     const first = await next(() => true)
-    expect(first.upsert_messages).toEqual(transcript.messages)
-    expect(first.retrieval.messages.map((message) => message.id)).toEqual(["msg_synthetic"])
+    expect(first.upsert_messages).toEqual(projectionVersion === 2 ? [] : transcript.messages)
+    expect(first.retrieval.messages.map((message) => message.id)).toEqual(projectionVersion === 2 ? [] : ["msg_synthetic"])
     expect(first.info).toEqual(transcript.info)
     expect(first.retrieval.repository).toBe("github.com/captured/repository")
-    expect(first.retrieval.messages[0]!.conversation).toBe("fixture\\u0000text")
-    expect(first.retrieval.messages[0]!.conversation_spans).toHaveLength(1)
-    expect(first.retrieval.messages[0]!.tool_spans).toEqual([])
-    await next((upload) => upload.upsert_messages.length === 0)
+    if (projectionVersion !== 2) {
+      expect(first.retrieval.messages[0]!.conversation).toBe("fixture\\u0000text")
+      expect(first.retrieval.messages[0]!.conversation_spans).toHaveLength(1)
+      expect(first.retrieval.messages[0]!.tool_spans).toEqual([])
+    }
+    await Bun.sleep(100)
     expect((checkpoints.get("fixture/ses_synthetic") as { projectionVersion: number }).projectionVersion).toBe(2)
+    const idle = { exports, lists, uploads: uploads.length, checkpoint: checkpoints.get("fixture/ses_synthetic") }
+    await Bun.sleep(400)
+    expect({ exports, lists, uploads: uploads.length, checkpoint: checkpoints.get("fixture/ses_synthetic") }).toEqual(idle)
+    emit()
+    await Bun.sleep(400)
+    expect(exports).toBe(idle.exports + 1)
+    expect(uploads).toHaveLength(idle.uploads)
+    expect(checkpoints.get("fixture/ses_synthetic")).toBe(idle.checkpoint)
     transcript.info.title = "Metadata-only change"
+    emit()
     const metadata = await next((upload) => (upload.info as { title: string }).title === "Metadata-only change")
     expect(metadata.upsert_messages).toHaveLength(0)
     expect(metadata.retrieval.messages).toHaveLength(0)
-    const changed = uploads.length
     const message = transcript.messages[0] as { text: string }
+    message.text = "Content event with unchanged metadata"
+    emit("session.text.ended")
+    const eventDelta = await next((upload) => upload.upsert_messages.some((item) => item.text === message.text))
+    expect(eventDelta.retrieval.messages[0]!.conversation).toBe("Content event with unchanged metadata")
+    const changed = uploads.length
     message.text = "Changed evidence"
+    await Bun.sleep(400)
+    expect(uploads).toHaveLength(changed)
+    collector.repair()
     const delta = await next((upload) => upload.upsert_messages.some((item) => item.text === "Changed evidence"), changed)
     expect(delta.retrieval.messages).toHaveLength(1)
     expect(delta.retrieval.messages[0]!.conversation).toBe("Changed evidence")
+    await Bun.sleep(100)
+    await remove()
+    const previous = checkpoints.get("fixture/ses_synthetic") as { remote?: string }
+    const { remote: _remote, ...withoutOverride } = previous
+    delete config.repositoryRemote
+    const switched = { exports, uploads: uploads.length }
+    collector = new Collector(config, "2.2.5")
+    remove = collector.attach(ctx)
+    await Bun.sleep(400)
+    expect(exports).toBe(switched.exports + 1)
+    expect(uploads).toHaveLength(switched.uploads)
+    expect(checkpoints.get("fixture/ses_synthetic")).toEqual(withoutOverride)
+    await remove()
+    collector = new Collector(config, "2.2.5")
+    remove = collector.attach(ctx)
+    await Bun.sleep(400)
+    expect(exports).toBe(switched.exports + 1)
+    expect(uploads).toHaveLength(switched.uploads)
+    expect(checkpoints.get("fixture/ses_synthetic")).toEqual(withoutOverride)
     loseAcknowledgement = true
     git("remote", "set-url", "origin", "https://new.example/Actual/Origin.git")
+    collector.repair()
     await next((upload) => upload.retrieval.repository === "new.example/Actual/Origin")
     expect((checkpoints.get("fixture/ses_synthetic") as { repository: string }).repository).toBe("new.example/Actual/Origin")
     const stop = remove
@@ -114,10 +167,39 @@ test.each([undefined, 1])("collector upgrades projection checkpoint %s, sends sp
     remove = new Collector(config, "2.2.5").attach(ctx)
     expect((await next(() => true, deleted)).retrieval.repository).toBe("new.example/Actual/Origin")
     conflict = true
+    transcript.info.title = "Trigger conflict"
+    emit()
     await next((upload) => conflicted && upload.base_revision === null, uploads.length)
     const retry = uploads.findLast((upload) => upload.base_revision === null)!
     expect(retry.upsert_messages).toHaveLength(1)
     expect(retry.retrieval.repository).toBe("new.example/Actual/Origin")
+    await Bun.sleep(100)
+    await remove()
+    const restarted = { exports, uploads: uploads.length }
+    remove = new Collector(config, "2.2.5").attach(ctx)
+    await Bun.sleep(400)
+    expect({ exports, uploads: uploads.length }).toEqual(restarted)
+    emit("disconnect")
+    await Bun.sleep(1_400)
+    expect({ exports, uploads: uploads.length }).toEqual(restarted)
+    emit("disconnect")
+    await Bun.sleep(400)
+    transcript.info.title = "Changed during disconnected event stream"
+    const recovered = await next((upload) => (upload.info as { title: string }).title === transcript.info.title)
+    expect(recovered.upsert_messages).toHaveLength(0)
+    await Bun.sleep(100)
+    await remove()
+    message.text = "Silent edit repaired during startup reconciliation"
+    const entered = Promise.withResolvers<void>()
+    const release = Promise.withResolvers<void>()
+    onList = async () => { onList = undefined; entered.resolve(); await release.promise }
+    const pending = new Collector(config, "2.2.5")
+    remove = pending.attach(ctx)
+    await entered.promise
+    pending.repair()
+    release.resolve()
+    const pendingRepair = await next((upload) => upload.upsert_messages.some((item) => item.text === message.text))
+    expect(pendingRepair.retrieval.messages[0]!.conversation).toBe("Silent edit repaired during startup reconciliation")
   } finally {
     await remove?.()
     await server.stop(true)
