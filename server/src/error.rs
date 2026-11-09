@@ -1,10 +1,13 @@
 use axum::{Json, http::StatusCode, response::IntoResponse};
 use serde_json::json;
 
+use crate::retrieval::PAGE_BYTES;
+
 pub(crate) struct ApiError {
     status: StatusCode,
     code: &'static str,
     revision: Option<Option<i64>>,
+    candidates: Option<(Vec<String>, bool)>,
 }
 
 impl ApiError {
@@ -13,6 +16,7 @@ impl ApiError {
             status,
             code,
             revision: None,
+            candidates: None,
         }
     }
 
@@ -29,6 +33,7 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: "revision_conflict",
             revision: Some(current),
+            candidates: None,
         }
     }
 
@@ -37,6 +42,14 @@ impl ApiError {
             status: StatusCode::CONFLICT,
             code: "session_changed",
             revision: Some(Some(current)),
+            candidates: None,
+        }
+    }
+
+    pub fn ambiguous_session(candidates: Vec<String>, more: bool) -> Self {
+        Self {
+            candidates: Some((candidates, more)),
+            ..Self::new(StatusCode::CONFLICT, "ambiguous_session")
         }
     }
 
@@ -68,6 +81,19 @@ impl IntoResponse for ApiError {
         if let Some(revision) = self.revision {
             error["current_revision"] = json!(revision.map(|value| value.to_string()));
         }
-        (self.status, Json(json!({ "error": error }))).into_response()
+        let mut body = json!({ "error": error });
+        if let Some((candidates, more)) = self.candidates {
+            body["error"]["candidates"] = json!(candidates);
+            body["error"]["more"] = json!(more);
+            while serde_json::to_vec(&body).expect("serializable error").len() > PAGE_BYTES {
+                body["error"]["candidates"]
+                    .as_array_mut()
+                    .expect("ambiguity candidates")
+                    .pop()
+                    .expect("bounded individual candidate");
+                body["error"]["more"] = json!(true);
+            }
+        }
+        (self.status, Json(body)).into_response()
     }
 }

@@ -19,6 +19,17 @@ test("public configuration keeps retrieval opt-in and validates its options", as
     expect(configured.repositoryRemote).toBe("archive-origin")
     await expect(configure({ ...options, readerUrl: "http://localhost:8378" })).rejects.toThrow()
     await expect(configure({ ...options, repositoryRemote: "bad\0remote" })).rejects.toThrow()
+    const original = await configure(options)
+    expect(original.sourceAlias).toBeUndefined()
+    for (const sourceAlias of ["laptop", "work-01", "a", "a".repeat(32)]) {
+      const named = await configure({ ...options, sourceAlias })
+      expect(named.sourceAlias).toBe(sourceAlias)
+      expect(named.cachePrefix).toBe(original.cachePrefix)
+      expect(named.sourceID).toBe(original.sourceID)
+    }
+    for (const sourceAlias of [null, 1, "", "Laptop", "1laptop", "-laptop", "with_underscore", "a/b", "界", "a".repeat(33), "laptop\n", "laptop\0"]) {
+      await expect(configure({ ...options, sourceAlias })).rejects.toThrow("sourceAlias")
+    }
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
@@ -39,14 +50,27 @@ test("tool inputs distinguish cursor-only from bounded initial arguments", () =>
   expect(validInput("read", { session, start: 1, end: 3 })).toBe(true)
   for (const route of ["find", "search", "read"] as const) {
     expect(validInput(route, { cursor: "opaque-cursor" })).toBe(true)
+    expect(validInput(route, { cursor: "x".repeat(8192) })).toBe(true)
     expect(validInput(route, { cursor: "opaque", limit: 1 })).toBe(false)
     expect(validInput(route, { cursor: "" })).toBe(false)
     expect(validInput(route, { cursor: "x".repeat(8193) })).toBe(false)
   }
   for (const value of [{ query: "" }, { query: " " }, { query: "界".repeat(171) }, { query: Array(17).fill("term").join(" ") }, { limit: 51 }, { limit: 1.5 }, { include_tools: "true" }, { unexpected: true }, { toString: "bad" }]) expect(validInput("find", value)).toBe(false)
-  for (const value of [{ query: "term" }, { session }, { session, query: " " }, { session: "no-source", query: "term" }]) expect(validInput("search", value)).toBe(false)
+  for (const value of [{ query: "term" }, { session }, { session, query: " " }]) expect(validInput("search", value)).toBe(false)
   for (const value of [{ session, start: 0 }, { session, start: 3, end: 2 }, { session, end: 100_001 }, { session, end: Number.MAX_SAFE_INTEGER + 1 }, { session, revision: "0" }, { session, revision: "9223372036854775808" }]) expect(validInput("read", value)).toBe(false)
   expect(validInput("read", { session: `00000000-0000-0000-0000-000000000001/${"x".repeat(513)}` })).toBe(false)
+})
+
+test("session references accept native IDs, aliases and legacy UUIDs within byte bounds", () => {
+  const uuid = "ABCDEF00-0000-0000-0000-000000000001"
+  for (const session of ["ses_fixture", "native-id", "x".repeat(512), "界".repeat(170), "laptop/ses_fixture", `${"a".repeat(32)}/${"x".repeat(512)}`, `${uuid}/ses_fixture`, `${uuid}/${"x".repeat(512)}`]) {
+    expect(validInput("search", { session, query: "term" })).toBe(true)
+    expect(validInput("read", { session })).toBe(true)
+  }
+  for (const session of ["", null, 1, "x".repeat(513), "界".repeat(171), "ses_\0fixture", "/ses_fixture", "laptop/", "Laptop/ses_fixture", "1laptop/ses_fixture", "a_b/ses_fixture", `${"a".repeat(33)}/ses_fixture`, `laptop/${"界".repeat(171)}`, "laptop\n/ses_fixture", `${uuid}\n/ses_fixture`, "laptop/ses_\0fixture"]) {
+    expect(validInput("search", { session, query: "term" })).toBe(false)
+    expect(validInput("read", { session })).toBe(false)
+  }
 })
 
 test("reader transport is bounded, unauthenticated, redirect-free and hides error bodies", async () => {
@@ -86,6 +110,36 @@ test("reader transport is bounded, unauthenticated, redirect-free and hides erro
     const before = calls
     expect(JSON.parse(await requestReader(server.url.origin, "find", { cursor: "cursor", query: "mixed" })).error.code).toBe("malformed_request")
     expect(calls).toBe(before)
+  } finally { await server.stop(true) }
+})
+
+test("ambiguous sessions forward only bounded qualified candidates and a boolean more flag", async () => {
+  const candidates = ["laptop/ses_fixture", "00000000-0000-0000-0000-000000000001/ses_fixture"]
+  let error: Record<string, unknown> = { code: "ambiguous_session", candidates, more: false, detail: "SECRET_ERROR_BODY" }
+  let status = 409
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    expect(await request.json()).toEqual({ session: "ses_fixture" })
+    return Response.json({ error, secret: "SECRET_ERROR_BODY" }, { status })
+  } })
+  try {
+    const call = async () => JSON.parse(await requestReader(server.url.origin, "read", { session: "ses_fixture" }))
+    expect(await call()).toEqual({ error: { code: "ambiguous_session", candidates, more: false } })
+    const maximum = Array.from({ length: 10 }, (_, i) => `source-${i}/${"x".repeat(512)}`)
+    error = { code: "ambiguous_session", candidates: maximum, more: true }
+    expect(await call()).toEqual({ error })
+    for (const invalid of [undefined, null, [], "laptop/ses_fixture", ["ses_fixture"], ["Laptop/ses_fixture"], ["laptop/"], ["laptop/ses_\0fixture"], [`laptop/${"x".repeat(513)}`], [...maximum, "extra/ses_fixture"], [null], [{ session: "laptop/ses_fixture" }]]) {
+      error = { code: "ambiguous_session", candidates: invalid, more: false }
+      expect(await call()).toEqual({ error: { code: "reader_unavailable" } })
+    }
+    for (const more of [undefined, null, "false", 0]) {
+      error = { code: "ambiguous_session", candidates, more }
+      expect(await call()).toEqual({ error: { code: "reader_unavailable" } })
+    }
+    error = { code: "ambiguous_session", candidates, more: false }
+    for (const invalidStatus of [200, 400, 500]) {
+      status = invalidStatus
+      expect(await call()).toEqual({ error: { code: "reader_unavailable" } })
+    }
   } finally { await server.stop(true) }
 })
 

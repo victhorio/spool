@@ -1,13 +1,13 @@
 import { readFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 import { Skill, type Plugin } from "@opencode/plugin"
-import { readerURL } from "./config"
+import { readerURL, validSourceAlias } from "./config"
 
 type Route = "find" | "search" | "read"
 const maximumBytes = 24 * 1024
 const errorResult = (code: string, current_revision?: string) => JSON.stringify({ error: { code, ...(current_revision ? { current_revision } : {}) } })
 const string = { type: "string", minLength: 1 }
-const session = { ...string, maxLength: 549, description: "Opaque source-qualified session reference returned by find." }
+const session = { ...string, maxLength: 549, description: "Native OpenCode ID (when globally unique), alias/ID, or legacy source-UUID/ID. On ambiguous_session, select a returned qualified candidate." }
 const revision = { ...string, maxLength: 19, pattern: "^[0-9]+$" }
 const query = { ...string, maxLength: 512, description: "Case-insensitive literal whitespace terms, AND within one title/message; at most 512 UTF-8 bytes and 16 terms. No query DSL." }
 const boolean = { type: "boolean" }
@@ -15,7 +15,7 @@ const integer = (maximum?: number, defaultValue?: number) => ({ type: "integer",
 const definitions = {
   find: {
     name: "find_sessions",
-    description: "Find archived sessions across sources. Query and exact repository key are optional; no implicit current-repository filter. Returns session references, one snippet each, revisions, capture times and archive coverage.",
+    description: "Find archived sessions across sources. Query and exact repository key are optional; no implicit current-repository filter. Returns source-qualified session references, one snippet each, revisions, capture times and archive coverage.",
     properties: { query, repository: { ...string, description: "Exact normalized host/path key (not a folder name or URL)." }, include_tools: boolean, limit: integer(50, 10) },
     required: [],
   },
@@ -37,6 +37,16 @@ function validRevision(value: unknown): value is string {
   return typeof value === "string" && /^[0-9]{1,19}$/.test(value) && BigInt(value) > 0 && BigInt(value) <= 9223372036854775807n
 }
 
+function validSession(value: unknown, qualifiedOnly = false): value is string {
+  if (typeof value !== "string" || !value || value.includes("\0")) return false
+  const slash = value.indexOf("/")
+  if (slash < 0) return !qualifiedOnly && Buffer.byteLength(value) <= 512
+  const source = value.slice(0, slash)
+  const id = value.slice(slash + 1)
+  return (validSourceAlias(source) || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.exec(source)?.[0] === source) &&
+    !!id && Buffer.byteLength(id) <= 512
+}
+
 export function validInput(route: Route, value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const input = value as Record<string, unknown>
@@ -55,9 +65,7 @@ export function validInput(route: Route, value: unknown): value is Record<string
     } else if (key === "revision") {
       if (!validRevision(item)) return false
     } else if (key === "session") {
-      if (typeof item !== "string") return false
-      const slash = item.indexOf("/")
-      if (slash !== 36 || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(item.slice(0, slash)) || !text(item.slice(slash + 1), 512)) return false
+      if (!validSession(item)) return false
     } else if (!text(item, 1024)) return false
   }
   return !(route === "read" && typeof input.end === "number" && input.end < (typeof input.start === "number" ? input.start : 1))
@@ -86,8 +94,14 @@ export async function requestReader(base: string, route: Route, input: unknown, 
     } finally { await reader.cancel().catch(() => {}) }
     const raw = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))
     const parsed = JSON.parse(raw)
+    const code = parsed?.error?.code
+    if (code === "ambiguous_session") {
+      const { candidates, more } = parsed.error
+      if (response.status !== 409 || !Array.isArray(candidates) || candidates.length < 1 || candidates.length > 10 ||
+          !candidates.every((candidate: unknown) => validSession(candidate, true)) || typeof more !== "boolean") return errorResult("reader_unavailable")
+      return JSON.stringify({ error: { code, candidates, more } })
+    }
     if (!response.ok) {
-      const code = parsed?.error?.code
       if (code === "session_changed" && validRevision(parsed?.error?.current_revision)) return errorResult(code, parsed.error.current_revision)
       return errorResult(["session_changed", "not_indexed", "malformed_request", "not_found"].includes(code) ? code : "reader_unavailable")
     }

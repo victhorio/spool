@@ -16,7 +16,7 @@ END
 $$;
 
 GRANT USAGE ON SCHEMA public TO spool_reader;
-GRANT SELECT (id, label) ON public.sources TO spool_reader;
+GRANT SELECT (id, label, alias) ON public.sources TO spool_reader;
 GRANT SELECT (source_id, session_id, revision, info, captured_at, received_at, deleted_at,
     retrieval_title, repository, activity)
     ON public.sessions TO spool_reader;

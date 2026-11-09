@@ -52,6 +52,18 @@ impl Harness {
         (status, body)
     }
 
+    async fn source_alias(&self, token: &str, alias: &str) -> (StatusCode, Value) {
+        let response = self
+            .client
+            .put(format!("{}/v1/sync/source", self.url))
+            .bearer_auth(token)
+            .json(&json!({"alias": alias}))
+            .send()
+            .await
+            .unwrap();
+        (response.status(), response.json().await.unwrap())
+    }
+
     async fn inventory(&self, token: &str) -> Value {
         self.client
             .get(format!("{}/v1/sync/sessions", self.url))
@@ -168,6 +180,9 @@ async fn postgres_http_contract() {
     // Keep cleanup outside the task so failed assertions also drop the disposable DB.
     let result = tokio::spawn(async move {
         let (_, outage_token) = harness.source("outage");
+        source_alias_assignment(&harness).await;
+        source_alias_validation(&harness).await;
+        source_alias_races(&harness).await;
         isolation_and_sparse_mutations(&harness).await;
         revisions_and_races(&harness).await;
         large_sessions(&harness).await;
@@ -207,6 +222,323 @@ async fn postgres_http_contract() {
         .unwrap();
     admin.close().await;
     result.unwrap();
+}
+
+async fn source_alias_assignment(h: &Harness) {
+    let (a, token_a) = h.source("alias A");
+    let (b, token_b) = h.source("alias B");
+    let url = format!("{}/v1/sync/source", h.url);
+    let unauthorized = (
+        StatusCode::UNAUTHORIZED,
+        json!({"error": {"code": "unauthorized"}}),
+    );
+    let response = h.client.put(&url).body("not JSON").send().await.unwrap();
+    assert_eq!(
+        (response.status(), response.json::<Value>().await.unwrap()),
+        unauthorized
+    );
+    let forged = token_b.replace(&b.to_string(), &a.to_string());
+    for token in [&forged, "wrong", "spool_v1.invalid.invalid"] {
+        assert_eq!(h.source_alias(token, "machine-a").await, unauthorized);
+    }
+    let hash: Vec<u8> = sqlx::query_scalar("SELECT token_hash FROM sources WHERE id = $1")
+        .bind(a)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.source_alias(&token_a, "machine-a").await,
+        (StatusCode::OK, json!({"alias": "machine-a"}))
+    );
+    let state: (String, Vec<u8>) =
+        sqlx::query_as("SELECT alias, token_hash FROM sources WHERE id = $1")
+            .bind(a)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, ("machine-a".into(), hash));
+    let other: Option<String> = sqlx::query_scalar("SELECT alias FROM sources WHERE id = $1")
+        .bind(b)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        other, None,
+        "assignment must only affect the authenticated source"
+    );
+
+    // Authentication touches last_seen_at; a repeat must not also write the alias column.
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_alias_rewrite() RETURNS trigger LANGUAGE plpgsql AS $$ \
+         BEGIN RAISE EXCEPTION 'alias must not be rewritten'; END; $$; \
+         CREATE TRIGGER reject_alias_rewrite BEFORE UPDATE OF alias ON sources \
+         FOR EACH ROW WHEN (OLD.alias IS NOT NULL) EXECUTE FUNCTION reject_alias_rewrite();",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        h.source_alias(&token_a, "machine-a").await,
+        (StatusCode::OK, json!({"alias": "machine-a"}))
+    );
+    let mismatch = (
+        StatusCode::CONFLICT,
+        json!({"error": {"code": "source_alias_mismatch"}}),
+    );
+    assert_eq!(h.source_alias(&token_a, "renamed").await, mismatch);
+    let conflict = (
+        StatusCode::CONFLICT,
+        json!({"error": {"code": "source_alias_conflict"}}),
+    );
+    assert_eq!(h.source_alias(&token_b, "machine-a").await, conflict);
+    assert_eq!(
+        h.source_alias(&token_b, "machine-b").await,
+        (StatusCode::OK, json!({"alias": "machine-b"}))
+    );
+    assert_eq!(h.source_alias(&token_a, "machine-b").await, mismatch);
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_alias_rewrite ON sources; DROP FUNCTION reject_alias_rewrite();",
+    )
+    .execute(&h.pool)
+    .await
+    .unwrap();
+
+    let rotated = h.cli(&["source", "rotate", &a.to_string()]);
+    let new_token = rotated["token"].as_str().unwrap();
+    assert_eq!(h.source_alias(&token_a, "machine-a").await, unauthorized);
+    assert_eq!(
+        h.source_alias(new_token, "machine-a").await,
+        (StatusCode::OK, json!({"alias": "machine-a"}))
+    );
+    assert_eq!(h.source_alias(new_token, "renamed").await, mismatch);
+    h.cli(&["source", "revoke", &a.to_string()]);
+    assert_eq!(h.source_alias(new_token, "machine-a").await, unauthorized);
+    let (_, token_c) = h.source("alias C");
+    assert_eq!(h.source_alias(&token_c, "machine-a").await, conflict);
+    let retained: String =
+        sqlx::query_scalar("SELECT alias FROM sources WHERE id = $1 AND revoked_at IS NOT NULL")
+            .bind(a)
+            .fetch_one(&h.pool)
+            .await
+            .unwrap();
+    assert_eq!(retained, "machine-a");
+}
+
+async fn source_alias_validation(h: &Harness) {
+    let (source, token) = h.source("alias validation");
+    let url = format!("{}/v1/sync/source", h.url);
+    let malformed = json!({"error": {"code": "malformed_request"}});
+    for body in [
+        "{",
+        "{}",
+        "null",
+        "[]",
+        r#"["machine"]"#,
+        r#"{"alias":null}"#,
+        r#"{"alias":1}"#,
+        r#"{"alias":"machine","extra":true}"#,
+        r#"{"alias":"machine","source_id":"other"}"#,
+        r#"{"alias":"machine","alias":"machine"}"#,
+        r#"{"alias":"machine"} {}"#,
+    ] {
+        let response = h
+            .client
+            .put(&url)
+            .bearer_auth(&token)
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        assert_eq!(response.json::<Value>().await.unwrap(), malformed, "{body}");
+    }
+    for alias in [
+        "",
+        "A",
+        "1machine",
+        "-machine",
+        "machine_name",
+        "machine.name",
+        "machine name",
+        "machine\n",
+        "é",
+        "aé",
+        "a\0",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ] {
+        assert_eq!(
+            h.source_alias(&token, alias).await,
+            (StatusCode::BAD_REQUEST, malformed.clone()),
+            "{alias:?}"
+        );
+        if !alias.contains('\0') {
+            let error = sqlx::query("UPDATE sources SET alias = $2 WHERE id = $1")
+                .bind(source)
+                .bind(alias)
+                .execute(&h.pool)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error.as_database_error().unwrap().code().as_deref(),
+                Some("23514"),
+                "database must also reject {alias:?}"
+            );
+        }
+    }
+    let unassigned: Option<String> = sqlx::query_scalar("SELECT alias FROM sources WHERE id = $1")
+        .bind(source)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(unassigned, None);
+    for (content_type, encoding, code) in [
+        ("text/plain", "identity", "unsupported_content_type"),
+        ("application/json", "gzip", "unsupported_content_encoding"),
+    ] {
+        let response = h
+            .client
+            .put(&url)
+            .bearer_auth(&token)
+            .header("content-type", content_type)
+            .header("content-encoding", encoding)
+            .body(r#"{"alias":"machine"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            code
+        );
+    }
+    let response = h
+        .client
+        .put(&url)
+        .bearer_auth(&token)
+        .header("content-type", "application/json")
+        .body(vec![b' '; 1025])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    assert_eq!(
+        response.json::<Value>().await.unwrap()["error"]["code"],
+        "payload_too_large"
+    );
+    let mut chunked = tokio::net::TcpStream::connect(h.url.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    chunked.write_all(format!("PUT /v1/sync/source HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n401\r\n{}\r\n0\r\n\r\n", " ".repeat(1025)).as_bytes()).await.unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        chunked.read_to_string(&mut response),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(response.starts_with("HTTP/1.1 413"));
+    assert!(response.contains("payload_too_large"));
+
+    let mut slow = tokio::net::TcpStream::connect(h.url.strip_prefix("http://").unwrap())
+        .await
+        .unwrap();
+    slow.write_all(format!("PUT /v1/sync/source HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {token}\r\nContent-Type: application/json\r\nContent-Length: 15\r\nConnection: close\r\n\r\n").as_bytes()).await.unwrap();
+    let mut response = String::new();
+    tokio::time::timeout(Duration::from_secs(8), slow.read_to_string(&mut response))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(response.starts_with("HTTP/1.1 400"));
+    assert!(response.contains("request_timeout"));
+    let response = h
+        .client
+        .put(&url)
+        .bearer_auth(&token)
+        .header("content-type", "Application/JSON; charset=utf-8")
+        .body(format!("{:1024}", r#"{"alias":"body-boundary"}"#))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.json::<Value>().await.unwrap(),
+        json!({"alias": "body-boundary"})
+    );
+
+    for alias in ["a", "a0-", "a123456789012345678901234567890-"] {
+        let (_, token) = h.source("valid alias boundary");
+        assert_eq!(
+            h.source_alias(&token, alias).await,
+            (StatusCode::OK, json!({"alias": alias}))
+        );
+    }
+}
+
+async fn source_alias_races(h: &Harness) {
+    let (source, token) = h.source("alias same source race");
+    let (a, b) = tokio::join!(
+        h.source_alias(&token, "race-a"),
+        h.source_alias(&token, "race-b"),
+    );
+    let mismatch = (
+        StatusCode::CONFLICT,
+        json!({"error": {"code": "source_alias_mismatch"}}),
+    );
+    let winner = if a.0 == StatusCode::OK {
+        assert_eq!(a.1, json!({"alias": "race-a"}));
+        assert_eq!(b, mismatch);
+        "race-a"
+    } else {
+        assert_eq!(a, mismatch);
+        assert_eq!(b, (StatusCode::OK, json!({"alias": "race-b"})));
+        "race-b"
+    };
+    let assigned: String = sqlx::query_scalar("SELECT alias FROM sources WHERE id = $1")
+        .bind(source)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(assigned, winner);
+
+    let (_, token) = h.source("alias repeat race");
+    let expected = (StatusCode::OK, json!({"alias": "race-repeat"}));
+    let (a, b) = tokio::join!(
+        h.source_alias(&token, "race-repeat"),
+        h.source_alias(&token, "race-repeat"),
+    );
+    assert_eq!(a, expected);
+    assert_eq!(b, expected);
+
+    let (source_a, token_a) = h.source("alias cross source race A");
+    let (source_b, token_b) = h.source("alias cross source race B");
+    let (a, b) = tokio::join!(
+        h.source_alias(&token_a, "race-shared"),
+        h.source_alias(&token_b, "race-shared"),
+    );
+    let conflict = (
+        StatusCode::CONFLICT,
+        json!({"error": {"code": "source_alias_conflict"}}),
+    );
+    let loser = if a.0 == StatusCode::OK {
+        assert_eq!(a.1, json!({"alias": "race-shared"}));
+        assert_eq!(b, conflict);
+        source_b
+    } else {
+        assert_eq!(a, conflict);
+        assert_eq!(b, (StatusCode::OK, json!({"alias": "race-shared"})));
+        source_a
+    };
+    let unassigned: Option<String> = sqlx::query_scalar("SELECT alias FROM sources WHERE id = $1")
+        .bind(loser)
+        .fetch_one(&h.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        unassigned, None,
+        "losing a name race must not assign any alias"
+    );
 }
 
 async fn isolation_and_sparse_mutations(h: &Harness) {

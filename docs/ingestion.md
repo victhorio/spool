@@ -33,9 +33,21 @@ local token file and reload all plugin instances. `source revoke <uuid>` blocks
 future authentication. Already authenticated in-flight work may finish.
 Admin commands require direct database access; there is no enrollment endpoint.
 
+The optional plugin `sourceAlias` registers a short, globally unique name for
+that credential's source. Names are stable and reserved even after revocation;
+they do not replace UUID credentials or change session identity. See
+[session references](retrieval.md#session-references) and [client setup](client-setup.md).
+
 ## HTTP
 
 - `GET /healthz`: empty 200 when PostgreSQL is reachable, otherwise 503.
+- `PUT /v1/sync/source`: authenticated assignment of `{ "alias": "work-m5" }`
+  to the token's source. Names match `^[a-z][a-z0-9-]{0,31}$`. Returns 200 with
+  `{ "alias": "work-m5" }`, including on an identical repeat. A different
+  assigned name returns 409 `source_alias_mismatch`; a name reserved by another
+  source returns 409 `source_alias_conflict`. No renaming or clearing operation.
+  JSON objects only, no unknown fields, 1024-byte body limit and five-second
+  body deadline. Omitting the plugin setting leaves the stored name untouched.
 - `GET /v1/sync/sessions?limit=200&cursor=…`: source-scoped inventory, ordered
   by session ID. Limit 1–500. Returns
   `{"sessions":[{"session_id":"ses_…","revision":"7","deleted":false}],"next_cursor":null}`.

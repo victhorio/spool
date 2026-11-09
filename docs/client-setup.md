@@ -14,7 +14,8 @@ no retrieval tools. Omitting `readerUrl` deliberately makes it capture-only.
    source using [source add](ingestion.md#identity-and-credentials). Save its token
    in `~/.config/spool/source.token`, mode 0600, outside tracked configuration.
    For an existing installation, keep its token and checkpoints. Never copy
-   another store's token just to enable retrieval.
+   another store's token or source name: each independent store needs its own
+   credential and globally unique, stable name, even on the same machine.
 3. Merge this entry into `plugins` in `~/.config/opencode/opencode.json`, preserving
    other configuration. Use the machine's absolute checkout path, not the `.ts`
    entrypoint. Replace the ingestion URL with the operator-provided HTTPS URL.
@@ -26,11 +27,22 @@ no retrieval tools. Omitting `readerUrl` deliberately makes it capture-only.
     "options": {
       "url": "https://your-spool-host",
       "tokenFile": "~/.config/spool/source.token",
+      "sourceAlias": "work-laptop",
       "readerUrl": "http://100.86.13.40:8090"
     }
   }]
 }
 ```
+
+`sourceAlias` is optional and must match `^[a-z][a-z0-9-]{0,31}$`. Use the same
+name as the operator assigned, or choose an unused name for an unnamed source.
+The collector registers it once on startup, retrying transient failures; an
+already assigned identical name is accepted. Names are stable: changing the
+option cannot rename a source. A different assigned name (`source_alias_mismatch`)
+or a name taken by another source (`source_alias_conflict`) stops capture until
+the configuration is corrected and all instances are reloaded. Omitting the
+option leaves any centrally assigned name unchanged; it does not clear it.
+Adding an alias preserves checkpoints and does not recapture existing sessions.
 
 `http://100.86.13.40:8090` is the current private deployment's reader address;
 use its current literal Tailscale IPv4 address if that node is replaced. Each
@@ -80,9 +92,13 @@ Spool registers native OpenCode tools, not an MCP server.
 Exercise `spool_find_sessions` with `{"limit":1}`. If the archive has a session,
 pass its exact returned `session` reference to `spool_read_messages` with
 `start: 1, end: 1`; then search a known phrase from that evidence with
-`spool_search_messages`. References include the source UUID; a native `ses_…` ID
-alone is not sufficient. Only successful actual calls verify agent access;
-plugin status, a Git pull or direct HTTP success does not.
+`spool_search_messages`. References use `work-laptop/ses_…` when named, otherwise
+`source-UUID/ses_…`; legacy UUID-qualified references remain valid. A bare native
+OpenCode ID also works when globally unique. If `ambiguous_session` returns
+`candidates`, select the qualified reference for the intended source, not simply
+the first; `more: true` means additional candidates exist. Use find to narrow the
+choice when needed. Only successful actual calls verify agent access; plugin
+status, a Git pull or direct HTTP success does not.
 
 ## Troubleshooting
 
@@ -90,6 +106,8 @@ plugin status, a Git pull or direct HTTP success does not.
 | --- | --- |
 | Capture works but tools and skill are absent | `readerUrl` in the effective Spool options, then reload all instances. If registered but unavailable to one agent, check that agent's permissions. |
 | `reader_unavailable` | Run the probes from the affected machine. Check Tailscale, the literal reader address and reader readiness; the public ingestion service does not serve these routes. |
+| Capture logs `source_alias_mismatch` or `source_alias_conflict`, then `disabled_until_reload` | Keep the already assigned alias for this source, or choose an unused alias for an unnamed source. Correct the options and reload all instances; retrying cannot rename a source or take another source's name. |
+| `ambiguous_session` | Select the intended source-qualified reference from `candidates`, or use find to narrow the choice. |
 | `malformed_request` | Use the source-qualified reference from find and the documented arguments; a continuation request contains only its cursor. |
 | `not_indexed` | The archive lacks complete projections. Update its source collector; `/spool-repair` can recapture sessions still present locally, not recover locally deleted sessions. |
 

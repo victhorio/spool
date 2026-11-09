@@ -9,7 +9,7 @@ import { startOpenCode } from "./opencode"
 import { agentQuery, evidence, longText, needle, seed, location, type Host } from "./retrieval-fixture/conversations"
 import { RetrievalRuntime } from "./retrieval-fixture/runtime"
 
-interface Source { source_id: string; token: string }
+interface Source { source_id: string; token: string; alias?: string }
 interface FoundSession { session: string; repository: string | null; revision: string; captured_at: string; message_count: number; match: { index: number; excerpt: string; read_cursor: string } | null }
 interface Found { sessions: FoundSession[]; coverage: { total_sessions: number; indexed_sessions: number; unassigned_repository_sessions: number }; next_cursor: string | null }
 interface Searched { session: string; revision: string; matches: { index: number; excerpt: string; read_cursor: string }[]; next_cursor: string | null }
@@ -36,7 +36,7 @@ async function host(label: string, source: Source, withReader = true) {
   await Bun.write(tokenFile, source.token)
   await chmod(tokenFile, 0o600)
   const value = await startOpenCode(path.join(root, label), path.join(repository, "plugin"), {
-    url: runtime.url, tokenFile, ...(withReader ? { readerUrl: runtime.readerUrl } : {}),
+    url: runtime.url, tokenFile, ...(source.alias ? { sourceAlias: source.alias } : {}), ...(withReader ? { readerUrl: runtime.readerUrl } : {}),
   }, runtime.signal, [{ package: path.join(repository, "dev", "retrieval-fixture"), options: { query: agentQuery, expectedText: evidence } }])
   hosts.push(value)
   return value
@@ -100,8 +100,8 @@ async function agent(host: Host, id: "general" | "explore", model = "availabilit
 
 try {
   await runtime.up()
-  const primary: Source = JSON.parse(await runtime.admin("source", "add", "--label", "synthetic-retrieval-primary"))
-  const secondary: Source = JSON.parse(await runtime.admin("source", "add", "--label", "synthetic-retrieval-second-store"))
+  const primary: Source = { ...JSON.parse(await runtime.admin("source", "add", "--label", "synthetic-retrieval-primary")), alias: "work-m5" }
+  const secondary: Source = { ...JSON.parse(await runtime.admin("source", "add", "--label", "synthetic-retrieval-second-store")), alias: "home-m4" }
   const first = await host("opencode-primary", primary)
   const second = await host("opencode-second", secondary)
   const main = location(first).directory
@@ -127,17 +127,20 @@ try {
     converged(second, secondary, sharedID), converged(first, primary, unassignedID),
   ])
   assert.deepEqual(captured.map((item) => item.repository), [repoKey, repoKey, repoKey, null])
-  pass("actual OpenCode capture → Rust ingestion → PostgreSQL, SSH/HTTPS repository identity across checkout/worktree/clone")
+  const aliases = JSON.parse(await runtime.sql("SELECT json_object_agg(id, alias) FROM sources"))
+  assert.equal(aliases[primary.source_id], primary.alias)
+  assert.equal(aliases[secondary.source_id], secondary.alias)
+  pass("actual OpenCode capture → Rust ingestion → PostgreSQL; source aliases registered and repository identity shared across checkout/worktree/clone")
 
   const listed = await first.client.rpc.call({ rpcID: "spool-retrieval-fixture", method: "tools", input: {}, location: location(first) })
   for (const name of Object.values(names)) assert.ok(listed.output.some((tool: { id: string }) => tool.id === name), `${name} is not registered`)
   const skills = await first.client.skill.list({ location: location(first) })
   assert.ok(skills.data.some((skill) => skill.id === "spool.searching-sessions"))
   const broad = await findAll(first, { query: needle, limit: 1 })
-  const reference = `${primary.source_id}/${sharedID}`
-  const worktreeReference = `${primary.source_id}/${worktreeID}`
-  const secondReference = `${secondary.source_id}/${sharedID}`
-  assert.deepEqual(broad.sessions.map((item) => item.session).sort(), [reference, worktreeReference, secondReference, `${primary.source_id}/${unassignedID}`].sort())
+  const reference = `${primary.alias}/${sharedID}`
+  const worktreeReference = `${primary.alias}/${worktreeID}`
+  const secondReference = `${secondary.alias}/${sharedID}`
+  assert.deepEqual(broad.sessions.map((item) => item.session).sort(), [reference, worktreeReference, secondReference, `${primary.alias}/${unassignedID}`].sort())
   assert.equal(broad.coverage.indexed_sessions, broad.coverage.total_sessions)
   assert.ok(broad.coverage.unassigned_repository_sessions >= 1)
   const filtered = await findAll(first, { query: needle.toUpperCase(), repository: repoKey, limit: 1 })
@@ -149,9 +152,21 @@ try {
   assert.ok(found.match?.read_cursor)
   pass("public registration and skill discovery; cross-source find, exact repository filter, coverage and cursor-only pagination")
 
+  assert.equal((await tool<Read>(first, "read", { session: worktreeID })).session, worktreeReference)
+  const legacyReference = await tool<Read>(first, "read", { session: `${primary.source_id}/${sharedID}` })
+  assert.equal(legacyReference.session, reference)
+  assert.match(legacyReference.messages[0]!.text, /durable WAL fencing/)
+  const ambiguous = await tool<{ error: { code: string; candidates: string[]; more: boolean } }>(first, "read", { session: sharedID })
+  assert.equal(ambiguous.error.code, "ambiguous_session")
+  assert.deepEqual(ambiguous.error.candidates.sort(), [reference, secondReference].sort())
+  assert.equal(ambiguous.error.more, false)
+  assert.equal((await tool<Read>(first, "read", { session: secondReference })).session, secondReference)
+  pass("registered tools resolve unique native IDs and legacy UUID references; ambiguous copies offer alias-qualified choices without merging stores")
+
   const search = await tool<Searched>(first, "search", { session: reference, revision: found.revision, query: needle, limit: 1 })
   assert.deepEqual(search.matches.map((match) => match.index), [2])
   assert.match(search.matches[0]!.excerpt, /second ordinary match/)
+  assert.ok(search.matches[0]!.read_cursor.length <= 80, "Evidence cursor is no longer compact")
   const ordinaryJump = await tool<Read>(first, "read", { cursor: search.matches[0]!.read_cursor })
   assert.ok(ordinaryJump.messages[0]!.offset_bytes > 50_000)
   assert.match(ordinaryJump.messages[0]!.text, /second ordinary match/)

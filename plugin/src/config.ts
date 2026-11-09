@@ -14,6 +14,11 @@ export interface Config {
   opencodePassword?: string
   readerUrl?: string
   repositoryRemote?: string
+  sourceAlias?: string
+}
+
+export function validSourceAlias(value: unknown): value is string {
+  return typeof value === "string" && /^[a-z][a-z0-9-]{0,31}$/.exec(value)?.[0] === value
 }
 
 function filename(value: unknown, name: string): string {
@@ -48,9 +53,13 @@ export function readerURL(value: unknown): string {
 }
 
 export async function configure(options: Record<string, unknown>): Promise<Config> {
-  const allowed = new Set(["url", "tokenFile", "sweepIntervalMs", "serviceFile", "opencodeUrl", "opencodePasswordFile", "readerUrl", "repositoryRemote"])
+  const allowed = new Set(["url", "tokenFile", "sweepIntervalMs", "serviceFile", "opencodeUrl", "opencodePasswordFile", "readerUrl", "repositoryRemote", "sourceAlias"])
   for (const key of Object.keys(options)) if (!allowed.has(key)) throw new Error(`Unknown Spool option: ${key}`)
   const readerUrl = options.readerUrl === undefined ? undefined : readerURL(options.readerUrl)
+  const sourceAlias = options.sourceAlias
+  if (sourceAlias !== undefined && !validSourceAlias(sourceAlias)) {
+    throw new Error("Spool sourceAlias must match ^[a-z][a-z0-9-]{0,31}$")
+  }
   const repositoryRemote = options.repositoryRemote
   if (repositoryRemote !== undefined && (typeof repositoryRemote !== "string" || !repositoryRemote || /[\s\0]/u.test(repositoryRemote) || Buffer.byteLength(repositoryRemote) > 256)) {
     throw new Error("Spool repositoryRemote must be a nonempty remote name of at most 256 bytes")
@@ -74,6 +83,7 @@ export async function configure(options: Record<string, unknown>): Promise<Confi
     cachePrefix: `v1/${createHash("sha256").update(`${destination}\0${sourceID}`).digest("hex")}/`,
     readerUrl,
     repositoryRemote,
+    sourceAlias,
     serviceFile: options.serviceFile === undefined ? undefined : filename(options.serviceFile, "serviceFile"),
     opencodeUrl: options.opencodeUrl === undefined ? undefined : url(options.opencodeUrl, "opencodeUrl"),
     opencodePassword: options.opencodePasswordFile === undefined ? undefined : (await readFile(filename(options.opencodePasswordFile, "opencodePasswordFile"), "utf8")).trim(),

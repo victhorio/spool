@@ -3,7 +3,6 @@ use axum::{
     extract::{DefaultBodyLimit, State, rejection::JsonRejection},
     routing::post,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
@@ -13,7 +12,10 @@ use uuid::Uuid;
 
 use crate::{error::ApiError, snapshot::valid_id};
 
-const PAGE_BYTES: usize = 24 * 1024;
+mod cursor;
+use cursor::{Cursor, FindKey};
+
+pub(super) const PAGE_BYTES: usize = 24 * 1024;
 const MAX_POSITION: i32 = 100_000;
 
 pub(crate) fn routes() -> Router<PgPool> {
@@ -67,52 +69,6 @@ struct Read {
     end: Option<i32>,
 }
 
-#[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", deny_unknown_fields)]
-enum Cursor {
-    Find {
-        query: Find,
-        after: FindKey,
-    },
-    Search {
-        query: Search,
-        revision: i64,
-        before: i32,
-    },
-    Read {
-        session: String,
-        revision: i64,
-        start: i32,
-        end: i32,
-        offset: i64,
-    },
-}
-
-#[derive(Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FindKey {
-    score: i32,
-    activity: i64,
-    source: Uuid,
-    session: String,
-}
-
-impl Cursor {
-    fn encode(&self) -> String {
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).expect("serializable cursor"))
-    }
-
-    fn decode(value: &str) -> Result<Self, ApiError> {
-        if value.len() > 8192 {
-            return Err(ApiError::malformed());
-        }
-        let bytes = URL_SAFE_NO_PAD
-            .decode(value)
-            .map_err(|_| ApiError::malformed())?;
-        serde_json::from_slice(&bytes).map_err(|_| ApiError::malformed())
-    }
-}
-
 fn terms(query: Option<&str>) -> Result<Vec<String>, ApiError> {
     let Some(query) = query else {
         return Ok(Vec::new());
@@ -133,14 +89,6 @@ fn limit(value: Option<u16>, default: u16, maximum: u16) -> Result<usize, ApiErr
         return Err(ApiError::malformed());
     }
     Ok(usize::from(value))
-}
-
-fn identity(session: &str) -> Result<(Uuid, &str), ApiError> {
-    let (source, id) = session.split_once('/').ok_or_else(ApiError::malformed)?;
-    if !valid_id(id) {
-        return Err(ApiError::malformed());
-    }
-    Ok((source.parse().map_err(|_| ApiError::malformed())?, id))
 }
 
 fn revision(value: Option<&str>) -> Result<Option<i64>, ApiError> {
@@ -232,6 +180,7 @@ async fn coverage(pool: &PgPool) -> Result<Coverage, ApiError> {
 #[derive(FromRow)]
 struct FindRow {
     source_id: Uuid,
+    alias: Option<String>,
     session_id: String,
     revision: i64,
     title: String,
@@ -245,8 +194,16 @@ struct FindRow {
     hit_excerpt: Option<String>,
 }
 
-fn read_cursor(session: String, revision: i64, index: i32, offset: i64) -> String {
+fn reference(source: Uuid, alias: Option<&str>, session: &str) -> String {
+    match alias {
+        Some(alias) => format!("{alias}/{session}"),
+        None => format!("{source}/{session}"),
+    }
+}
+
+fn read_cursor(source: Uuid, session: String, revision: i64, index: i32, offset: i64) -> String {
     Cursor::Read {
+        source,
         session,
         revision,
         start: index,
@@ -286,7 +243,7 @@ async fn find(
         return Err(ApiError::malformed());
     }
     let mut sql = QueryBuilder::new(
-        "WITH ranked AS (SELECT s.source_id, s.session_id, s.revision, \
+        "WITH ranked AS (SELECT s.source_id, sources.alias, s.session_id, s.revision, \
          s.retrieval_title AS title, s.repository, s.captured_at, s.activity, \
          (SELECT count(*) FROM messages m WHERE m.source_id = s.source_id \
           AND m.session_id = s.session_id) AS message_count, ",
@@ -298,7 +255,10 @@ async fn find(
         metadata_matches(&mut sql, &terms);
         sql.push(" THEN 2 ELSE 1 END");
     }
-    sql.push("::integer AS score FROM sessions s WHERE s.deleted_at IS NULL AND s.retrieval_title IS NOT NULL");
+    sql.push(
+        "::integer AS score FROM sessions s JOIN sources ON sources.id = s.source_id \
+        WHERE s.deleted_at IS NULL AND s.retrieval_title IS NOT NULL",
+    );
     if let Some(repository) = &query.repository {
         sql.push(" AND s.repository = ")
             .push_bind(repository.clone());
@@ -347,11 +307,11 @@ async fn find(
             response["next_cursor"] = json!(last_cursor);
             break;
         }
-        let session = format!("{}/{}", row.source_id, row.session_id);
+        let session = reference(row.source_id, row.alias.as_deref(), &row.session_id);
         let matched = match (row.hit_position, row.hit_offset, row.hit_excerpt) {
             (Some(position), Some(offset), Some(excerpt)) => json!({
                 "index": position + 1, "excerpt": excerpt,
-                "read_cursor": read_cursor(session.clone(), row.revision, position + 1, offset),
+                "read_cursor": read_cursor(row.source_id, row.session_id.clone(), row.revision, position + 1, offset),
             }),
             _ => Value::Null,
         };
@@ -385,6 +345,9 @@ async fn find(
 
 #[derive(FromRow)]
 struct Session {
+    source_id: Uuid,
+    session_id: String,
+    alias: Option<String>,
     revision: i64,
     captured_at: DateTime<Utc>,
     retrieval_title: Option<String>,
@@ -393,21 +356,58 @@ struct Session {
 
 async fn session(
     tx: &mut sqlx::Transaction<'_, Postgres>,
-    reference: &str,
+    input: &str,
     expected: Option<i64>,
 ) -> Result<Session, ApiError> {
-    let (source, id) = identity(reference)?;
-    let session: Session = sqlx::query_as(
-        "SELECT s.revision, s.captured_at, s.retrieval_title, \
+    let (qualifier, id) = match input.split_once('/') {
+        Some((source, id)) => (Some(source), id),
+        None => (None, input),
+    };
+    if !valid_id(id) {
+        return Err(ApiError::malformed());
+    }
+    let mut sql = QueryBuilder::new(
+        "SELECT s.source_id, s.session_id, sources.alias, s.revision, s.captured_at, s.retrieval_title, \
          (SELECT count(*) FROM messages m WHERE m.source_id = s.source_id AND m.session_id = s.session_id) AS message_count \
-         FROM sessions s WHERE source_id = $1 AND session_id = $2 AND deleted_at IS NULL",
-    )
-    .bind(source)
-    .bind(id)
-    .fetch_optional(&mut **tx)
-    .await
-    .map_err(|error| ApiError::database("retrieval.session", error))?
-    .ok_or_else(|| ApiError::new(axum::http::StatusCode::NOT_FOUND, "not_found"))?;
+         FROM sessions s JOIN sources ON sources.id = s.source_id WHERE s.deleted_at IS NULL AND s.session_id = ",
+    );
+    sql.push_bind(id);
+    if let Some(qualifier) = qualifier {
+        if qualifier.len() == 36 {
+            let source = qualifier
+                .parse::<Uuid>()
+                .map_err(|_| ApiError::malformed())?;
+            sql.push(" AND s.source_id = ").push_bind(source);
+        } else if qualifier.len() <= 32
+            && qualifier.starts_with(|c: char| c.is_ascii_lowercase())
+            && qualifier
+                .bytes()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+        {
+            sql.push(" AND sources.alias = ").push_bind(qualifier);
+        } else {
+            return Err(ApiError::malformed());
+        }
+    }
+    sql.push(" ORDER BY s.source_id LIMIT 11");
+    let mut sessions: Vec<Session> = sql
+        .build_query_as()
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(|error| ApiError::database("retrieval.session", error))?;
+    if sessions.len() > 1 {
+        return Err(ApiError::ambiguous_session(
+            sessions
+                .iter()
+                .take(10)
+                .map(|s| reference(s.source_id, s.alias.as_deref(), &s.session_id))
+                .collect(),
+            sessions.len() > 10,
+        ));
+    }
+    let session = sessions
+        .pop()
+        .ok_or_else(|| ApiError::new(axum::http::StatusCode::NOT_FOUND, "not_found"))?;
     if expected.is_some_and(|revision| revision != session.revision) {
         return Err(ApiError::session_changed(session.revision));
     }
@@ -451,28 +451,40 @@ async fn search(
         }
         Request::Continuation(value) => match Cursor::decode(&value.cursor)? {
             Cursor::Search {
+                source,
+                session,
                 query,
                 revision,
+                include_tools,
+                limit,
                 before,
-            } if revision > 0 && (0..MAX_POSITION).contains(&before) => {
-                (query, Some(revision), before)
-            }
+            } if revision > 0 && (0..MAX_POSITION).contains(&before) => (
+                Search {
+                    session: format!("{source}/{session}"),
+                    query,
+                    revision: None,
+                    include_tools,
+                    limit,
+                },
+                Some(revision),
+                before,
+            ),
             _ => return Err(ApiError::malformed()),
         },
     };
-    let (source, id) = identity(&query.session)?;
     let terms = terms(Some(&query.query))?;
     let limit = limit(query.limit, 20, 100)?;
     let mut tx = transaction(&pool).await?;
     let state = session(&mut tx, &query.session, expected).await?;
+    let reference = reference(state.source_id, state.alias.as_deref(), &state.session_id);
     let mut sql = QueryBuilder::new(
         "SELECT m.position, evidence.hit_offset, evidence.hit_excerpt FROM messages m",
     );
     passage(&mut sql, &terms[0], query.include_tools);
     sql.push(" WHERE m.source_id = ")
-        .push_bind(source)
+        .push_bind(state.source_id)
         .push(" AND m.session_id = ")
-        .push_bind(id.to_owned())
+        .push_bind(state.session_id.clone())
         .push(" AND m.position < ")
         .push_bind(before)
         .push(" AND ");
@@ -480,7 +492,7 @@ async fn search(
     sql.push(" ORDER BY m.position DESC LIMIT ")
         .push_bind(limit as i64 + 1);
     let mut response = json!({
-        "session": query.session, "revision": state.revision.to_string(),
+        "session": reference, "revision": state.revision.to_string(),
         "captured_at": state.captured_at, "message_count": state.message_count,
         "matches": [], "next_cursor": null,
     });
@@ -496,14 +508,18 @@ async fn search(
             break;
         }
         let cursor = Cursor::Search {
-            query: query.clone(),
+            source: state.source_id,
+            session: state.session_id.clone(),
+            query: query.query.clone(),
             revision: state.revision,
+            include_tools: query.include_tools,
+            limit: query.limit,
             before: row.position,
         }
         .encode();
         response["matches"].as_array_mut().unwrap().push(json!({
             "index": row.position + 1, "excerpt": row.hit_excerpt,
-            "read_cursor": read_cursor(query.session.clone(), state.revision, row.position + 1, row.hit_offset),
+            "read_cursor": read_cursor(state.source_id, state.session_id.clone(), state.revision, row.position + 1, row.hit_offset),
         }));
         response["next_cursor"] = json!(cursor);
         if !fits(&response) {
@@ -535,7 +551,7 @@ async fn read(
     request: Result<Json<Request<Read>>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(request) = request.map_err(|_| ApiError::malformed())?;
-    let (reference, expected, start, end, offset) = match request {
+    let (input, expected, start, end, offset) = match request {
         Request::Initial(query) => {
             let start = query.start.unwrap_or(1);
             (
@@ -548,21 +564,28 @@ async fn read(
         }
         Request::Continuation(value) => match Cursor::decode(&value.cursor)? {
             Cursor::Read {
+                source,
                 session,
                 revision,
                 start,
                 end,
                 offset,
-            } if revision > 0 => (session, Some(revision), start, end, offset),
+            } if revision > 0 => (
+                format!("{source}/{session}"),
+                Some(revision),
+                start,
+                end,
+                offset,
+            ),
             _ => return Err(ApiError::malformed()),
         },
     };
     if start < 1 || end < start || end > MAX_POSITION || !(0..=64 * 1024 * 1024).contains(&offset) {
         return Err(ApiError::malformed());
     }
-    let (source, id) = identity(&reference)?;
     let mut tx = transaction(&pool).await?;
-    let state = session(&mut tx, &reference, expected).await?;
+    let state = session(&mut tx, &input, expected).await?;
+    let reference = reference(state.source_id, state.alias.as_deref(), &state.session_id);
     let end = end.min(state.message_count as i32);
     let mut response = json!({
         "session": reference, "revision": state.revision.to_string(),
@@ -577,8 +600,8 @@ async fn read(
          FROM messages WHERE source_id = $1 AND session_id = $2 \
          AND position >= $3 AND position < $4 ORDER BY position LIMIT 200",
     )
-    .bind(source)
-    .bind(id)
+    .bind(state.source_id)
+    .bind(state.session_id.clone())
     .bind(start - 1)
     .bind(end)
     .bind(offset)
@@ -620,7 +643,8 @@ async fn read(
             let next_offset = offset + length as i64;
             if next_offset < total {
                 Some(Cursor::Read {
-                    session: reference.clone(),
+                    source: state.source_id,
+                    session: state.session_id.clone(),
                     revision: state.revision,
                     start: row.position + 1,
                     end,
@@ -628,7 +652,8 @@ async fn read(
                 })
             } else if row.position + 1 < end {
                 Some(Cursor::Read {
-                    session: reference.clone(),
+                    source: state.source_id,
+                    session: state.session_id.clone(),
                     revision: state.revision,
                     start: row.position + 2,
                     end,
@@ -656,7 +681,8 @@ async fn read(
             response["messages"].as_array_mut().unwrap().pop();
             response["next_cursor"] = json!(
                 Cursor::Read {
-                    session: reference.clone(),
+                    source: state.source_id,
+                    session: state.session_id.clone(),
                     revision: state.revision,
                     start: row.position + 1,
                     end,

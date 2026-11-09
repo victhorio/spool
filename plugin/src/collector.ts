@@ -67,6 +67,7 @@ export class Collector {
   private wake?: () => void
   private reconcileRequested = true
   private repairRequested = false
+  private sourceRegistered = false
   private failures = 0
   private operation = "opencode_connect"
 
@@ -163,10 +164,14 @@ export class Collector {
       signal: this.signal(),
     })
     const result = await response.json().catch(() => ({})) as { error?: { code?: string; current_revision?: string | null } }
+    if (route === "source" && response.status === 409) {
+      const code = result?.error?.code
+      throw new SyncError(code === "source_alias_conflict" || code === "source_alias_mismatch" ? code : "http_409", false)
+    }
     if (!response.ok) throw new SyncError(
       response.status === 409 ? "revision_conflict" : response.status === 410 ? "purged" : `http_${response.status}`,
       response.status === 409 || response.status === 429 || response.status >= 500,
-      result.error?.current_revision,
+      result?.error?.current_revision,
     )
     return result as T
   }
@@ -283,6 +288,11 @@ export class Collector {
     while (!this.lifetime.signal.aborted) {
       let current: string | undefined
       try {
+        if (!this.sourceRegistered && this.config.sourceAlias !== undefined) {
+          this.operation = "source_register"
+          await this.request("source", { method: "PUT", body: JSON.stringify({ alias: this.config.sourceAlias }) })
+          this.sourceRegistered = true
+        }
         if (this.reconcileRequested || this.repairRequested) {
           const full = this.repairRequested
           this.reconcileRequested = this.repairRequested = false

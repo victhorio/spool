@@ -23,7 +23,7 @@ No GitHub API, `gh`, network access or host-alias resolution is involved.
 Worktrees normally share remotes; independent clones on different machines
 therefore group together without matching local paths. Different fork origins
 remain separate. Remote renames, repository transfers and SSH aliases are not
-automatically merged. No alias-management feature is included in this version.
+automatically merged.
 
 Successful captures retain the observed repository in the local checkpoint.
 Unknown discovery never clears a known association: deleted/unreadable worktrees,
@@ -53,6 +53,29 @@ Registration does not override agent permissions. General can use tools allowed
 by its configuration; Explore's restricted defaults are not broadened. The
 skill recommends optional delegation only to an agent that has these tools.
 
+## Session references
+
+OpenCode's native session IDs are preserved. Search and read accept a bare ID
+when it identifies exactly one live archived session. Imported copies in
+independent stores stay distinct: an ambiguous ID returns `ambiguous_session`
+with up to ten qualified `candidates` and a `more` flag, never an arbitrary copy.
+Use discovery to narrow the choice when the candidates are incomplete.
+
+Discovery, search and read return qualified references such as
+`work-m5/ses_…`. The optional plugin `sourceAlias` names its independent store,
+not a project or Location. The authenticated ingestion endpoint registers that
+name centrally once per collector lifetime; it does not re-export sessions or
+change their checkpoints. Names are unique, match `^[a-z][a-z0-9-]{0,31}$`, and
+cannot be renamed or reassigned, including after credential revocation. Omitting
+the setting retains the assigned name. A conflicting setting stops capture
+until corrected and reloaded; see [client setup](client-setup.md).
+
+Unnamed stores retain UUID-qualified references. Previously returned
+`source-UUID/native-ID` references remain valid after naming a source. Returned
+qualified references and cursors identify their store even if another copy of
+the native ID is archived later. UUIDs remain the internal storage and credential
+identity; no replacement session IDs are introduced.
+
 ## Tool and HTTP contract
 
 The tools call JSON POST endpoints on the private `browse` listener only:
@@ -64,10 +87,8 @@ The tools call JSON POST endpoints on the private `browse` listener only:
 | `spool_read_messages` | `/api/agent/read` | `session`, `revision?`, `start?`, `end?` |
 
 Every operation alternatively accepts **only** `{ "cursor": "…" }`. Mixing a
-cursor with initial arguments is rejected. Session references are opaque
-source-qualified strings returned by discovery. Independent stores containing
-the same original session ID remain distinct results. There are no source or
-directory search filters, and no implicit current-repository restriction.
+cursor with initial arguments is rejected. There are no source or directory
+search filters, and no implicit current-repository restriction.
 
 Queries contain up to 512 UTF-8 bytes and 16 whitespace-separated terms.
 Matching is case-insensitive literal substring matching, with all terms in one
@@ -120,6 +141,13 @@ pagination, not a frozen archive snapshot. Malformed arguments/cursors return
 without a complete text projection returns `not_indexed`. Transport failures
 are reported as `reader_unavailable` without disclosing server error bodies.
 
+Cursors encode versioned compact binary state as unpadded base64url: UUID bytes,
+native IDs, variable-length numbers and the filters needed to resume. They are
+stateless, with no server-side cursor records or expiry timers. Long queries and
+repository keys necessarily make their discovery cursors longer. Clients pass
+tokens unchanged and need not decode their representation. Previously issued
+JSON cursors remain accepted; all new tokens use the compact format.
+
 ## Coverage and rollout
 
 Discovery always reports global live-archive counts: `total_sessions`,
@@ -139,7 +167,10 @@ Raw archival JSON and the browser remain available.
 Deploy server migrations and updated reader privileges before activating the
 new plugin. An existing `spool_reader` needs the added column SELECT grants from
 `deploy/reader-role.sql`; do not rerun that script's CREATE ROLE against an
-existing role. Creating `pg_trgm` requires appropriate database privileges.
+existing role. Source aliases specifically require migration `0003_source_alias`
+and `GRANT SELECT (alias) ON public.sources TO spool_reader`. Update all retrieval
+clients before enabling source aliases, since older plugins reject non-UUID
+qualifiers. Creating `pg_trgm` requires appropriate database privileges.
 Budget database memory for concurrent projected uploads and index construction,
 not just their wire size; the local stack reserves a 1 GiB database cap after a
 maximum-envelope workload exhausted its previous 256 MiB cap. This is a tested

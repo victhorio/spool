@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test"
+import { expect, spyOn, test } from "bun:test"
 import { createHash } from "node:crypto"
 import { execFileSync } from "node:child_process"
 import { mkdtemp, mkdir, rm } from "node:fs/promises"
@@ -39,9 +39,17 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
   let loseAcknowledgement = false
   let exports = 0
   let lists = 0
+  let registrations = 0
   let onList: (() => Promise<void>) | undefined
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const pathname = new URL(request.url).pathname
+    if (pathname === "/v1/sync/source") {
+      registrations++
+      expect(request.method).toBe("PUT")
+      expect(request.headers.get("authorization")).toBe("Bearer synthetic")
+      expect(await request.json()).toEqual({ alias: "laptop" })
+      return Response.json({ alias: "laptop" })
+    }
     if (pathname === "/api/info") return Response.json({ pid: process.pid })
     if (pathname === "/api/session") { lists++; await onList?.(); return Response.json({ data: [transcript.info], cursor: {} }) }
     if (pathname === "/api/experimental/session/ses_synthetic/export") { exports++; return Response.json({ data: transcript }) }
@@ -98,6 +106,7 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
   }
   try {
     const first = await next(() => true)
+    expect(registrations).toBe(0)
     expect(first.upsert_messages).toEqual(projectionVersion === 2 ? [] : transcript.messages)
     expect(first.retrieval.messages.map((message) => message.id)).toEqual(projectionVersion === 2 ? [] : ["msg_synthetic"])
     expect(first.info).toEqual(transcript.info)
@@ -148,9 +157,13 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
     expect(uploads).toHaveLength(switched.uploads)
     expect(checkpoints.get("fixture/ses_synthetic")).toEqual(withoutOverride)
     await remove()
+    config.sourceAlias = "laptop"
     collector = new Collector(config, "2.2.5")
+    expect(collector.matches({ ...config })).toBe(true)
+    expect(collector.matches({ ...config, sourceAlias: "desktop" })).toBe(false)
     remove = collector.attach(ctx)
     await Bun.sleep(400)
+    expect(registrations).toBe(1)
     expect(exports).toBe(switched.exports + 1)
     expect(uploads).toHaveLength(switched.uploads)
     expect(checkpoints.get("fixture/ses_synthetic")).toEqual(withoutOverride)
@@ -166,6 +179,7 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
       for (const name of remotes) git("remote", "remove", name)
       git("remote", "add", "origin", "git@github.com:Captured/Repository.git")
     }
+    expect(registrations).toBe(1)
     loseAcknowledgement = true
     git("remote", "set-url", "origin", "https://new.example/Actual/Origin.git")
     collector.repair()
@@ -191,13 +205,13 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
     expect((await next((upload) => (upload.info as SessionTransferData["info"]).location.directory === transcript.info.location.directory)).retrieval.repository).toBe("new.example/Actual/Origin")
     await Bun.sleep(100)
     await remove()
-    const restarted = { exports, uploads: uploads.length }
+    const restarted = { exports, uploads: uploads.length, registrations: registrations + 1 }
     remove = new Collector(config, "2.2.5").attach(ctx)
     await Bun.sleep(400)
-    expect({ exports, uploads: uploads.length }).toEqual(restarted)
+    expect({ exports, uploads: uploads.length, registrations }).toEqual(restarted)
     emit("disconnect")
     await Bun.sleep(1_400)
-    expect({ exports, uploads: uploads.length }).toEqual(restarted)
+    expect({ exports, uploads: uploads.length, registrations }).toEqual(restarted)
     emit("disconnect")
     await Bun.sleep(400)
     transcript.info.title = "Changed during disconnected event stream"
@@ -222,3 +236,86 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
     await rm(root, { recursive: true, force: true })
   }
 }, 10_000)
+
+test.each([429, 503])("source registration retries HTTP %s once and stays registered across later sync failures and attachments", async (status) => {
+  let registrations = 0
+  let inventories = 0
+  let connections = 0
+  let lists = 0
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    switch (new URL(request.url).pathname) {
+      case "/v1/sync/source":
+        registrations++
+        expect(request.method).toBe("PUT")
+        expect(request.headers.get("authorization")).toBe("Bearer synthetic")
+        expect(await request.json()).toEqual({ alias: "laptop" })
+        return registrations === 1 ? Response.json({ error: { code: "transient" } }, { status }) : Response.json({ alias: "laptop" })
+      case "/api/info": connections++; return Response.json({ pid: process.pid })
+      case "/v1/sync/sessions":
+        inventories++
+        return inventories === 1 ? new Response(null, { status: 503 }) : Response.json({ sessions: [], next_cursor: null })
+      case "/api/session": lists++; return Response.json({ data: [], cursor: {} })
+      default: return new Response(null, { status: 404 })
+    }
+  } })
+  const config: Config = { url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", sourceAlias: "laptop", opencodeUrl: server.url.origin }
+  const ctx = {
+    event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
+      await new Promise<void>((resolve) => { signal.addEventListener("abort", () => resolve(), { once: true }) })
+    } },
+  } as unknown as Plugin.Context
+  const collector = new Collector(config, "2.2.5")
+  const remove = collector.attach(ctx)
+  let detach: (() => Promise<boolean>) | undefined
+  try {
+    const deadline = Date.now() + 3_000
+    while (!lists && Date.now() < deadline) await Bun.sleep(10)
+    expect(lists).toBe(1)
+    expect(registrations).toBe(2)
+    expect(connections).toBe(2)
+    detach = collector.attach({ ...ctx })
+    collector.repair()
+    await Bun.sleep(100)
+    expect(lists).toBeGreaterThan(1)
+    expect(registrations).toBe(2)
+    expect(await detach()).toBe(false)
+    detach = undefined
+  } finally {
+    await detach?.()
+    await remove()
+    await server.stop(true)
+  }
+})
+
+test.each(["source_alias_conflict", "source_alias_mismatch", "unknown_conflict", null])("source assignment %s disables capture until reload without a revision-conflict retry", async (code) => {
+  let calls = 0
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    calls++
+    expect(new URL(request.url).pathname).toBe("/v1/sync/source")
+    return Response.json(code === null ? null : { error: { code, detail: "SECRET_ERROR_BODY" } }, { status: 409 })
+  } })
+  const logs = spyOn(console, "info").mockImplementation(() => {})
+  const config: Config = { url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", sourceAlias: "laptop", opencodeUrl: server.url.origin }
+  const ctx = {
+    event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
+      await new Promise<void>((resolve) => { signal.addEventListener("abort", () => resolve(), { once: true }) })
+    } },
+  } as unknown as Plugin.Context
+  const collector = new Collector(config, "2.2.5")
+  const remove = collector.attach(ctx)
+  try {
+    const deadline = Date.now() + 1_000
+    while (!logs.mock.calls.length && Date.now() < deadline) await Bun.sleep(10)
+    collector.repair()
+    await Bun.sleep(600)
+    expect(calls).toBe(1)
+    expect(logs.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+      { component: "spool", event: "sync_failed", operation: "source_register", code: code === "source_alias_conflict" || code === "source_alias_mismatch" ? code : "http_409" },
+      { component: "spool", event: "disabled_until_reload" },
+    ])
+  } finally {
+    await remove()
+    logs.mockRestore()
+    await server.stop(true)
+  }
+})

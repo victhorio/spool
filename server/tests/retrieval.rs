@@ -1,5 +1,6 @@
 use std::{collections::BTreeMap, path::PathBuf, time::Duration};
 
+use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
 use spool_server::{admin, browse_router, connect, connect_browse, migrate, router};
@@ -108,7 +109,13 @@ impl Harness {
             .await
             .unwrap();
         assert_eq!(response.status(), status);
-        let body: Value = response.json().await.unwrap();
+        let bytes = response.bytes().await.unwrap();
+        assert!(
+            bytes.len() <= 24 * 1024,
+            "oversized {operation} error: {}",
+            bytes.len()
+        );
+        let body: Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(body["error"]["code"], code, "{body}");
         body
     }
@@ -182,7 +189,19 @@ async fn private_repository_search_and_bounded_evidence() {
         )
         .await
         .unwrap();
-        let a = admin::add_source(&pool, "synthetic laptop").await.unwrap();
+        let mut a = admin::add_source(&pool, "synthetic laptop").await.unwrap();
+        // A fixed fixture identity lets literal v2 cursors outlive changes to their encoder.
+        let source = Uuid::from_u128(1);
+        sqlx::query("UPDATE sources SET id = $1 WHERE id = $2")
+            .bind(source)
+            .bind(a.source_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        a.token = a
+            .token
+            .replacen(&a.source_id.to_string(), &source.to_string(), 1);
+        a.source_id = source;
         let b = admin::add_source(&pool, "synthetic desktop").await.unwrap();
         database_url.set_username(&role).unwrap();
         database_url
@@ -210,6 +229,7 @@ async fn private_repository_search_and_bounded_evidence() {
             ingestion,
         };
         exercise(&harness, &a, &b).await;
+        aliases_and_compact_cursors(&harness, &a, &b).await;
         reader_task.abort();
         ingestion_task.abort();
         reader_pool.close().await;
@@ -493,7 +513,7 @@ async fn exercise(h: &Harness, a: &admin::Credential, b: &admin::Credential) {
         ("read", json!({"session":ref_a,"start":0})),
         ("read", json!({"session":ref_a,"start":4,"end":1})),
         ("read", json!({"session":ref_a,"revision":"not-a-number"})),
-        ("read", json!({"session":"unqualified"})),
+        ("read", json!({"session":"/unqualified"})),
         ("read", json!({"cursor":stale_search})),
     ] {
         h.error(
@@ -666,5 +686,313 @@ async fn exercise(h: &Harness, a: &admin::Credential, b: &admin::Credential) {
                     .contains(expected)
             );
         }
+    }
+}
+
+async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &admin::Credential) {
+    for (token, alias) in [(&a.token, "work-m5"), (&b.token, "home-m4")] {
+        let response = h
+            .client
+            .put(format!("{}/v1/sync/source", h.ingestion))
+            .bearer_auth(token)
+            .json(&json!({"alias":alias}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    let id = format!("ses_{:0<26}", "compact_unique");
+    let rendered = format!(
+        "compactneedle original work evidence {}",
+        "東京🙂\n\"\\".repeat(5000)
+    );
+    h.upload(
+        &a.token,
+        &id,
+        None,
+        "Compact cursor fixture",
+        vec![
+            projection("compact_1", &rendered, &rendered, ""),
+            projection(
+                "compact_2",
+                "compactneedle later correction",
+                "compactneedle later correction",
+                "",
+            ),
+            projection(
+                "compact_3",
+                "compactneedle final decision",
+                "compactneedle final decision",
+                "",
+            ),
+        ],
+    )
+    .await;
+    let qualified = format!("work-m5/{id}");
+    let legacy_reference = format!("{}/{id}", a.source_id);
+    for reference in [&id, &qualified, &legacy_reference] {
+        let read = h.call("read", json!({"session":reference,"start":2})).await;
+        assert_eq!(read["session"], qualified);
+        assert_eq!(
+            read["messages"][0]["text"],
+            "compactneedle later correction"
+        );
+    }
+    let searched = h
+        .call(
+            "search",
+            json!({"session":id,"query":"compactneedle","limit":1}),
+        )
+        .await;
+    assert_eq!(searched["session"], qualified);
+    assert_eq!(searched["matches"][0]["index"], 3);
+    let reading = h
+        .call("read", json!({"session":id,"start":1,"end":3}))
+        .await;
+    let legacy = |value: Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap());
+    let old_search = legacy(json!({"kind":"Search","query":{
+        "session":legacy_reference,"query":"compactneedle","revision":null,"include_tools":false,"limit":1
+    },"revision":1,"before":2}));
+    let old_read = legacy(
+        json!({"kind":"Read","session":legacy_reference,"revision":1,"start":1,"end":3,"offset":0}),
+    );
+    let search_cursor = searched["next_cursor"].as_str().unwrap();
+    let read_cursor = searched["matches"][0]["read_cursor"].as_str().unwrap();
+    assert!(search_cursor.len() * 2 < old_search.len());
+    assert!(read_cursor.len() * 2 < old_read.len());
+    assert!(
+        read_cursor.len() <= 80,
+        "normal evidence jump should fit in 80 characters: {}",
+        read_cursor.len()
+    );
+    assert_eq!(h.call("read", json!({"cursor":old_read})).await, reading);
+    assert_eq!(
+        h.call("search", json!({"cursor":old_search})).await,
+        h.call("search", json!({"cursor":search_cursor})).await
+    );
+    let v2_search = "AgEQAAAAAAAAAAAAAAAAAAAAAR5zZXNfY29tcGFjdF91bmlxdWUwMDAwMDAwMDAwMDANY29tcGFjdG5lZWRsZQIAAQEE";
+    assert_eq!(
+        h.call("search", json!({"cursor":v2_search})).await,
+        h.call("search", json!({"cursor":old_search})).await
+    );
+    let v2_read = "AgIQAAAAAAAAAAAAAAAAAAAAAR5zZXNfY29tcGFjdF91bmlxdWUwMDAwMDAwMDAwMDACBAYA";
+    assert_eq!(
+        h.call("read", json!({"cursor":v2_read})).await,
+        h.call("read", json!({"session":qualified,"start":2,"end":3}))
+            .await
+    );
+
+    // Native IDs can become ambiguous later; issued cursors must stay bound to the original store.
+    h.upload(
+        &b.token,
+        &id,
+        None,
+        "Independent compact copy",
+        vec![projection(
+            "copy",
+            "compactneedle other machine only",
+            "compactneedle other machine only",
+            "",
+        )],
+    )
+    .await;
+    let expected_candidates: std::collections::BTreeSet<_> =
+        [qualified.clone(), format!("home-m4/{id}")]
+            .into_iter()
+            .collect();
+    for (operation, input) in [
+        ("read", json!({"session":id})),
+        (
+            "search",
+            json!({"session":id,"query":"compactneedle","revision":"1"}),
+        ),
+    ] {
+        let error = h
+            .error(operation, input, StatusCode::CONFLICT, "ambiguous_session")
+            .await;
+        let candidates = error["error"]["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(expected_candidates, candidates);
+        assert_eq!(error["error"]["more"], false);
+    }
+    assert_eq!(
+        h.call("search", json!({"cursor":search_cursor})).await["matches"][0]["index"],
+        2
+    );
+    assert_eq!(
+        h.call("read", json!({"cursor":read_cursor})).await["messages"][0]["text"],
+        "compactneedle final decision"
+    );
+    let continuation = h
+        .call("read", json!({"cursor":reading["next_cursor"]}))
+        .await;
+    assert_eq!(continuation["session"], qualified);
+    assert_eq!(
+        continuation["messages"][0]["offset_bytes"],
+        reading["messages"][0]["text"].as_str().unwrap().len()
+    );
+
+    let found = h
+        .call("find", json!({"query":"compactneedle","limit":1}))
+        .await;
+    let v2_find = "AgABDWNvbXBhY3RuZWVkbGUAAAEBAtIPEAAAAAAAAAAAAAAAAAAAAAEec2VzX2NvbXBhY3RfdW5pcXVlMDAwMDAwMDAwMDAw";
+    assert_eq!(h.call("find", json!({"cursor":v2_find})).await, found);
+    let first = &found["sessions"][0];
+    let first_reference = first["session"].as_str().unwrap();
+    let first_source = if first_reference.starts_with("work-m5/") {
+        a.source_id
+    } else {
+        b.source_id
+    };
+    let old_find = legacy(
+        json!({"kind":"Find","query":{"query":"compactneedle","repository":null,"include_tools":false,"limit":1},
+        "after":{"score":1,"activity":1000,"source":first_source,"session":id}}),
+    );
+    let find_cursor = found["next_cursor"].as_str().unwrap();
+    assert!(find_cursor.len() * 2 < old_find.len());
+    assert_eq!(
+        h.call("find", json!({"cursor":find_cursor})).await,
+        h.call("find", json!({"cursor":old_find})).await
+    );
+    eprintln!(
+        "cursor characters: find {} -> {}, search {} -> {}, evidence read {} -> {}",
+        old_find.len(),
+        find_cursor.len(),
+        old_search.len(),
+        search_cursor.len(),
+        old_read.len(),
+        read_cursor.len()
+    );
+    for operation in ["find", "search", "read"] {
+        let mut bytes = URL_SAFE_NO_PAD
+            .decode(match operation {
+                "find" => find_cursor,
+                "search" => search_cursor,
+                _ => read_cursor,
+            })
+            .unwrap();
+        let mut unknown_version = bytes.clone();
+        unknown_version[0] = 3;
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        bytes.pop();
+        for bytes in [bytes, unknown_version, trailing] {
+            h.error(
+                operation,
+                json!({"cursor":URL_SAFE_NO_PAD.encode(bytes)}),
+                StatusCode::BAD_REQUEST,
+                "malformed_request",
+            )
+            .await;
+        }
+    }
+    h.error(
+        "read",
+        json!({"session":"ses_missing_compact"}),
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    h.error(
+        "read",
+        json!({"session":format!("unknown/{id}")}),
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    for reference in [
+        format!("bad_alias/{id}"),
+        format!("{}/{id}", "x".repeat(33)),
+        "work-m5/".to_owned(),
+    ] {
+        h.error(
+            "read",
+            json!({"session":reference}),
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        )
+        .await;
+    }
+
+    // A 32-character hexadecimal alias is a name, not an unhyphenated UUID.
+    let c = admin::add_source(&h.pool, "unaliased then named")
+        .await
+        .unwrap();
+    h.upload(
+        &c.token,
+        "alias-edge",
+        None,
+        "Alias boundary",
+        vec![projection(
+            "c",
+            "unaltered evidence",
+            "unaltered evidence",
+            "",
+        )],
+    )
+    .await;
+    assert_eq!(
+        h.call("read", json!({"session":"alias-edge"})).await["session"],
+        format!("{}/alias-edge", c.source_id)
+    );
+    let alias = "a".repeat(32);
+    assert_eq!(
+        h.client
+            .put(format!("{}/v1/sync/source", h.ingestion))
+            .bearer_auth(&c.token)
+            .json(&json!({"alias":alias}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.call("read", json!({"session":format!("{alias}/alias-edge")}))
+            .await["messages"][0]["text"],
+        "unaltered evidence"
+    );
+    let escaped = "\u{1}".repeat(512);
+    h.upload(&a.token, &escaped, None, "Escaped native ID", vec![])
+        .await;
+    for index in 0..9 {
+        let copy = admin::add_source(&h.pool, &format!("ambiguous {index}"))
+            .await
+            .unwrap();
+        h.upload(&copy.token, &id, None, "More independent copies", vec![])
+            .await;
+        h.upload(&copy.token, &escaped, None, "Escaped native ID", vec![])
+            .await;
+    }
+    let error = h
+        .error(
+            "read",
+            json!({"session":id}),
+            StatusCode::CONFLICT,
+            "ambiguous_session",
+        )
+        .await;
+    assert_eq!(error["error"]["candidates"].as_array().unwrap().len(), 10);
+    assert_eq!(error["error"]["more"], true);
+    for (operation, input) in [
+        ("read", json!({"session":escaped})),
+        ("search", json!({"session":escaped,"query":"any"})),
+    ] {
+        let error = h
+            .error(operation, input, StatusCode::CONFLICT, "ambiguous_session")
+            .await;
+        let candidates = error["error"]["candidates"].as_array().unwrap();
+        assert!((1..10).contains(&candidates.len()));
+        assert!(
+            candidates
+                .iter()
+                .all(|value| value.as_str().unwrap().ends_with(&escaped))
+        );
+        assert_eq!(error["error"]["more"], true);
+        h.call("read", json!({"session":candidates[0]})).await;
     }
 }

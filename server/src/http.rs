@@ -9,7 +9,7 @@ use axum::{
     },
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
@@ -29,6 +29,7 @@ struct App {
 pub fn router(pool: PgPool) -> Router {
     Router::new()
         .route("/healthz", get(health))
+        .route("/v1/sync/source", put(assign_source_alias))
         .route("/v1/sync/sessions", get(inventory))
         .route("/v1/sync/sessions/{id}/snapshot", post(upload))
         .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found") })
@@ -49,6 +50,96 @@ async fn health(State(app): State<App>) -> StatusCode {
         Ok(_) => StatusCode::OK,
         Err(_) => StatusCode::SERVICE_UNAVAILABLE,
     }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SourceAlias {
+    alias: String,
+}
+
+async fn assign_source_alias(
+    State(app): State<App>,
+    request: Request,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    let headers = request.headers();
+    let source = auth::authenticate(&app.pool, headers).await?;
+    if !headers
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .eq_ignore_ascii_case("application/json")
+    {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_content_type",
+        ));
+    }
+    if headers.get_all("content-encoding").iter().any(|value| {
+        !value
+            .to_str()
+            .is_ok_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
+    }) {
+        return Err(ApiError::new(
+            StatusCode::UNSUPPORTED_MEDIA_TYPE,
+            "unsupported_content_encoding",
+        ));
+    }
+    let body = tokio::time::timeout(Duration::from_secs(5), to_bytes(request.into_body(), 1024))
+        .await
+        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "request_timeout"))?
+        .map_err(|error| {
+            use std::error::Error;
+            if error
+                .source()
+                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
+            {
+                ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
+            } else {
+                ApiError::malformed()
+            }
+        })?;
+    if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
+        return Err(ApiError::malformed());
+    }
+    let SourceAlias { alias } = serde_json::from_slice(&body).map_err(|_| ApiError::malformed())?;
+    if !(1..=32).contains(&alias.len())
+        || !alias.as_bytes()[0].is_ascii_lowercase()
+        || !alias
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+    {
+        return Err(ApiError::malformed());
+    }
+    let assigned = sqlx::query("UPDATE sources SET alias = $2 WHERE id = $1 AND alias IS NULL")
+        .bind(source)
+        .bind(&alias)
+        .execute(&app.pool)
+        .await
+        .map_err(|error| {
+            if error.as_database_error().is_some_and(|error| {
+                error.is_unique_violation() && error.constraint() == Some("sources_alias_key")
+            }) {
+                ApiError::new(StatusCode::CONFLICT, "source_alias_conflict")
+            } else {
+                ApiError::database("source.alias.assign", error)
+            }
+        })?;
+    if assigned.rows_affected() == 0 {
+        let existing: String = sqlx::query_scalar("SELECT alias FROM sources WHERE id = $1")
+            .bind(source)
+            .fetch_one(&app.pool)
+            .await
+            .map_err(|error| ApiError::database("source.alias.lookup", error))?;
+        if existing != alias {
+            return Err(ApiError::new(StatusCode::CONFLICT, "source_alias_mismatch"));
+        }
+    }
+    Ok(Json(json!({"alias": alias})))
 }
 
 #[derive(Default, Deserialize)]
