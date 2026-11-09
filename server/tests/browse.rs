@@ -9,7 +9,7 @@ use chrono::DateTime;
 use reqwest::{Client, Response, StatusCode};
 use serde_json::{Value, json};
 use spool_server::{browse_router, connect, connect_browse, migrate, router, validate_browse_bind};
-use sqlx::{PgPool, postgres::PgPoolOptions};
+use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -293,43 +293,83 @@ async fn cli_without_migrations(database_url: &str, pool: &PgPool, assets: &Asse
 async fn postgres_browse_contract() {
     let Ok(database_url) = std::env::var("SPOOL_TEST_DATABASE_URL") else {
         eprintln!(
-            "PostgreSQL browse regression skipped: set SPOOL_TEST_DATABASE_URL (requires CREATEDB)"
+            "PostgreSQL browse regression skipped: set SPOOL_TEST_DATABASE_URL (requires a disposable PostgreSQL superuser)"
         );
         return;
     };
     let admin = connect(&database_url).await.unwrap();
     let database = format!("spool_test_{}", Uuid::new_v4().simple());
+    let reader_role = format!("spool_reader_test_{}", Uuid::new_v4().simple());
     sqlx::query(&format!("CREATE DATABASE {database}"))
         .execute(&admin)
         .await
         .unwrap();
-    sqlx::query(&format!(
-        "ALTER DATABASE {database} SET plan_cache_mode = force_generic_plan"
-    ))
-    .execute(&admin)
-    .await
-    .unwrap();
-    let mut database_url = reqwest::Url::parse(&database_url).unwrap();
-    database_url.set_path(&database);
-    let pool = connect(database_url.as_str()).await.unwrap();
-    let read = connect_browse(database_url.as_str()).await.unwrap();
-    let assets = Assets::new();
-    let (url, task) = serve(browse_router(read.clone(), &assets.0).unwrap()).await;
-    let work_pool = pool.clone();
-    let work_read = read.clone();
+    let work_database = database.clone();
+    let work_role = reader_role.clone();
+    // Setup also belongs inside the task: failed provisioning must not leak a role or DB.
     let result = tokio::spawn(async move {
-        cli_without_migrations(database_url.as_str(), &work_pool, &assets).await;
-        migrate(&work_pool).await.unwrap();
-        read_only_connections(&work_read).await;
-        seed(&work_pool).await;
+        let mut database_url = reqwest::Url::parse(&database_url).unwrap();
+        database_url.set_path(&work_database);
+        let pool = connect(database_url.as_str()).await.unwrap();
+        sqlx::query(&format!(
+            "ALTER DATABASE {work_database} SET plan_cache_mode = force_generic_plan"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        // Make CONNECT and schema USAGE depend on the script, not ambient PUBLIC grants.
+        sqlx::query(&format!(
+            "REVOKE CONNECT ON DATABASE {work_database} FROM PUBLIC"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("REVOKE USAGE ON SCHEMA public FROM PUBLIC")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let assets = Assets::new();
+        cli_without_migrations(database_url.as_str(), &pool, &assets).await;
+        let provisioning =
+            include_str!("../../deploy/reader-role.sql").replace("spool_reader", &work_role);
+        provisioning_error(&pool, &provisioning, "42P01").await;
+        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
+            .bind(&work_role)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(!exists, "failed provisioning must roll back the cluster-scoped role");
+        migrate(&pool).await.unwrap();
+        pool.execute(provisioning.as_str()).await.unwrap();
+        let restricted: bool = sqlx::query_scalar("SELECT NOT (rolcanlogin OR rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls) FROM pg_roles WHERE rolname = $1")
+            .bind(&work_role).fetch_one(&pool).await.unwrap();
+        assert!(restricted, "provisioning must create a restricted NOLOGIN role");
+        sqlx::query(&format!(
+            "ALTER ROLE {work_role} LOGIN PASSWORD 'synthetic-reader-only'"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        provisioning_error(&pool, &provisioning, "42710").await;
+        database_url.set_username(&work_role).unwrap();
+        database_url.set_password(Some("synthetic-reader-only")).unwrap();
+        reader_privileges(database_url.as_str(), &work_role).await;
+        let read = connect_browse(database_url.as_str()).await.unwrap();
+        let (url, task) = serve(browse_router(read.clone(), &assets.0).unwrap()).await;
         let client = Client::builder()
             .timeout(Duration::from_secs(15))
             .build()
             .unwrap();
-        api_contract(&client, &url, &work_pool).await;
-        snapshot_consistency(&client, &url, &work_pool).await;
-        limits(&client, &url, &work_pool).await;
-        let (public_url, public_task) = serve(router(work_pool.clone())).await;
+        let health = client.get(format!("{url}/healthz")).send().await.unwrap();
+        privacy(&health);
+        assert_eq!(health.status(), StatusCode::NO_CONTENT);
+        assert!(health.bytes().await.unwrap().is_empty());
+        assert_eq!(get(&client, &format!("{url}/api/sessions")).await["sessions"], json!([]));
+        seed(&pool).await;
+        api_contract(&client, &url, &pool).await;
+        snapshot_consistency(&client, &url, &pool).await;
+        limits(&client, &url, &pool).await;
+        let (public_url, public_task) = serve(router(pool.clone())).await;
         let response = client
             .get(format!("{public_url}/api/sessions"))
             .send()
@@ -342,7 +382,13 @@ async fn postgres_browse_contract() {
         );
         public_task.abort();
         let _ = public_task.await;
-        work_read.close().await;
+        read.close().await;
+        error(
+            client.get(format!("{url}/healthz")).send().await.unwrap(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "database_unavailable",
+        )
+        .await;
         error(
             client
                 .get(format!("{url}/api/sessions"))
@@ -353,18 +399,34 @@ async fn postgres_browse_contract() {
             "database_unavailable",
         )
         .await;
+        task.abort();
+        let _ = task.await;
+        pool.close().await;
     })
     .await;
-    task.abort();
-    let _ = task.await;
-    read.close().await;
-    pool.close().await;
-    sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
+    let drop_database = sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
         .execute(&admin)
+        .await;
+    let drop_role = sqlx::query(&format!("DROP ROLE IF EXISTS {reader_role}"))
+        .execute(&admin)
+        .await;
+    admin.close().await;
+    drop_database.unwrap();
+    drop_role.unwrap();
+    result.unwrap();
+}
+
+async fn provisioning_error(pool: &PgPool, script: &str, code: &str) {
+    let mut connection = pool.acquire().await.unwrap();
+    let error = connection.execute(script).await.unwrap_err();
+    sqlx::query("ROLLBACK")
+        .execute(&mut *connection)
         .await
         .unwrap();
-    admin.close().await;
-    result.unwrap();
+    assert_eq!(
+        error.as_database_error().unwrap().code().as_deref(),
+        Some(code)
+    );
 }
 
 async fn read_only_connections(pool: &PgPool) {
@@ -387,6 +449,73 @@ async fn read_only_connections(pool: &PgPool) {
             );
         }
     }
+}
+
+async fn reader_privileges(database_url: &str, role: &str) {
+    // Use a normal pool so the role's own default is checked, not browse's override.
+    let pool = connect(database_url).await.unwrap();
+    read_only_connections(&pool).await;
+    let mut connection = pool.acquire().await.unwrap();
+    let identity: (String, String) =
+        sqlx::query_as("SELECT session_user::text, current_user::text")
+            .fetch_one(&mut *connection)
+            .await
+            .unwrap();
+    assert_eq!(identity, (role.to_owned(), role.to_owned()));
+    sqlx::query("SET default_transaction_read_only = off")
+        .execute(&mut *connection)
+        .await
+        .unwrap();
+    let readonly: String = sqlx::query_scalar("SHOW transaction_read_only")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(readonly, "off");
+    for statement in [
+        "INSERT INTO sources (id, label, token_hash) VALUES (gen_random_uuid(), 'forbidden', decode(repeat('42',32),'hex'))",
+        "UPDATE sources SET label = 'forbidden'",
+        "DELETE FROM sources",
+        "TRUNCATE sources CASCADE",
+        "INSERT INTO sessions (source_id, session_id, revision, format) VALUES ('00000000-0000-0000-0000-000000000001', 'forbidden', 1, 'opencode.v2')",
+        "UPDATE sessions SET revision = 99",
+        "DELETE FROM sessions",
+        "TRUNCATE sessions CASCADE",
+        "INSERT INTO messages (source_id, session_id, message_id, position, payload, payload_hash) VALUES ('00000000-0000-0000-0000-000000000001', 'same', 'forbidden', 0, '{}'::json, decode(repeat('42',32),'hex'))",
+        "UPDATE messages SET payload = '{}'::json",
+        "DELETE FROM messages",
+        "TRUNCATE messages",
+        "CREATE TABLE public.forbidden (id int)",
+        "CREATE SCHEMA forbidden",
+        "ALTER TABLE sources ADD COLUMN forbidden int",
+        "DROP TABLE messages",
+        "SELECT token_hash FROM sources",
+        "SELECT created_at FROM sources",
+        "SELECT last_seen_at FROM sources",
+        "SELECT revoked_at FROM sources",
+        "SELECT format FROM sessions",
+        "SELECT info_hash FROM sessions",
+        "SELECT upstream_version FROM sessions",
+        "SELECT collector_version FROM sessions",
+        "SELECT captured_at FROM sessions",
+        "SELECT message_id FROM messages",
+        "SELECT payload_hash FROM messages",
+        "SELECT * FROM sources",
+        "SELECT * FROM sessions",
+        "SELECT * FROM messages",
+        "SELECT * FROM _sqlx_migrations",
+    ] {
+        let error = sqlx::query(statement)
+            .execute(&mut *connection)
+            .await
+            .expect_err(statement);
+        assert_eq!(
+            error.as_database_error().unwrap().code().as_deref(),
+            Some("42501"),
+            "privileges, not a read-only transaction, must deny: {statement}"
+        );
+    }
+    drop(connection);
+    pool.close().await;
 }
 
 async fn insert_session(pool: &PgPool, source: Uuid, id: &str, info: &str) {
@@ -758,6 +887,15 @@ async fn snapshot_consistency(client: &Client, url: &str, pool: &PgPool) {
     assert_eq!(after["revision"], "3");
     assert_eq!(after["info"]["generation"], 3);
     assert_eq!(after["messages"][0]["generation"], 3);
+    let inventory = get(client, &format!("{url}/api/sessions?source={A}")).await;
+    let updated = inventory["sessions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|session| session["session_id"] == "same")
+        .unwrap();
+    assert_eq!(updated["revision"], "3");
+    assert_eq!(updated["info"]["generation"], 3);
 }
 
 async fn limits(client: &Client, url: &str, pool: &PgPool) {

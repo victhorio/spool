@@ -56,6 +56,7 @@ pub fn browse_router(pool: PgPool, assets: impl AsRef<FilePath>) -> anyhow::Resu
         bail!("browse assets invalid: {} must be a file", index.display());
     }
     Ok(Router::new()
+        .route("/healthz", get(health))
         .route("/api/sessions", get(sessions))
         .route("/api/sources/{source}/sessions/{session}", get(session))
         .route_service("/", ServeFile::new(index.clone()))
@@ -68,6 +69,14 @@ pub fn browse_router(pool: PgPool, assets: impl AsRef<FilePath>) -> anyhow::Resu
         })
         .with_state(pool)
         .layer(middleware::from_fn(privacy)))
+}
+
+async fn health(State(pool): State<PgPool>) -> Result<StatusCode, ApiError> {
+    sqlx::query("SELECT source_id FROM sessions LIMIT 1")
+        .execute(&pool)
+        .await
+        .map_err(|error| ApiError::database("browse_health", error))?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn privacy(request: Request, next: Next) -> Response {

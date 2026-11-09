@@ -26,7 +26,9 @@ Tailscale, but the browser does not treat it as an HTTPS secure context.
 loopback or your tailnet's access policy is the boundary. Do not publish it through
 a tunnel, Funnel, or public proxy. Source tokens still authorize ingestion only.
 The public `serve` mode does not mount the reader or its API. Adding production
-read access will require a separate, deliberate authentication design.
+read access through the public internet would require a separate authentication
+design. The [private production reader](reader-deployment.md) instead uses a
+separate tailnet-only service with restricted database credentials.
 
 The browser uses a separate two-connection pool with PostgreSQL's
 `default_transaction_read_only=on`; its routes execute only reads. This setting
@@ -46,6 +48,9 @@ Both endpoints exist only in `browse` mode. Metadata and message documents remai
 opaque JSON, including unknown fields and escaped NUL. Responses contain no
 source credential fields. Purged sessions are omitted/return 404; revoked sources'
 already archived sessions remain readable.
+
+`GET /healthz` is a separate private readiness probe: a bounded database read,
+204 with no body on success, and 503 when unavailable. It does not list sessions.
 
 - `GET /api/sessions?limit=50&cursor=…&q=…&source={source_uuid}` returns
   `{sessions: [{source_id, source_label, session_id, revision, info, received_at}], sources: [{source_id, source_label}], next_cursor}`.

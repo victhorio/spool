@@ -59,9 +59,15 @@ remove their temporary roots; failures and SIGINT/SIGTERM interruptions retain
 logs/state at the printed path after cleaning up processes and containers/volumes.
 
 `cargo test --workspace` alone skips PostgreSQL regressions unless
-`SPOOL_TEST_DATABASE_URL` is set. The supplied database role must have CREATEDB;
-tests create/drop a unique disposable database rather than clearing an existing
+`SPOOL_TEST_DATABASE_URL` is set. Supply a disposable PostgreSQL superuser;
+the suite provisions and removes restricted roles and tests their permissions.
+Tests create/drop a unique disposable database rather than clearing an existing
 one. `bun run validate` supplies the local container URL automatically.
+
+`bun run reader:validate` builds the separate production reader image and tests
+actual userspace Tailscale forwarding with a local, credential-free control plane
+on an egress-isolated network. See [reader deployment](reader-deployment.md) for
+its access boundary, covered scenarios and separate production go-live checks.
 
 ## Plugin configuration and hosting
 

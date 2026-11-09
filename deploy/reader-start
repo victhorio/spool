@@ -1,0 +1,56 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+
+fail() { echo "Spool reader: $*" >&2; exit 1; }
+[[ $# == 0 ]] || fail "this image runs the private reader only"
+[[ -n ${DATABASE_URL:-} ]] || fail "DATABASE_URL is required (use the SELECT-only reader login)"
+
+# Railway mounts volumes as root; neither service starts until privileges are dropped.
+if [[ $(id -u) == 0 ]]; then
+  install -d -m 0700 -o 10001 -g 10001 /var/lib/tailscale /run/spool
+  exec gosu 10001:10001 "$0"
+fi
+[[ -w /var/lib/tailscale ]] || fail "the Tailscale state volume must be writable by UID 10001"
+[[ -n ${TS_AUTHKEY:-} || -s /var/lib/tailscale/tailscaled.state ]] \
+  || fail "first enrollment requires TS_AUTHKEY; later starts require the persisted identity volume"
+
+export TS_USERSPACE=true TS_AUTH_ONCE=true TS_ACCEPT_DNS=false
+export TS_STATE_DIR=/var/lib/tailscale TS_SOCKET=/run/spool/tailscaled.sock
+export TS_SERVE_CONFIG=/etc/spool/serve.json
+export TS_ENABLE_METRICS=false TS_ENABLE_HEALTH_CHECK=true
+export TS_LOCAL_ADDR_PORT="[::]:${PORT:-9002}"
+unset TS_DEST_IP TS_TAILNET_TARGET_IP TS_TAILNET_TARGET_FQDN TS_ROUTES
+unset TS_SOCKS5_SERVER TS_OUTBOUND_HTTP_PROXY_LISTEN TS_DEBUG_ADDR_PORT TS_HEALTHCHECK_ADDR_PORT
+unset TS_TAILSCALED_EXTRA_ARGS
+
+app= vpn=
+cleanup() {
+  trap '' TERM INT
+  [[ -z $app ]] || kill -TERM "$app" 2>/dev/null || true
+  [[ -z $vpn ]] || kill -TERM "$vpn" 2>/dev/null || true
+  [[ -z $app ]] || wait "$app" 2>/dev/null || true
+  [[ -z $vpn ]] || wait "$vpn" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+
+spool-server browse --bind 127.0.0.1 --port 8090 --assets /opt/spool/web &
+app=$!
+ready=false
+for ((attempt = 0; attempt < 60; attempt++)); do
+  kill -0 "$app" 2>/dev/null || fail "the reader exited during startup"
+  if curl --fail --silent --max-time 2 http://127.0.0.1:8090/healthz >/dev/null; then
+    ready=true
+    break
+  fi
+  sleep 1 &
+  wait $!
+done
+[[ $ready == true ]] || fail "the reader did not become ready before the startup deadline"
+
+containerboot &
+vpn=$!
+# containerboot can exit zero when tailscaled dies; either child's exit is a failure.
+if wait -n "$app" "$vpn"; then exit 1; else exit $?; fi

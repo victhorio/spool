@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+
+curl --fail --silent --max-time 3 http://127.0.0.1:8090/healthz >/dev/null
+tailscale --socket=/run/spool/tailscaled.sock status --json \
+  | jq -e '.BackendState == "Running" and (.TailscaleIPs | length > 0)' >/dev/null
+tailscale --socket=/run/spool/tailscaled.sock serve status --json \
+  | jq -e '. == {"TCP": {"8090": {"TCPForward": "127.0.0.1:8090"}}}' >/dev/null
