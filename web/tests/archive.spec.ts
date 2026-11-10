@@ -163,6 +163,21 @@ test("empty, missing, no matches and failed transport have distinct recoverable 
   await expect(page.getByText("6 sessions", { exact: true })).toBeVisible()
 })
 
+test("an expired Access login reloads the page instead of showing an error", async ({ page }) => {
+  let expired = true
+  await page.route("**/api/sessions?*", async (route) => {
+    if (!expired) return route.continue()
+    expired = false
+    return route.fulfill({ status: 302, headers: { location: "https://login.invalid/" } })
+  })
+  let loads = 0
+  page.on("load", () => loads++)
+  await page.goto("/")
+  await expect(page.getByText("6 sessions", { exact: true })).toBeVisible()
+  expect(loads).toBe(2)
+  await expect(page.getByRole("alert")).toHaveCount(0)
+})
+
 test("errors, shell output and unfamiliar message types remain inspectable", async ({ page }) => {
   await page.goto(selection("laptop", "ses_errors"))
   await page.locator("summary").filter({ hasText: "read" }).click()

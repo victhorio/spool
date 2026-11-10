@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, net::IpAddr, path::Path as FilePath};
+use std::{collections::BTreeMap, path::Path as FilePath};
 
 use anyhow::{Context, bail};
 use axum::{
@@ -7,7 +7,7 @@ use axum::{
         Path, Query, Request, State,
         rejection::{PathRejection, QueryRejection},
     },
-    http::{HeaderValue, StatusCode, uri::Authority},
+    http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::get,
@@ -21,45 +21,33 @@ use sqlx::{FromRow, PgPool};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
-use crate::{error::ApiError, snapshot::valid_id};
+use crate::{
+    access::{self, Access},
+    error::ApiError,
+    snapshot::valid_id,
+};
 
-fn private_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(ip) => {
-            ip.is_loopback() || (ip.octets()[0] == 100 && ip.octets()[1] & 0xc0 == 64)
-        }
-        IpAddr::V6(ip) => ip.is_loopback() || ip.segments()[..3] == [0xfd7a, 0x115c, 0xa1e0],
-    }
-}
-
-pub fn validate_browse_bind(bind: IpAddr) -> anyhow::Result<()> {
-    if !private_ip(bind) {
-        bail!(
-            "browse is unauthenticated: --bind must be loopback or a Tailscale IP (100.64.0.0/10 or fd7a:115c:a1e0::/48); wildcard and LAN/public binds are not allowed"
-        );
-    }
-    Ok(())
-}
-
-/// An unauthenticated, read-only listener; never mount this on the ingestion router.
-/// Use `connect_browse` and bind only to loopback or a private tailnet address.
-pub fn browse_router(pool: PgPool, assets: impl AsRef<FilePath>) -> anyhow::Result<Router> {
+/// The web reader and its API. Every request requires a Cloudflare Access assertion;
+/// `read` should be a read-only pool.
+pub(crate) fn router(
+    read: PgPool,
+    access: Access,
+    assets: impl AsRef<FilePath>,
+) -> anyhow::Result<Router> {
     let assets = assets.as_ref();
     let index = assets.join("index.html");
     let metadata = std::fs::metadata(&index).with_context(|| {
         format!(
-            "browse assets missing: {} is required; build the web frontend first or set --assets",
+            "web assets missing: {} is required; build the web frontend first or set ASSETS_DIR",
             index.display()
         )
     })?;
     if !metadata.is_file() {
-        bail!("browse assets invalid: {} must be a file", index.display());
+        bail!("web assets invalid: {} must be a file", index.display());
     }
     Ok(Router::new()
-        .route("/healthz", get(health))
         .route("/api/sessions", get(sessions))
         .route("/api/sources/{source}/sessions/{session}", get(session))
-        .merge(crate::retrieval::routes())
         .route_service("/", ServeFile::new(index.clone()))
         .route_service("/index.html", ServeFile::new(index))
         .nest_service("/assets", ServeDir::new(assets.join("assets")))
@@ -68,16 +56,9 @@ pub fn browse_router(pool: PgPool, assets: impl AsRef<FilePath>) -> anyhow::Resu
         .method_not_allowed_fallback(|| async {
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
         })
-        .with_state(pool)
+        .with_state(read)
+        .layer(middleware::from_fn_with_state(access, access::require))
         .layer(middleware::from_fn(privacy)))
-}
-
-async fn health(State(pool): State<PgPool>) -> Result<StatusCode, ApiError> {
-    sqlx::query("SELECT source_id FROM sessions LIMIT 1")
-        .execute(&pool)
-        .await
-        .map_err(|error| ApiError::database("browse_health", error))?;
-    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn privacy(request: Request, next: Next) -> Response {
@@ -93,6 +74,7 @@ async fn privacy(request: Request, next: Next) -> Response {
         ("x-content-type-options", "nosniff"),
         ("x-frame-options", "DENY"),
         ("cross-origin-resource-policy", "same-origin"),
+        ("strict-transport-security", "max-age=31536000"),
         (
             "content-security-policy",
             "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src 'none'",
@@ -103,49 +85,38 @@ async fn privacy(request: Request, next: Next) -> Response {
     response
 }
 
+/// The API serves only the reader's own pages. TLS terminates before this
+/// service, so an Origin is compared with the Host by authority, not scheme.
 fn trusted_request(request: &Request) -> bool {
+    let path = request.uri().path();
+    if path != "/api" && !path.starts_with("/api/") {
+        return true;
+    }
     let headers = request.headers();
+    if headers.get_all("sec-fetch-site").iter().any(|value| {
+        !value
+            .to_str()
+            .is_ok_and(|value| matches!(value, "same-origin" | "none"))
+    }) {
+        return false;
+    }
+    let mut origins = headers.get_all("origin").iter().peekable();
+    if origins.peek().is_none() {
+        return true;
+    }
     let mut hosts = headers.get_all("host").iter();
-    let Some(host) = hosts.next().and_then(|value| value.to_str().ok()) else {
+    let (Some(host), None) = (hosts.next(), hosts.next()) else {
         return false;
     };
-    if hosts.next().is_some() {
-        return false;
-    }
-    let Ok(authority) = host.parse::<Authority>() else {
-        return false;
-    };
-    if host.contains('@') || (host.len() > authority.host().len() && authority.port_u16().is_none())
-    {
-        return false;
-    }
-    let name = authority
-        .host()
-        .trim_start_matches('[')
-        .trim_end_matches(']');
-    // Literal private IPs (and localhost) prevent a rebinding domain from becoming
-    // a trusted same-origin reader. Forwarded headers are deliberately ignored.
-    if !name.eq_ignore_ascii_case("localhost") && !name.parse::<IpAddr>().is_ok_and(private_ip) {
-        return false;
-    }
-    if request.uri().path() == "/api" || request.uri().path().starts_with("/api/") {
-        if headers.get_all("sec-fetch-site").iter().any(|value| {
-            !value
-                .to_str()
-                .is_ok_and(|value| matches!(value, "same-origin" | "none"))
-        }) {
-            return false;
-        }
-        let expected = format!("http://{authority}");
-        if headers
-            .get_all("origin")
-            .iter()
-            .any(|value| value.as_bytes() != expected.as_bytes())
-        {
-            return false;
-        }
-    }
-    true
+    origins.all(|origin| {
+        origin
+            .to_str()
+            .ok()
+            .and_then(|origin| origin.split_once("://"))
+            .is_some_and(|(scheme, authority)| {
+                matches!(scheme, "http" | "https") && authority.as_bytes() == host.as_bytes()
+            })
+    })
 }
 
 #[derive(Deserialize)]

@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises"
 import { fileURLToPath } from "node:url"
 import { Skill, type Plugin } from "@opencode/plugin"
-import { readerURL, validSourceAlias } from "./config"
+import { type Config, validSourceAlias } from "./config"
 
 type Route = "find" | "search" | "read"
 const maximumBytes = 24 * 1024
@@ -71,12 +71,14 @@ export function validInput(route: Route, value: unknown): value is Record<string
   return !(route === "read" && typeof input.end === "number" && input.end < (typeof input.start === "number" ? input.start : 1))
 }
 
-export async function requestReader(base: string, route: Route, input: unknown, signal?: AbortSignal): Promise<string> {
+type Archive = Pick<Config, "url" | "token">
+
+export async function requestReader(archive: Archive, route: Route, input: unknown, signal?: AbortSignal): Promise<string> {
   if (!validInput(route, input)) return errorResult("malformed_request")
   try {
-    const response = await fetch(`${readerURL(base)}/api/agent/${route}`, {
+    const response = await fetch(`${archive.url}/v1/agent/${route}`, {
       method: "POST", body: JSON.stringify(input), redirect: "error", credentials: "omit",
-      headers: { "content-type": "application/json", accept: "application/json" },
+      headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${archive.token}` },
       signal: AbortSignal.any([AbortSignal.timeout(5_000), ...(signal ? [signal] : [])]),
     })
     if (!response.body) return errorResult("reader_unavailable")
@@ -103,14 +105,13 @@ export async function requestReader(base: string, route: Route, input: unknown, 
     }
     if (!response.ok) {
       if (code === "session_changed" && validRevision(parsed?.error?.current_revision)) return errorResult(code, parsed.error.current_revision)
-      return errorResult(["session_changed", "not_indexed", "malformed_request", "not_found"].includes(code) ? code : "reader_unavailable")
+      return errorResult(["session_changed", "not_indexed", "malformed_request", "not_found", "unauthorized"].includes(code) ? code : "reader_unavailable")
     }
     return raw
   } catch { return errorResult("reader_unavailable") }
 }
 
-export async function registerRetrieval(ctx: Plugin.Context, base: string | undefined): Promise<void> {
-  if (!base) return
+export async function registerRetrieval(ctx: Plugin.Context, archive: Archive): Promise<void> {
   const location = new URL("../skills/searching-sessions/SKILL.md", import.meta.url)
   const source = await readFile(location, "utf8")
   const frontmatter = /^---\nname: ([^\n]+)\ndescription: ([^\n]+)\n---\n([\s\S]*)$/.exec(source)
@@ -133,7 +134,7 @@ export async function registerRetrieval(ctx: Plugin.Context, base: string | unde
           additionalProperties: false,
           properties: { ...definition.properties, cursor: { ...string, maxLength: 8192 } },
         },
-        execute: async (input, context) => ({ content: await requestReader(base, route, input, context.signal) }),
+        execute: async (input, context) => ({ content: await requestReader(archive, route, input, context.signal) }),
       })
     }
   })

@@ -7,15 +7,15 @@ Built-in reader-agent orchestration and session resume remain out of scope.
 ## Architecture
 
 Railway is the initial target for the Rust service and PostgreSQL. The backend
-must not depend on a user's computer staying online. Tailnet access is optional;
-source-scoped bearer tokens are not.
+must not depend on a user's computer staying online.
 
 `server/` owns authentication, validation, and durable storage, with SQL migrations
 in `server/migrations/`. `plugin/` contains the TypeScript OpenCode plugin,
 which owns capture, repository discovery, OpenCode text projections, uploads and
 tool/skill registration. Keep OpenCode-specific parsing in the plugin and `web/`
-reader rather than the database. The unauthenticated `browse` listener hosts
-both reader APIs on loopback/tailnet only, separate from public ingestion.
+reader rather than the database. One public service hosts everything: `/v1/*`
+is for machines with source tokens, `/healthz` is open, and every other route is
+the web reader behind Cloudflare Access, which the server verifies itself.
 
 [Client setup](docs/client-setup.md) covers capture and retrieval on each machine.
 [Ingestion](docs/ingestion.md) describes the consistency and wire contract.

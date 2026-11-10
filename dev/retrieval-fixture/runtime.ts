@@ -11,8 +11,7 @@ export class RetrievalRuntime {
   readonly env: Record<string, string | undefined>
   private readonly stops: (() => Promise<void>)[] = []
   url = ""
-  readerUrl = ""
-  stopReader: () => Promise<void> = async () => {}
+  stopServer: () => Promise<void> = async () => {}
   private database = ""
 
   constructor(readonly root: string, readonly repository: string) {
@@ -40,8 +39,7 @@ export class RetrievalRuntime {
   }
 
   async up() {
-    await Promise.all(["home", "config", "data", "state", "cache", "tmp", "assets"].map((name) => mkdir(path.join(this.root, name), { recursive: true })))
-    await Bun.write(path.join(this.root, "assets", "index.html"), "<!doctype html><title>Synthetic retrieval validation</title>")
+    await Promise.all(["home", "config", "data", "state", "cache", "tmp"].map((name) => mkdir(path.join(this.root, name), { recursive: true })))
     const results = await Promise.allSettled([
       command(["cargo", "build", "--locked", "-p", "spool-server"], this.repository),
       command(["docker", "run", "--detach", "--name", this.container,
@@ -57,12 +55,11 @@ export class RetrievalRuntime {
     const address = await command(["docker", "port", this.container, "5432/tcp"], this.repository)
     assert.match(address, /^127\.0\.0\.1:\d+$/)
     this.database = `postgres://spool:retrieval-validation-only@${address}/spool`
-    this.url = await this.start("ingest", ["serve"], /Spool listening on (127\.0\.0\.1:\d+)/)
+    this.url = await this.start("serve", ["serve"], /Spool listening on (127\.0\.0\.1:\d+)/)
     await waitFor("Rust ingestion migrations/readiness", async () => {
       const response = await fetch(`${this.url}/healthz`, { signal: AbortSignal.any([this.signal, AbortSignal.timeout(2_000)]) }).catch(() => undefined)
       return response?.ok ? true : undefined
     }, 30_000, this.signal)
-    this.readerUrl = await this.start("browse", ["browse", "--bind", "127.0.0.1", "--port", "0", "--assets", path.join(this.root, "assets")], /at http:\/\/(127\.0\.0\.1:\d+)/)
   }
 
   private async start(label: string, args: string[], pattern: RegExp) {
@@ -81,7 +78,7 @@ export class RetrievalRuntime {
       try { await child.exited } finally { clearTimeout(timeout) }
     })()
     this.stops.push(stop)
-    if (label === "browse") this.stopReader = stop
+    if (label === "serve") this.stopServer = stop
     return waitFor(`Rust ${label} listener`, async () => {
       const output = await Bun.file(filename).text()
       assert.equal(child.exitCode, null, `${label} exited: ${output}`)

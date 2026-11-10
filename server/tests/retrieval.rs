@@ -1,17 +1,17 @@
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{collections::BTreeMap, time::Duration};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use reqwest::{Client, StatusCode};
 use serde_json::{Value, json};
-use spool_server::{admin, browse_router, connect, connect_browse, migrate, router};
-use sqlx::{Executor, PgPool};
+use spool_server::{admin, connect, connect_read, migrate, router};
+use sqlx::PgPool;
 use uuid::Uuid;
 
 struct Harness {
     pool: PgPool,
     client: Client,
-    reader: String,
-    ingestion: String,
+    url: String,
+    token: String,
 }
 
 async fn serve(router: axum::Router) -> (String, tokio::task::JoinHandle<()>) {
@@ -58,7 +58,7 @@ impl Harness {
         });
         let response = self
             .client
-            .post(format!("{}/v1/sync/sessions/{id}/snapshot", self.ingestion))
+            .post(format!("{}/v1/sync/sessions/{id}/snapshot", self.url))
             .bearer_auth(token)
             .json(&body)
             .send()
@@ -72,18 +72,12 @@ impl Harness {
     async fn call(&self, operation: &str, input: Value) -> Value {
         let response = self
             .client
-            .post(format!("{}/api/agent/{operation}", self.reader))
+            .post(format!("{}/v1/agent/{operation}", self.url))
+            .bearer_auth(&self.token)
             .json(&input)
             .send()
             .await
             .unwrap();
-        assert_eq!(response.headers()["cache-control"], "no-store");
-        assert!(
-            response
-                .headers()
-                .get("access-control-allow-origin")
-                .is_none()
-        );
         let status = response.status();
         let bytes = response.bytes().await.unwrap();
         assert_eq!(
@@ -103,7 +97,8 @@ impl Harness {
     async fn error(&self, operation: &str, input: Value, status: StatusCode, code: &str) -> Value {
         let response = self
             .client
-            .post(format!("{}/api/agent/{operation}", self.reader))
+            .post(format!("{}/v1/agent/{operation}", self.url))
+            .bearer_auth(&self.token)
             .json(&input)
             .send()
             .await
@@ -147,14 +142,6 @@ impl Harness {
     }
 }
 
-struct Assets(PathBuf);
-
-impl Drop for Assets {
-    fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.0).unwrap();
-    }
-}
-
 #[tokio::test]
 async fn private_repository_search_and_bounded_evidence() {
     let Ok(database_url) = std::env::var("SPOOL_TEST_DATABASE_URL") else {
@@ -165,30 +152,16 @@ async fn private_repository_search_and_bounded_evidence() {
     };
     let owner = connect(&database_url).await.unwrap();
     let database = format!("spool_retrieval_{}", Uuid::new_v4().simple());
-    let role = format!("spool_retrieval_reader_{}", Uuid::new_v4().simple());
     sqlx::query(&format!("CREATE DATABASE {database}"))
         .execute(&owner)
         .await
         .unwrap();
     let cleanup_database = database.clone();
-    let cleanup_role = role.clone();
     let result = tokio::spawn(async move {
         let mut database_url = reqwest::Url::parse(&database_url).unwrap();
         database_url.set_path(&database);
         let pool = connect(database_url.as_str()).await.unwrap();
         migrate(&pool).await.unwrap();
-        pool.execute(
-            include_str!("../../deploy/reader-role.sql")
-                .replace("spool_reader", &role)
-                .as_str(),
-        )
-        .await
-        .unwrap();
-        pool.execute(
-            format!("ALTER ROLE {role} LOGIN PASSWORD 'synthetic-retrieval-reader'").as_str(),
-        )
-        .await
-        .unwrap();
         let mut a = admin::add_source(&pool, "synthetic laptop").await.unwrap();
         // A fixed fixture identity lets literal v2 cursors outlive changes to their encoder.
         let source = Uuid::from_u128(1);
@@ -203,48 +176,29 @@ async fn private_repository_search_and_bounded_evidence() {
             .replacen(&a.source_id.to_string(), &source.to_string(), 1);
         a.source_id = source;
         let b = admin::add_source(&pool, "synthetic desktop").await.unwrap();
-        database_url.set_username(&role).unwrap();
-        database_url
-            .set_password(Some("synthetic-retrieval-reader"))
-            .unwrap();
-        let reader_pool = connect_browse(database_url.as_str()).await.unwrap();
-        let assets =
-            Assets(std::env::temp_dir().join(format!("spool-retrieval-{}", Uuid::new_v4())));
-        std::fs::create_dir_all(&assets.0).unwrap();
-        std::fs::write(
-            assets.0.join("index.html"),
-            "<!doctype html><title>Fixture</title>",
-        )
-        .unwrap();
-        let (reader, reader_task) =
-            serve(browse_router(reader_pool.clone(), &assets.0).unwrap()).await;
-        let (ingestion, ingestion_task) = serve(router(pool.clone())).await;
+        let read = connect_read(database_url.as_str()).await.unwrap();
+        let (url, task) = serve(router(pool.clone(), read.clone(), None).unwrap()).await;
         let harness = Harness {
             pool: pool.clone(),
             client: Client::builder()
                 .timeout(Duration::from_secs(20))
                 .build()
                 .unwrap(),
-            reader,
-            ingestion,
+            url,
+            token: b.token.clone(),
         };
         exercise(&harness, &a, &b).await;
         aliases_and_compact_cursors(&harness, &a, &b).await;
-        reader_task.abort();
-        ingestion_task.abort();
-        reader_pool.close().await;
+        task.abort();
+        read.close().await;
         pool.close().await;
     })
     .await;
     let database_result = sqlx::query(&format!("DROP DATABASE {cleanup_database} WITH (FORCE)"))
         .execute(&owner)
         .await;
-    let role_result = sqlx::query(&format!("DROP ROLE IF EXISTS {cleanup_role}"))
-        .execute(&owner)
-        .await;
     owner.close().await;
     database_result.unwrap();
-    role_result.unwrap();
     result.unwrap();
 }
 
@@ -325,7 +279,7 @@ async fn exercise(h: &Harness, a: &admin::Credential, b: &admin::Credential) {
     });
     assert_eq!(
         h.client
-            .post(format!("{}/v1/sync/sessions/legacy/snapshot", h.ingestion))
+            .post(format!("{}/v1/sync/sessions/legacy/snapshot", h.url))
             .bearer_auth(&a.token)
             .json(&legacy)
             .send()
@@ -524,30 +478,52 @@ async fn exercise(h: &Harness, a: &admin::Credential, b: &admin::Credential) {
         )
         .await;
     }
-    for header in [
-        ("origin", "https://evil.invalid"),
-        ("sec-fetch-site", "cross-site"),
+    let forged = format!("{}A", &h.token[..h.token.len() - 1]);
+    for token in [None, Some(forged.as_str())] {
+        let mut request = h.client.post(format!("{}/v1/agent/find", h.url));
+        if let Some(token) = token {
+            request = request.bearer_auth(token);
+        }
+        let response = request.json(&json!({})).send().await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.json::<Value>().await.unwrap(),
+            json!({"error":{"code":"unauthorized"}})
+        );
+    }
+    sqlx::query("UPDATE sources SET revoked_at = now() WHERE id = $1")
+        .bind(a.source_id)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    let response = h
+        .client
+        .post(format!("{}/v1/agent/find", h.url))
+        .bearer_auth(&a.token)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    sqlx::query("UPDATE sources SET revoked_at = NULL WHERE id = $1")
+        .bind(a.source_id)
+        .execute(&h.pool)
+        .await
+        .unwrap();
+    for (path, status) in [
+        ("/api/agent/find", StatusCode::NOT_FOUND),
+        ("/v1/agent/unknown", StatusCode::NOT_FOUND),
     ] {
         let response = h
             .client
-            .post(format!("{}/api/agent/find", h.reader))
-            .header(header.0, header.1)
+            .post(format!("{}{path}", h.url))
+            .bearer_auth(&h.token)
             .json(&json!({}))
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.status(), status, "{path}");
     }
-    assert_eq!(
-        h.client
-            .post(format!("{}/api/agent/find", h.ingestion))
-            .json(&json!({}))
-            .send()
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::NOT_FOUND
-    );
 
     sqlx::query("UPDATE sessions SET revision = 2 WHERE source_id = $1 AND session_id = 'same'")
         .bind(a.source_id)
@@ -693,7 +669,7 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
     for (token, alias) in [(&a.token, "work-m5"), (&b.token, "home-m4")] {
         let response = h
             .client
-            .put(format!("{}/v1/sync/source", h.ingestion))
+            .put(format!("{}/v1/sync/source", h.url))
             .bearer_auth(token)
             .json(&json!({"alias":alias}))
             .send()
@@ -942,7 +918,7 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
     let alias = "a".repeat(32);
     assert_eq!(
         h.client
-            .put(format!("{}/v1/sync/source", h.ingestion))
+            .put(format!("{}/v1/sync/source", h.url))
             .bearer_auth(&c.token)
             .json(&json!({"alias":alias}))
             .send()

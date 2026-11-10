@@ -20,9 +20,9 @@ const MAX_POSITION: i32 = 100_000;
 
 pub(crate) fn routes() -> Router<PgPool> {
     Router::new()
-        .route("/api/agent/find", post(find))
-        .route("/api/agent/search", post(search))
-        .route("/api/agent/read", post(read))
+        .route("/v1/agent/find", post(find))
+        .route("/v1/agent/search", post(search))
+        .route("/v1/agent/read", post(read))
         .layer(DefaultBodyLimit::max(16 * 1024))
 }
 

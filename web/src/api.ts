@@ -37,7 +37,12 @@ export class ArchiveError extends Error {
 }
 
 export async function read<T>(path: string, signal?: AbortSignal): Promise<T> {
-  const response = await fetch(path, { signal, cache: "no-store" })
+  const response = await fetch(path, { signal, cache: "no-store", redirect: "manual" })
+  // An expired Cloudflare Access session redirects to its login; only a navigation can follow it.
+  if (response.type === "opaqueredirect") {
+    window.location.reload()
+    return new Promise<T>(() => {})
+  }
   if (!response.ok) throw new ArchiveError(response.status)
   return response.json() as Promise<T>
 }

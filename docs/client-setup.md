@@ -1,9 +1,7 @@
 # Set up OpenCode on another machine
 
-Spool has two independent connections. The public ingestion `url` and source
-token enable capture. The private `readerUrl` enables archive search/read tools
-and their skill. A plugin can be active and uploading successfully while exposing
-no retrieval tools. Omitting `readerUrl` deliberately makes it capture-only.
+The plugin needs the Spool `url` and a source token. The token enables capture
+and the archive search/read tools; both use the same HTTPS address.
 
 ## Install and configure
 
@@ -25,10 +23,9 @@ no retrieval tools. Omitting `readerUrl` deliberately makes it capture-only.
   "plugins": [{
     "package": "/absolute/path/to/spool/plugin",
     "options": {
-      "url": "https://your-spool-host",
+      "url": "https://spool.example.com",
       "tokenFile": "~/.config/spool/source.token",
-      "sourceAlias": "work-laptop",
-      "readerUrl": "http://100.86.13.40:8090"
+      "sourceAlias": "work-laptop"
     }
   }]
 }
@@ -44,13 +41,8 @@ the configuration is corrected and all instances are reloaded. Omitting the
 option leaves any centrally assigned name unchanged; it does not clear it.
 Adding an alias preserves checkpoints and does not recapture existing sessions.
 
-`http://100.86.13.40:8090` is the current private deployment's reader address;
-use its current literal Tailscale IPv4 address if that node is replaced. Each
-client needs `readerUrl` configured and Tailscale connected to the trusted tailnet.
-Do not substitute the public ingestion URL, a MagicDNS name, HTTPS, or another
-machine's `127.0.0.1`. Loopback works only when the reader runs on that same machine.
-The source token authorizes ingestion, not reading; do not send it to the reader.
-No new database, reader service or tailnet policy changes are needed on clients.
+The former `readerUrl` option is accepted and ignored; remove it when convenient.
+Retrieval requests send the source token to `url`.
 
 Pulling the checkout updates files, not already-loaded plugin instances. After
 changing code or options, reload all Spool instances for that source. Restarting
@@ -61,23 +53,20 @@ changing options, or their shared collector will reject conflicting configuratio
 
 ## Verify from that machine
 
-Check network/API access separately from tool registration. These read-only
-probes need curl and jq; they do not send credentials or read conversation bodies:
+Check network/API access separately from tool registration. This read-only probe
+needs curl and jq. It sends the source token from a file, so the token does not
+appear in the command line or shell history:
 
 ```bash
 set -o pipefail
-reader=http://100.86.13.40:8090
-curl --noproxy '*' --fail --silent --show-error --max-time 5 \
-  --output /dev/null --write-out 'HTTP %{http_code}\n' "$reader/healthz"
-curl --noproxy '*' --fail --silent --show-error --max-time 5 \
+curl --fail --silent --show-error --max-time 5 \
+  --header @<(printf 'Authorization: Bearer %s\n' "$(cat ~/.config/spool/source.token)") \
   --header 'Content-Type: application/json' --data '{"limit":1}' \
-  "$reader/api/agent/find" | jq '{coverage, returned_sessions: (.sessions | length)}'
+  https://spool.example.com/v1/agent/find | jq '{coverage, returned_sessions: (.sessions | length)}'
 ```
 
-Expect health **204** and a find response containing `coverage`. A successful
-health probe alone does not establish that the agent API is deployed or granted
-access to its database columns. A timeout is a network/reader availability problem,
-not evidence of a bad source token.
+Expect a find response containing `coverage`. A 401 means the token is missing,
+wrong or revoked; a timeout is a network or service availability problem.
 
 After reload, check the intended agent's available tools, not just plugin status:
 
@@ -104,8 +93,9 @@ status, a Git pull or direct HTTP success does not.
 
 | Symptom | Check |
 | --- | --- |
-| Capture works but tools and skill are absent | `readerUrl` in the effective Spool options, then reload all instances. If registered but unavailable to one agent, check that agent's permissions. |
-| `reader_unavailable` | Run the probes from the affected machine. Check Tailscale, the literal reader address and reader readiness; the public ingestion service does not serve these routes. |
+| Tools and skill are absent | Reload all instances after updating the plugin. If registered but unavailable to one agent, check that agent's permissions. |
+| `unauthorized` | The source token is missing, wrong or revoked. Check `tokenFile` and run the probe above. |
+| `reader_unavailable` | Run the probe from the affected machine and check the service's availability. |
 | Capture logs `source_alias_mismatch` or `source_alias_conflict`, then `disabled_until_reload` | Keep the already assigned alias for this source, or choose an unused alias for an unnamed source. Correct the options and reload all instances; retrying cannot rename a source or take another source's name. |
 | `ambiguous_session` | Select the intended source-qualified reference from `candidates`, or use find to narrow the choice. |
 | `malformed_request` | Use the source-qualified reference from find and the documented arguments; a continuation request contains only its cursor. |
@@ -118,7 +108,7 @@ selection. See [repository identity](retrieval.md#repository-identity).
 Managed OpenCode service discovery is automatic and must resolve the plugin's own
 process. For a nondefault registration use `serviceFile`; for an unmanaged server
 set both `opencodeUrl` and `opencodePasswordFile`. Those endpoints must still
-identify the current host; remote ingestion requires HTTPS, unlike private reader
-HTTP. The former `sweepIntervalMs` option is accepted but ignored: capture is
+identify the current host; remote ingestion requires HTTPS. The former
+`sweepIntervalMs` option is accepted but ignored: capture is
 event-driven, with explicit [repair](ingestion.md#capture-and-retention), not
 periodic full sweeps.

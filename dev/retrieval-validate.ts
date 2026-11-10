@@ -31,12 +31,12 @@ let calls = 0
 const quote = (text: string) => `'${text.replaceAll("'", "''")}'`
 const pass = (name: string) => { cases.push(name); console.log(`PASS ${name}`) }
 
-async function host(label: string, source: Source, withReader = true) {
+async function host(label: string, source: Source) {
   const tokenFile = path.join(root, `${label}.token`)
   await Bun.write(tokenFile, source.token)
   await chmod(tokenFile, 0o600)
   const value = await startOpenCode(path.join(root, label), path.join(repository, "plugin"), {
-    url: runtime.url, tokenFile, ...(source.alias ? { sourceAlias: source.alias } : {}), ...(withReader ? { readerUrl: runtime.readerUrl } : {}),
+    url: runtime.url, tokenFile, ...(source.alias ? { sourceAlias: source.alias } : {}),
   }, runtime.signal, [{ package: path.join(repository, "dev", "retrieval-fixture"), options: { query: agentQuery, expectedText: evidence } }])
   hosts.push(value)
   return value
@@ -273,15 +273,9 @@ try {
   assert.equal(coverage.total_sessions - coverage.indexed_sessions, 1)
   pass("legacy raw archives report not_indexed and incomplete coverage without fabricating evidence")
 
-  const disabled = await host("opencode-disabled", JSON.parse(await runtime.admin("source", "add", "--label", "synthetic-reader-disabled")), false)
-  await activate(disabled, location(disabled).directory)
-  const disabledTools = await disabled.client.rpc.call({ rpcID: "spool-retrieval-fixture", method: "tools", input: {}, location: location(disabled) })
-  assert.ok(disabledTools.output.every((tool: { id: string }) => !Object.values(names).includes(tool.id)))
-  assert.ok((await disabled.client.skill.list({ location: location(disabled) })).data.every((skill) => skill.id !== "spool.searching-sessions"))
-  pass("omitting readerUrl registers neither retrieval tools nor the bundled retrieval skill")
-  await runtime.stopReader()
+  await runtime.stopServer()
   await error("read", { session: reference }, "reader_unavailable")
-  pass("a stopped real Rust browse listener returns reader_unavailable rather than fabricated evidence")
+  pass("a stopped real Rust server returns reader_unavailable rather than fabricated evidence")
   passed = true
 } catch (error) {
   console.error(`Retrieval validation ${runtime.signal.aborted ? "interrupted" : "failed"}; synthetic logs retained in ${root}`)

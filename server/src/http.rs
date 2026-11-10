@@ -1,4 +1,4 @@
-use std::{sync::Arc, time::Duration};
+use std::{path::PathBuf, sync::Arc, time::Duration};
 
 use axum::{
     Json, Router,
@@ -8,8 +8,9 @@ use axum::{
         rejection::{PathRejection, QueryRejection},
     },
     http::{HeaderMap, StatusCode},
+    middleware,
     response::{IntoResponse, Response},
-    routing::{get, post, put},
+    routing::{any, get, post, put},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
@@ -18,7 +19,9 @@ use sqlx::{FromRow, PgPool};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::{auth, error::ApiError, snapshot, snapshot::MAX_BODY};
+use crate::{
+    access::Access, auth, browse, error::ApiError, retrieval, snapshot, snapshot::MAX_BODY,
+};
 
 #[derive(Clone)]
 struct App {
@@ -26,13 +29,26 @@ struct App {
     uploads: Arc<Semaphore>,
 }
 
-pub fn router(pool: PgPool) -> Router {
-    Router::new()
+/// The web reader, protected by Cloudflare Access.
+pub struct Reader {
+    pub access: Access,
+    pub assets: PathBuf,
+}
+
+/// Machines use `/v1/*` with source tokens. Without a `reader`, nothing else is served.
+/// `read` serves archive reads and should be a read-only pool.
+pub fn router(pool: PgPool, read: PgPool, reader: Option<Reader>) -> anyhow::Result<Router> {
+    let not_found = || async { ApiError::new(StatusCode::NOT_FOUND, "not_found") };
+    let agent = retrieval::routes()
+        .with_state(read.clone())
+        .route_layer(middleware::from_fn_with_state(pool.clone(), auth::require));
+    let app = Router::new()
         .route("/healthz", get(health))
         .route("/v1/sync/source", put(assign_source_alias))
         .route("/v1/sync/sessions", get(inventory))
         .route("/v1/sync/sessions/{id}/snapshot", post(upload))
-        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found") })
+        .route("/v1", any(not_found))
+        .route("/v1/{*rest}", any(not_found))
         .method_not_allowed_fallback(|| async {
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
         })
@@ -40,6 +56,11 @@ pub fn router(pool: PgPool) -> Router {
             pool,
             uploads: Arc::new(Semaphore::new(2)),
         })
+        .merge(agent);
+    Ok(match reader {
+        Some(reader) => app.fallback_service(browse::router(read, reader.access, reader.assets)?),
+        None => app.fallback(not_found),
+    })
 }
 
 async fn health(State(app): State<App>) -> StatusCode {

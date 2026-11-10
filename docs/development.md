@@ -64,15 +64,9 @@ remove their temporary roots; failures and SIGINT/SIGTERM interruptions retain
 logs/state at the printed path after cleaning up processes and containers/volumes.
 
 `cargo test --workspace` alone skips PostgreSQL regressions unless
-`SPOOL_TEST_DATABASE_URL` is set. Supply a disposable PostgreSQL superuser;
-the suite provisions and removes restricted roles and tests their permissions.
+`SPOOL_TEST_DATABASE_URL` is set. Supply a disposable PostgreSQL superuser.
 Tests create/drop a unique disposable database rather than clearing an existing
 one. `bun run validate` supplies the local container URL automatically.
-
-`bun run reader:validate` builds the separate production reader image and tests
-actual userspace Tailscale forwarding with a local, credential-free control plane
-on an egress-isolated network. See [reader deployment](reader-deployment.md) for
-its access boundary, covered scenarios and separate production go-live checks.
 
 `bun run retrieval:validate` uses isolated OpenCode stores, real Git checkouts,
 worktrees and clones, and Rust/PostgreSQL to exercise repository capture and the
@@ -81,19 +75,20 @@ actual General agent loop through skill loading, find, search and read without
 calling a model. It verifies runtime schemas, permissions and evidence delivery,
 not whether a model chooses the right search or delegation. Explore permissions
 remain unchanged. The fixture also checks giant-message continuation, stale
-revisions, missing projections, removed worktrees and reader outages.
+revisions, missing projections, removed worktrees and server outages.
 
 ## Installed clients and server hosting
 
 Use [client setup](client-setup.md) for an actual OpenCode installation, including
-both ingestion and private reader configuration, reloads and retrieval checks.
+configuration, reloads and retrieval checks.
 The sandbox above uses isolated settings and does not configure your installed
 client.
 
 For Railway, build `server/Dockerfile` from the repository root and supply
 `DATABASE_URL`. Default command serves and migrates before listening, honors
-`PORT` (default 8080), and binds `BIND_ADDR` (default 0.0.0.0). Use `/healthz`
-for readiness. The image runs as non-root. Operator CLI commands use the same
+`PORT` (default 8080), and binds `BIND_ADDR` (default 0.0.0.0). `ACCESS_ISSUER`
+and `ACCESS_AUD` enable the web reader; see [public deployment](public-deployment.md).
+The image includes the built frontend. Use `/healthz` for readiness. The image runs as non-root. Operator CLI commands use the same
 binary and database, not a public admin endpoint. Deployment, TLS, backups and
 real-client installation are separate operator actions. The production ingestion
 service is connected to GitHub `main`: pushing there can trigger deployment.

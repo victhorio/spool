@@ -1,3 +1,4 @@
+mod access;
 pub mod admin;
 mod auth;
 mod browse;
@@ -14,14 +15,15 @@ use sqlx::{
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
-pub use browse::{browse_router, validate_browse_bind};
-pub use http::router;
+pub use access::Access;
+pub use http::{Reader, router};
 
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
     connect_pool(database_url, false).await
 }
 
-pub async fn connect_browse(database_url: &str) -> anyhow::Result<PgPool> {
+/// A small pool whose transactions default to read-only, for archive reads.
+pub async fn connect_read(database_url: &str) -> anyhow::Result<PgPool> {
     connect_pool(database_url, true).await
 }
 

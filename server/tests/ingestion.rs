@@ -166,7 +166,7 @@ async fn postgres_http_contract() {
     migrate(&pool).await.unwrap();
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let app = router(pool.clone());
+    let app = router(pool.clone(), pool.clone(), None).unwrap();
     let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let harness = Harness {
         pool: pool.clone(),

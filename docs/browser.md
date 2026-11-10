@@ -8,49 +8,45 @@ change the archive. Reasoning, tools, system context and compaction summaries ar
 expandable. Attachments are labeled, not fetched from external storage. Archived
 HTML is inert, remote images are not loaded, and Markdown is sanitized.
 
-## Run locally
+## Access
 
-Run `bun install --frozen-lockfile`, `bun run web:build`, and
-`cargo build --locked --package spool-server`. Point `DATABASE_URL` at an existing
-Spool database and run `target/debug/spool-server browse`. It serves the built
-assets from `web/dist` at `http://127.0.0.1:8090` by default. `--assets` selects
-another build directory. It never migrates the database.
+The reader is part of the public `serve` service, at `https://spool.example.com`
+in production. Cloudflare Access protects every route except `/v1/*`, which is for
+machines with source tokens. The production Access application allows one GitHub
+identity; see [public deployment](public-deployment.md).
 
-For another machine on your tailnet, use `browse --bind <your-tailscale-ip>` and
-open the literal IP URL. The listener rejects wildcard, LAN and public binds.
-MagicDNS names, custom Host headers and reverse proxies are not supported; the
-Host restriction prevents DNS rebinding. HTTP over the tailnet is encrypted by
-Tailscale, but the browser does not treat it as an HTTPS secure context.
+Railway's origin can be reached without passing through Cloudflare, so the
+server also verifies Access itself. Every reader request needs a
+`Cf-Access-Jwt-Assertion` header: an RS256 assertion signed by a key from the
+team's `/cdn-cgi/access/certs`, with the configured issuer and AUD tag, unexpired.
+Requests without a valid assertion receive 403 `forbidden`. If the signing keys
+cannot be fetched, the reader returns 503 `access_unavailable`. Keys are fetched
+on first use and refreshed, at most every 30 seconds, when an assertion names an
+unknown key.
 
-**Access to this listener means read access to every source.** It has no login:
-loopback or your tailnet's access policy is the boundary. Do not publish it through
-a tunnel, Funnel, or public proxy. Source tokens still authorize ingestion only.
-The public `serve` mode does not mount the reader or its API. Adding production
-read access through the public internet would require a separate authentication
-design. The [private production reader](reader-deployment.md) instead uses a
-separate tailnet-only service with restricted database credentials.
+`serve` enables the reader only when both `ACCESS_ISSUER` (the team origin, such
+as `https://example.cloudflareaccess.com`) and `ACCESS_AUD` (the application's AUD
+tag) are set; with neither, it serves only `/healthz` and `/v1/*`. `ASSETS_DIR`
+selects the built frontend (default `web/dist`; the image uses `/opt/spool/web`).
+Startup fails if only one Access variable is set or the assets are missing.
 
-The browser uses a separate two-connection pool with PostgreSQL's
-`default_transaction_read_only=on`; its routes execute only reads. This setting
-prevents accidental writes, not misuse of an administrative database credential.
-A dedicated SELECT-only database role is appropriate for a persistent installation.
-Responses prohibit caching, framing and cross-origin API access.
+Reads use a separate two-connection pool with PostgreSQL's
+`default_transaction_read_only=on`. This prevents accidental writes; it is not a
+privilege boundary. Responses prohibit caching, framing and cross-origin API
+access. `/api/*` additionally rejects cross-site Fetch Metadata and any Origin
+that does not match the request's Host. When an Access session expires, API
+requests are redirected to Cloudflare's login; the page reloads to follow it.
 
 A local copy of the production archive is useful for a preview without changing
 the cloud deployment. Treat that copy as private data, not a synthetic fixture;
 it is a point-in-time snapshot and does not follow new uploads automatically.
-Production token hashes are not needed in a preview copy: populate source labels
-with inert hashes instead. Never expose PostgreSQL outside loopback for this.
+Never expose PostgreSQL outside loopback for this.
 
 ## Read API
 
-Both endpoints exist only in `browse` mode. Metadata and message documents remain
-opaque JSON, including unknown fields and escaped NUL. Responses contain no
-source credential fields. Purged sessions are omitted/return 404; revoked sources'
-already archived sessions remain readable.
-
-`GET /healthz` is a separate private readiness probe: a bounded database read,
-204 with no body on success, and 503 when unavailable. It does not list sessions.
+Metadata and message documents remain opaque JSON, including unknown fields and
+escaped NUL. Responses contain no source credential fields. Purged sessions are
+omitted/return 404; revoked sources' already archived sessions remain readable.
 
 - `GET /api/sessions?limit=50&cursor=…&q=…&source={source_uuid}` returns
   `{sessions: [{source_id, source_label, session_id, revision, info, received_at}], sources: [{source_id, source_label}], next_cursor}`.
@@ -80,14 +76,18 @@ return generic 503 errors. Error bodies use `{error: {code: "…"}}`.
 
 ## Validation
 
-`bun run web:validate` builds the frontend and native Rust reader, starts the
+`bun run web:validate` builds the frontend and the Rust server, starts the
 isolated container stack, ingests synthetic sessions over HTTP, then runs
-Playwright against the built app. It uses installed Google Chrome in a disposable
-browser profile, not personal tabs or cookies. There are no model calls or real
-conversations. Containers and volumes are removed afterward; failed runs retain
-logs under `.local/web-validate-*`. Screenshots and traces go to `.amp/in/artifacts/`.
+Playwright against the built app. A synthetic Access team serves an in-memory
+signing key, and the browser sends its assertion. It uses installed Google Chrome
+in a disposable browser profile, not personal tabs or cookies. There are no model
+calls or real conversations. Containers and volumes are removed afterward; failed
+runs retain logs under `.local/web-validate-*`. Screenshots and traces go to
+`.amp/in/artifacts/`.
 
 The checks exercise source collisions, filtering, history/deep links, Markdown,
 tools/reasoning/compaction, ordered pagination, revision conflicts, inert hostile
-content, recoverable failures and mobile navigation. Rust tests independently
-check the SQL snapshots, raw JSON, read-only connections and HTTP access guards.
+content, recoverable failures, expired Access sessions and mobile navigation. Rust
+tests independently check Access assertions (signature, issuer, audience, expiry,
+algorithm and key ID), the SQL snapshots, raw JSON, read-only connections and HTTP
+access guards.

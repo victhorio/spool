@@ -1,15 +1,29 @@
 use std::{
     path::PathBuf,
-    process::{Child, Command, Stdio},
-    time::Duration,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
+use axum::{
+    Json, http::StatusCode as AxumStatus, response::IntoResponse, routing::get as route_get,
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::DateTime;
-use reqwest::{Client, Response, StatusCode};
+use reqwest::{
+    Client, Response, StatusCode,
+    header::{HeaderMap, HeaderValue},
+};
+use ring::{
+    rand::SystemRandom,
+    rsa::PublicKeyComponents,
+    signature::{RSA_PKCS1_SHA256, RsaKeyPair},
+};
 use serde_json::{Value, json};
-use spool_server::{browse_router, connect, connect_browse, migrate, router, validate_browse_bind};
-use sqlx::{Executor, PgPool, postgres::PgPoolOptions};
+use spool_server::{Access, Reader, connect, connect_read, migrate, router};
+use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
 
@@ -18,6 +32,8 @@ const B: Uuid = Uuid::from_u128(2);
 const RAW_INFO: &str = r#"{ "id":"same", "unknown":{"text":"x\u0000y","number":1e3}, "html":"<script>alert(1)</script>" }"#;
 const RAW_MESSAGE: &str =
     r#"{ "id":"m3", "parts":[{"type":"future","text":"a\u0000b"}], "number":1e3 }"#;
+const AUDIENCE: &str = "syntheticaudience";
+const KID: &str = "synthetic-key";
 
 struct Assets(PathBuf);
 
@@ -45,6 +61,117 @@ async fn serve(app: axum::Router) -> (String, JoinHandle<()>) {
     (url, task)
 }
 
+/// A synthetic Cloudflare Access team: its certificate endpoint and assertion signer.
+struct Team {
+    issuer: String,
+    key: RsaKeyPair,
+    fetches: Arc<AtomicUsize>,
+    down: Arc<AtomicBool>,
+    task: JoinHandle<()>,
+}
+
+impl Team {
+    async fn start() -> Self {
+        // Test-only key; it authorizes nothing outside these tests.
+        let key = RsaKeyPair::from_pkcs8(include_bytes!("fixtures/access-test-only.pk8")).unwrap();
+        let public = PublicKeyComponents::<Vec<u8>>::from(key.public());
+        let certs = json!({"keys": [
+            {"kid": "unrelated", "kty": "EC", "crv": "P-256", "x": "AA", "y": "AA"},
+            {"kid": KID, "kty": "RSA", "alg": "RS256", "use": "sig",
+             "n": URL_SAFE_NO_PAD.encode(&public.n), "e": URL_SAFE_NO_PAD.encode(&public.e)},
+        ]});
+        let fetches = Arc::new(AtomicUsize::new(0));
+        let down = Arc::new(AtomicBool::new(false));
+        let (counter, unavailable) = (fetches.clone(), down.clone());
+        let (issuer, task) = serve(axum::Router::new().route(
+            "/cdn-cgi/access/certs",
+            route_get(move || {
+                counter.fetch_add(1, Ordering::SeqCst);
+                let response = if unavailable.load(Ordering::SeqCst) {
+                    AxumStatus::SERVICE_UNAVAILABLE.into_response()
+                } else {
+                    Json(certs.clone()).into_response()
+                };
+                async move { response }
+            }),
+        ))
+        .await;
+        Self {
+            issuer,
+            key,
+            fetches,
+            down,
+            task,
+        }
+    }
+
+    fn access(&self) -> Access {
+        Access::new(&self.issuer, AUDIENCE).unwrap()
+    }
+
+    fn sign(&self, header: Value, claims: Value) -> String {
+        let encode = |value: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(value).unwrap());
+        let signed = format!("{}.{}", encode(&header), encode(&claims));
+        let mut signature = vec![0; self.key.public().modulus_len()];
+        self.key
+            .sign(
+                &RSA_PKCS1_SHA256,
+                &SystemRandom::new(),
+                signed.as_bytes(),
+                &mut signature,
+            )
+            .unwrap();
+        format!("{signed}.{}", URL_SAFE_NO_PAD.encode(signature))
+    }
+
+    fn claims(&self) -> Value {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        json!({"iss": self.issuer, "aud": [AUDIENCE], "exp": now + 600, "nbf": now - 5,
+               "iat": now - 5, "email": "owner@example.invalid", "type": "app"})
+    }
+
+    fn assertion(&self) -> String {
+        self.sign(
+            json!({"alg": "RS256", "kid": KID, "typ": "JWT"}),
+            self.claims(),
+        )
+    }
+
+    fn client(&self) -> Client {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "cf-access-jwt-assertion",
+            HeaderValue::from_str(&self.assertion()).unwrap(),
+        );
+        Client::builder()
+            .default_headers(headers)
+            .timeout(Duration::from_secs(15))
+            .build()
+            .unwrap()
+    }
+}
+
+impl Drop for Team {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+fn app(pool: &PgPool, read: &PgPool, access: Access, assets: &Assets) -> axum::Router {
+    router(
+        pool.clone(),
+        read.clone(),
+        Some(Reader {
+            access,
+            assets: assets.0.clone(),
+        }),
+    )
+    .unwrap()
+}
+
 fn privacy(response: &Response) {
     let headers = response.headers();
     assert_eq!(headers["cache-control"], "no-store");
@@ -52,6 +179,7 @@ fn privacy(response: &Response) {
     assert_eq!(headers["x-content-type-options"], "nosniff");
     assert_eq!(headers["x-frame-options"], "DENY");
     assert_eq!(headers["cross-origin-resource-policy"], "same-origin");
+    assert_eq!(headers["strict-transport-security"], "max-age=31536000");
     assert!(headers.get("access-control-allow-origin").is_none());
     let csp = headers["content-security-policy"].to_str().unwrap();
     for directive in [
@@ -81,59 +209,60 @@ async fn error(response: Response, status: StatusCode, code: &str) {
 }
 
 #[test]
-fn private_bindings_only() {
-    for address in [
-        "127.0.0.1",
-        "127.0.0.2",
-        "::1",
-        "100.64.0.0",
-        "100.127.255.255",
-        "fd7a:115c:a1e0::1",
+fn access_configuration() {
+    for issuer in [
+        "https://team.cloudflareaccess.com",
+        "https://team.cloudflareaccess.com/",
+        "http://127.0.0.1:9000",
+        "http://[::1]:9000",
     ] {
-        validate_browse_bind(address.parse().unwrap()).unwrap();
+        Access::new(issuer, AUDIENCE).unwrap();
     }
-    for address in [
-        "0.0.0.0",
-        "::",
-        "192.168.1.1",
-        "10.0.0.1",
-        "8.8.8.8",
-        "100.63.255.255",
-        "100.128.0.0",
-        "fd7a:115c:a1e1::1",
-        "::ffff:127.0.0.1",
+    for issuer in [
+        "http://team.cloudflareaccess.com",
+        "http://192.168.1.1",
+        "https://team.cloudflareaccess.com/path",
+        "https://team.cloudflareaccess.com/?q=1",
+        "https://user@team.cloudflareaccess.com",
+        "team.cloudflareaccess.com",
     ] {
+        assert!(Access::new(issuer, AUDIENCE).is_err(), "{issuer}");
+    }
+    for audience in ["", "not-alphanumeric", &"a".repeat(257)] {
         assert!(
-            validate_browse_bind(address.parse().unwrap()).is_err(),
-            "{address}"
+            Access::new("https://team.cloudflareaccess.com", audience).is_err(),
+            "{audience}"
         );
-        let output = Command::new(env!("CARGO_BIN_EXE_spool-server"))
-            .env_remove("DATABASE_URL")
-            .args(["browse", "--bind", address])
-            .output()
-            .unwrap();
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr).contains("loopback or a Tailscale IP"));
     }
 }
 
 #[tokio::test]
-async fn static_files_and_origin_guards() {
+async fn access_assertions_and_origin_guards() {
     let assets = Assets::new();
+    let team = Team::start().await;
     let pool = PgPoolOptions::new()
+        .acquire_timeout(Duration::from_millis(500))
         .connect_lazy("postgres://unused@127.0.0.1:1/unused")
         .unwrap();
-    let missing = browse_router(pool.clone(), assets.0.join("missing")).unwrap_err();
-    assert!(missing.to_string().contains("browse assets missing"));
-    let (url, task) = serve(browse_router(pool.clone(), &assets.0).unwrap()).await;
-    let client = Client::new();
+    let missing = router(
+        pool.clone(),
+        pool.clone(),
+        Some(Reader {
+            access: team.access(),
+            assets: assets.0.join("missing"),
+        }),
+    )
+    .unwrap_err();
+    assert!(missing.to_string().contains("web assets missing"));
+    let (url, task) = serve(app(&pool, &pool, team.access(), &assets)).await;
+    let client = team.client();
     for (path, content_type) in [
         ("/", "text/html"),
         ("/index.html", "text/html"),
         ("/assets/test.js", "text/javascript"),
     ] {
         let response = client.get(format!("{url}{path}")).send().await.unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
         assert!(
             response.headers()["content-type"]
                 .to_str()
@@ -148,24 +277,181 @@ async fn static_files_and_origin_guards() {
         "/favicon.ico",
         "/assets/missing.js",
         "/assets/%2e%2e%2fprivate.txt",
-        "/v1/sync/sessions",
     ] {
         let response = client.get(format!("{url}{path}")).send().await.unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
         privacy(&response);
     }
+
+    let plain = Client::new();
+    let header = json!({"alg": "RS256", "kid": KID, "typ": "JWT"});
+    let valid = team.assertion();
+    let mut tampered: Vec<_> = valid.split('.').map(str::to_owned).collect();
+    let mut forged = team.claims();
+    forged["email"] = json!("attacker@example.invalid");
+    tampered[1] = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&forged).unwrap());
+    let claims = |change: &dyn Fn(&mut Value)| {
+        let mut claims = team.claims();
+        change(&mut claims);
+        team.sign(header.clone(), claims)
+    };
+    let now = team.claims()["iat"].as_u64().unwrap();
+    let mut rejected = vec![
+        String::new(),
+        "not-a-jwt".to_owned(),
+        tampered.join("."),
+        format!("{valid}.extra"),
+        claims(&|claims| claims["aud"] = json!(["another"])),
+        claims(&|claims| claims["aud"] = json!([])),
+        claims(&|claims| claims["iss"] = json!("https://evil.cloudflareaccess.com")),
+        claims(&|claims| claims["exp"] = json!(now - 120)),
+        claims(&|claims| claims["nbf"] = json!(now + 600)),
+        claims(&|claims| {
+            claims.as_object_mut().unwrap().remove("exp");
+        }),
+        team.sign(json!({"alg": "RS256", "kid": "unknown"}), team.claims()),
+        team.sign(json!({"alg": "RS384", "kid": KID}), team.claims()),
+        team.sign(json!({"alg": "RS256"}), team.claims()),
+    ];
+    let unsigned: Vec<_> = valid.split('.').collect();
+    rejected.push(format!(
+        "{}.{}.",
+        URL_SAFE_NO_PAD.encode(br#"{"alg":"none","kid":"synthetic-key"}"#),
+        unsigned[1]
+    ));
+    for path in [
+        "/",
+        "/api",
+        "/api/sessions",
+        "//api/sessions",
+        "/API/sessions",
+        "/assets/test.js",
+        "/assets/%2e%2e%2fprivate.txt",
+        "/v1x",
+        "/missing",
+    ] {
+        error(
+            plain.get(format!("{url}{path}")).send().await.unwrap(),
+            StatusCode::FORBIDDEN,
+            "forbidden",
+        )
+        .await;
+        for assertion in &rejected {
+            error(
+                plain
+                    .get(format!("{url}{path}"))
+                    .header("cf-access-jwt-assertion", assertion)
+                    .send()
+                    .await
+                    .unwrap(),
+                StatusCode::FORBIDDEN,
+                "forbidden",
+            )
+            .await;
+        }
+    }
+    let mut duplicate = HeaderMap::new();
+    duplicate.append("cf-access-jwt-assertion", valid.parse().unwrap());
+    duplicate.append("cf-access-jwt-assertion", valid.parse().unwrap());
+    error(
+        plain
+            .get(format!("{url}/"))
+            .headers(duplicate)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::FORBIDDEN,
+        "forbidden",
+    )
+    .await;
+    // A single audience string is valid, and expiry/not-before allow 30s of skew.
+    for assertion in [
+        claims(&|claims| claims["aud"] = json!(AUDIENCE)),
+        claims(&|claims| claims["exp"] = json!(now - 10)),
+        claims(&|claims| claims["nbf"] = json!(now + 10)),
+    ] {
+        let response = plain
+            .get(format!("{url}/"))
+            .header("cf-access-jwt-assertion", assertion)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+    // Keys were fetched once; unknown key IDs cannot force refetches within the interval,
+    // and cached keys keep working while the certificate endpoint is down.
+    assert_eq!(team.fetches.load(Ordering::SeqCst), 1);
+    team.down.store(true, Ordering::SeqCst);
+    let unknown = team.sign(json!({"alg": "RS256", "kid": "rotated"}), team.claims());
+    for _ in 0..5 {
+        let response = plain
+            .get(format!("{url}/"))
+            .header("cf-access-jwt-assertion", &unknown)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+    assert_eq!(team.fetches.load(Ordering::SeqCst), 1);
+    let response = client.get(format!("{url}/")).send().await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    team.down.store(false, Ordering::SeqCst);
+
+    // Machine routes never consult Access.
+    for (method, path, status) in [
+        ("GET", "/healthz", StatusCode::SERVICE_UNAVAILABLE),
+        ("GET", "/v1/sync/sessions", StatusCode::UNAUTHORIZED),
+        ("POST", "/v1/agent/find", StatusCode::UNAUTHORIZED),
+        ("GET", "/v1/agent/find", StatusCode::UNAUTHORIZED),
+        ("GET", "/v1", StatusCode::NOT_FOUND),
+        ("GET", "/v1/unknown", StatusCode::NOT_FOUND),
+        (
+            "GET",
+            "/v1/sync/sessions/x/snapshot",
+            StatusCode::METHOD_NOT_ALLOWED,
+        ),
+    ] {
+        let response = plain
+            .request(method.parse().unwrap(), format!("{url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{method} {path}");
+    }
+    // Each credential opens only its own routes.
+    for (method, path) in [("GET", "/v1/sync/sessions"), ("POST", "/v1/agent/find")] {
+        let response = client
+            .request(method.parse().unwrap(), format!("{url}{path}"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "an Access assertion must not authorize {path}"
+        );
+    }
+    let token = format!("spool_v1.{A}.{}", URL_SAFE_NO_PAD.encode([7; 32]));
+    error(
+        plain
+            .get(format!("{url}/api/sessions"))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::FORBIDDEN,
+        "forbidden",
+    )
+    .await;
+
+    let host = url.trim_start_matches("http://");
     for (name, value) in [
         ("origin", "https://evil.invalid"),
         ("origin", "null"),
         ("origin", "http://127.0.0.1:1"),
+        ("origin", &format!("ftp://{host}")),
         ("sec-fetch-site", "cross-site"),
         ("sec-fetch-site", "same-site"),
-        ("host", "evil.invalid"),
-        ("host", "evil.localhost"),
-        ("host", "localhost.evil.invalid"),
-        ("host", "192.168.1.1"),
-        ("host", "127.0.0.1:bad"),
-        ("host", "evil@127.0.0.1"),
     ] {
         let response = client
             .get(format!("{url}/api/sessions"))
@@ -174,21 +460,6 @@ async fn static_files_and_origin_guards() {
             .await
             .unwrap();
         error(response, StatusCode::FORBIDDEN, "forbidden_origin").await;
-    }
-    for host in [
-        "localhost",
-        "127.0.0.2",
-        "100.64.1.2:8090",
-        "[::1]:8090",
-        "[fd7a:115c:a1e0::1]:8090",
-    ] {
-        let response = client
-            .get(format!("{url}/"))
-            .header("host", host)
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "{host}");
     }
     let response = client
         .post(format!("{url}/api/sessions"))
@@ -203,90 +474,33 @@ async fn static_files_and_origin_guards() {
     .await;
     task.abort();
     let _ = task.await;
-    pool.close().await;
-}
 
-struct Process(Child);
-
-impl Drop for Process {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+    // Without a reachable certificate endpoint, assertions cannot be checked.
+    let unreachable = Access::new("http://127.0.0.1:1", AUDIENCE).unwrap();
+    let (url, task) = serve(app(&pool, &pool, unreachable, &assets)).await;
+    for _ in 0..2 {
+        error(
+            client.get(format!("{url}/")).send().await.unwrap(),
+            StatusCode::SERVICE_UNAVAILABLE,
+            "access_unavailable",
+        )
+        .await;
     }
-}
+    task.abort();
+    let _ = task.await;
 
-async fn cli_without_migrations(database_url: &str, pool: &PgPool, assets: &Assets) {
-    let missing = Command::new(env!("CARGO_BIN_EXE_spool-server"))
-        .env("DATABASE_URL", database_url)
-        .args([
-            "browse",
-            "--assets",
-            assets.0.join("missing").to_str().unwrap(),
-        ])
-        .output()
-        .unwrap();
-    assert!(!missing.status.success());
-    assert!(String::from_utf8_lossy(&missing.stderr).contains("browse assets missing"));
-    let socket = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = socket.local_addr().unwrap().port().to_string();
-    drop(socket);
-    let mut child = Process(
-        Command::new(env!("CARGO_BIN_EXE_spool-server"))
-            .env("DATABASE_URL", database_url)
-            .env("BIND_ADDR", "0.0.0.0")
-            .env("PORT", "invalid")
-            .args([
-                "browse",
-                "--port",
-                &port,
-                "--assets",
-                assets.0.to_str().unwrap(),
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap(),
-    );
-    let client = Client::builder()
-        .timeout(Duration::from_secs(2))
-        .build()
-        .unwrap();
-    let url = format!("http://127.0.0.1:{port}");
-    tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            assert!(
-                child.0.try_wait().unwrap().is_none(),
-                "browse exited before listening"
-            );
-            if let Ok(response) = client.get(&url).send().await {
-                assert_eq!(response.status(), StatusCode::OK);
-                privacy(&response);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap();
-    error(
-        client
-            .get(format!("{url}/api/sessions"))
-            .send()
-            .await
-            .unwrap(),
-        StatusCode::SERVICE_UNAVAILABLE,
-        "database_unavailable",
-    )
-    .await;
-    let tables: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM pg_tables WHERE schemaname = 'public'")
-            .fetch_one(pool)
-            .await
-            .unwrap();
-    assert_eq!(
-        tables, 0,
-        "browse must not create archive or migration tables"
-    );
+    let (url, task) = serve(router(pool.clone(), pool.clone(), None).unwrap()).await;
+    for path in ["/", "/index.html", "/api/sessions"] {
+        let response = client.get(format!("{url}{path}")).send().await.unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "no reader without Access: {path}"
+        );
+    }
+    task.abort();
+    let _ = task.await;
+    pool.close().await;
 }
 
 #[tokio::test]
@@ -299,14 +513,12 @@ async fn postgres_browse_contract() {
     };
     let admin = connect(&database_url).await.unwrap();
     let database = format!("spool_test_{}", Uuid::new_v4().simple());
-    let reader_role = format!("spool_reader_test_{}", Uuid::new_v4().simple());
     sqlx::query(&format!("CREATE DATABASE {database}"))
         .execute(&admin)
         .await
         .unwrap();
     let work_database = database.clone();
-    let work_role = reader_role.clone();
-    // Setup also belongs inside the task: failed provisioning must not leak a role or DB.
+    // Setup also belongs inside the task: failed provisioning must not leak a DB.
     let result = tokio::spawn(async move {
         let mut database_url = reqwest::Url::parse(&database_url).unwrap();
         database_url.set_path(&work_database);
@@ -317,78 +529,22 @@ async fn postgres_browse_contract() {
         .execute(&pool)
         .await
         .unwrap();
-        // Make CONNECT and schema USAGE depend on the script, not ambient PUBLIC grants.
-        sqlx::query(&format!(
-            "REVOKE CONNECT ON DATABASE {work_database} FROM PUBLIC"
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("REVOKE USAGE ON SCHEMA public FROM PUBLIC")
-            .execute(&pool)
-            .await
-            .unwrap();
-        let assets = Assets::new();
-        cli_without_migrations(database_url.as_str(), &pool, &assets).await;
-        let provisioning =
-            include_str!("../../deploy/reader-role.sql").replace("spool_reader", &work_role);
-        provisioning_error(&pool, &provisioning, "42P01").await;
-        let exists: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = $1)")
-            .bind(&work_role)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-        assert!(!exists, "failed provisioning must roll back the cluster-scoped role");
         migrate(&pool).await.unwrap();
-        pool.execute(provisioning.as_str()).await.unwrap();
-        let restricted: bool = sqlx::query_scalar("SELECT NOT (rolcanlogin OR rolsuper OR rolcreatedb OR rolcreaterole OR rolinherit OR rolreplication OR rolbypassrls) FROM pg_roles WHERE rolname = $1")
-            .bind(&work_role).fetch_one(&pool).await.unwrap();
-        assert!(restricted, "provisioning must create a restricted NOLOGIN role");
-        sqlx::query(&format!(
-            "ALTER ROLE {work_role} LOGIN PASSWORD 'synthetic-reader-only'"
-        ))
-        .execute(&pool)
-        .await
-        .unwrap();
-        provisioning_error(&pool, &provisioning, "42710").await;
-        database_url.set_username(&work_role).unwrap();
-        database_url.set_password(Some("synthetic-reader-only")).unwrap();
-        reader_privileges(database_url.as_str(), &work_role).await;
-        let read = connect_browse(database_url.as_str()).await.unwrap();
-        let (url, task) = serve(browse_router(read.clone(), &assets.0).unwrap()).await;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()
-            .unwrap();
-        let health = client.get(format!("{url}/healthz")).send().await.unwrap();
-        privacy(&health);
-        assert_eq!(health.status(), StatusCode::NO_CONTENT);
-        assert!(health.bytes().await.unwrap().is_empty());
-        assert_eq!(get(&client, &format!("{url}/api/sessions")).await["sessions"], json!([]));
+        let read = connect_read(database_url.as_str()).await.unwrap();
+        read_only_connections(&read).await;
+        let assets = Assets::new();
+        let team = Team::start().await;
+        let (url, task) = serve(app(&pool, &read, team.access(), &assets)).await;
+        let client = team.client();
+        assert_eq!(
+            get(&client, &format!("{url}/api/sessions")).await["sessions"],
+            json!([])
+        );
         seed(&pool).await;
         api_contract(&client, &url, &pool).await;
         snapshot_consistency(&client, &url, &pool).await;
         limits(&client, &url, &pool).await;
-        let (public_url, public_task) = serve(router(pool.clone())).await;
-        let response = client
-            .get(format!("{public_url}/api/sessions"))
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(
-            response.status(),
-            StatusCode::NOT_FOUND,
-            "browse must never be on the public ingestion listener"
-        );
-        public_task.abort();
-        let _ = public_task.await;
         read.close().await;
-        error(
-            client.get(format!("{url}/healthz")).send().await.unwrap(),
-            StatusCode::SERVICE_UNAVAILABLE,
-            "database_unavailable",
-        )
-        .await;
         error(
             client
                 .get(format!("{url}/api/sessions"))
@@ -407,26 +563,9 @@ async fn postgres_browse_contract() {
     let drop_database = sqlx::query(&format!("DROP DATABASE {database} WITH (FORCE)"))
         .execute(&admin)
         .await;
-    let drop_role = sqlx::query(&format!("DROP ROLE IF EXISTS {reader_role}"))
-        .execute(&admin)
-        .await;
     admin.close().await;
     drop_database.unwrap();
-    drop_role.unwrap();
     result.unwrap();
-}
-
-async fn provisioning_error(pool: &PgPool, script: &str, code: &str) {
-    let mut connection = pool.acquire().await.unwrap();
-    let error = connection.execute(script).await.unwrap_err();
-    sqlx::query("ROLLBACK")
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-    assert_eq!(
-        error.as_database_error().unwrap().code().as_deref(),
-        Some(code)
-    );
 }
 
 async fn read_only_connections(pool: &PgPool) {
@@ -449,71 +588,6 @@ async fn read_only_connections(pool: &PgPool) {
             );
         }
     }
-}
-
-async fn reader_privileges(database_url: &str, role: &str) {
-    // Use a normal pool so the role's own default is checked, not browse's override.
-    let pool = connect(database_url).await.unwrap();
-    read_only_connections(&pool).await;
-    let mut connection = pool.acquire().await.unwrap();
-    let identity: (String, String) =
-        sqlx::query_as("SELECT session_user::text, current_user::text")
-            .fetch_one(&mut *connection)
-            .await
-            .unwrap();
-    assert_eq!(identity, (role.to_owned(), role.to_owned()));
-    sqlx::query("SET default_transaction_read_only = off")
-        .execute(&mut *connection)
-        .await
-        .unwrap();
-    let readonly: String = sqlx::query_scalar("SHOW transaction_read_only")
-        .fetch_one(&mut *connection)
-        .await
-        .unwrap();
-    assert_eq!(readonly, "off");
-    for statement in [
-        "INSERT INTO sources (id, label, token_hash) VALUES (gen_random_uuid(), 'forbidden', decode(repeat('42',32),'hex'))",
-        "UPDATE sources SET label = 'forbidden'",
-        "DELETE FROM sources",
-        "TRUNCATE sources CASCADE",
-        "INSERT INTO sessions (source_id, session_id, revision, format) VALUES ('00000000-0000-0000-0000-000000000001', 'forbidden', 1, 'opencode.v2')",
-        "UPDATE sessions SET revision = 99",
-        "DELETE FROM sessions",
-        "TRUNCATE sessions CASCADE",
-        "INSERT INTO messages (source_id, session_id, message_id, position, payload, payload_hash) VALUES ('00000000-0000-0000-0000-000000000001', 'same', 'forbidden', 0, '{}'::json, decode(repeat('42',32),'hex'))",
-        "UPDATE messages SET payload = '{}'::json",
-        "DELETE FROM messages",
-        "TRUNCATE messages",
-        "CREATE TABLE public.forbidden (id int)",
-        "CREATE SCHEMA forbidden",
-        "ALTER TABLE sources ADD COLUMN forbidden int",
-        "DROP TABLE messages",
-        "SELECT token_hash FROM sources",
-        "SELECT created_at FROM sources",
-        "SELECT last_seen_at FROM sources",
-        "SELECT revoked_at FROM sources",
-        "SELECT format FROM sessions",
-        "SELECT info_hash FROM sessions",
-        "SELECT upstream_version FROM sessions",
-        "SELECT collector_version FROM sessions",
-        "SELECT payload_hash FROM messages",
-        "SELECT * FROM sources",
-        "SELECT * FROM sessions",
-        "SELECT * FROM messages",
-        "SELECT * FROM _sqlx_migrations",
-    ] {
-        let error = sqlx::query(statement)
-            .execute(&mut *connection)
-            .await
-            .expect_err(statement);
-        assert_eq!(
-            error.as_database_error().unwrap().code().as_deref(),
-            Some("42501"),
-            "privileges, not a read-only transaction, must deny: {statement}"
-        );
-    }
-    drop(connection);
-    pool.close().await;
 }
 
 async fn insert_session(pool: &PgPool, source: Uuid, id: &str, info: &str) {

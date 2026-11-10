@@ -1,6 +1,7 @@
 import assert from "node:assert/strict"
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import path from "node:path"
+import { startAccess } from "./access"
 import { command, waitFor } from "./command"
 import { LocalStack, type Source } from "./stack"
 import { envelope, fixtures } from "../web/tests/fixtures"
@@ -12,6 +13,7 @@ const root = await mkdtemp(path.join(local, "web-validate-"))
 const stack = new LocalStack(root)
 const releaseSignals = stack.handleSignals()
 let browser: Bun.Subprocess | undefined
+let access: Awaited<ReturnType<typeof startAccess>> | undefined
 let tests: Bun.Subprocess<"ignore", "pipe", "pipe"> | undefined
 let passed = false
 const stopTests = () => tests?.kill("SIGTERM")
@@ -42,29 +44,36 @@ try {
     assert.equal(response.status, 201, `Failed to seed ${fixture.title}`)
   }
   const address = await stack.compose("port", "db", "5432")
-  const log = path.join(root, "browse.log")
-  browser = Bun.spawn(
-    [path.join(repository, "target/debug/spool-server"), "browse", "--port", "0"],
-    {
-      cwd: repository,
-      env: { ...process.env, DATABASE_URL: `postgres://spool:local-spool-only@${address}/spool` },
-      stdout: "ignore",
-      stderr: Bun.file(log),
+  const log = path.join(root, "serve.log")
+  access = await startAccess()
+  browser = Bun.spawn([path.join(repository, "target/debug/spool-server"), "serve"], {
+    cwd: repository,
+    env: {
+      ...process.env,
+      ...access.env,
+      DATABASE_URL: `postgres://spool:local-spool-only@${address}/spool`,
+      BIND_ADDR: "127.0.0.1",
+      PORT: "0",
+      ASSETS_DIR: path.join(repository, "web/dist"),
     },
-  )
+    stdout: "ignore",
+    stderr: Bun.file(log),
+  })
   const url = await waitFor(
-    "read-only browser",
+    "web reader",
     async () => {
       if (browser?.exitCode !== null)
-        throw new Error(`Browser exited: ${await Bun.file(log).text()}`)
+        throw new Error(`Server exited: ${await Bun.file(log).text()}`)
       const output = await Bun.file(log).text()
-      const address = output.match(/(?:http:\/\/)?(127\.0\.0\.1:\d+)/)?.[1]
+      const address = output.match(/Spool listening on (127\.0\.0\.1:\d+) \(web reader enabled\)/)?.[1]
       return address ? `http://${address}` : undefined
     },
     30_000,
     stack.signal,
   )
-  console.log(`Testing the built frontend against real Rust HTTP + isolated PostgreSQL: ${url}`)
+  const unauthenticated = await fetch(`${url}/api/sessions`, { signal: stack.signal })
+  assert.equal(unauthenticated.status, 403, "the reader must require an Access assertion")
+  console.log(`Testing the built frontend against real Rust HTTP, synthetic Access and isolated PostgreSQL: ${url}`)
   stack.signal.throwIfAborted()
   tests = Bun.spawn([path.join(repository, "web/node_modules/.bin/playwright"), "test"], {
     cwd: path.join(repository, "web"),
@@ -72,6 +81,7 @@ try {
       ...process.env,
       SPOOL_WEB_URL: url,
       SPOOL_WEB_FIXTURES: JSON.stringify(sources),
+      SPOOL_WEB_ACCESS: access.assertion,
       SPOOL_INGEST_URL: stack.url,
     },
     stdin: "ignore",
@@ -99,6 +109,7 @@ try {
     browser.kill("SIGTERM")
     await browser.exited
   }
+  await access?.stop()
   try {
     await stack.down(true)
   } finally {

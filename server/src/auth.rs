@@ -1,4 +1,9 @@
-use axum::http::{HeaderMap, StatusCode};
+use axum::{
+    extract::{Request, State},
+    http::{HeaderMap, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
+};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
@@ -65,4 +70,12 @@ pub(crate) async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> Result<U
         .await
         .map_err(|error| ApiError::database("auth.touch", error))?;
     Ok(source)
+}
+
+/// Any valid source token may read the whole archive.
+pub(crate) async fn require(State(pool): State<PgPool>, request: Request, next: Next) -> Response {
+    match authenticate(&pool, request.headers()).await {
+        Ok(_) => next.run(request).await,
+        Err(error) => error.into_response(),
+    }
 }

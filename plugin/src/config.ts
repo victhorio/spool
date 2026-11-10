@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto"
 import { readFile } from "node:fs/promises"
-import { isIP } from "node:net"
 import { homedir } from "node:os"
 import path from "node:path"
 
@@ -12,7 +11,6 @@ export interface Config {
   serviceFile?: string
   opencodeUrl?: string
   opencodePassword?: string
-  readerUrl?: string
   repositoryRemote?: string
   sourceAlias?: string
 }
@@ -39,23 +37,9 @@ function url(value: unknown, name: string): string {
   return parsed.toString().replace(/\/$/, "")
 }
 
-export function readerURL(value: unknown): string {
-  if (typeof value !== "string") throw new Error("Spool readerUrl requires a literal loopback or Tailscale HTTP address")
-  const parsed = new URL(value)
-  const host = parsed.hostname.replace(/^\[|\]$/g, "")
-  const octets = host.split(".").map(Number)
-  const allowed = isIP(host) === 4 ? octets[0] === 127 || (octets[0] === 100 && (octets[1]! & 0xc0) === 64)
-    : isIP(host) === 6 && (host === "::1" || host.startsWith("fd7a:115c:a1e0:"))
-  if (!allowed || parsed.protocol !== "http:" || parsed.username || parsed.password || parsed.search || parsed.hash || parsed.pathname !== "/") {
-    throw new Error("Spool readerUrl requires a literal loopback or Tailscale HTTP address without credentials, path, query or fragment")
-  }
-  return parsed.origin
-}
-
 export async function configure(options: Record<string, unknown>): Promise<Config> {
   const allowed = new Set(["url", "tokenFile", "sweepIntervalMs", "serviceFile", "opencodeUrl", "opencodePasswordFile", "readerUrl", "repositoryRemote", "sourceAlias"])
   for (const key of Object.keys(options)) if (!allowed.has(key)) throw new Error(`Unknown Spool option: ${key}`)
-  const readerUrl = options.readerUrl === undefined ? undefined : readerURL(options.readerUrl)
   const sourceAlias = options.sourceAlias
   if (sourceAlias !== undefined && !validSourceAlias(sourceAlias)) {
     throw new Error("Spool sourceAlias must match ^[a-z][a-z0-9-]{0,31}$")
@@ -68,7 +52,8 @@ export async function configure(options: Record<string, unknown>): Promise<Confi
   const token = (await readFile(filename(options.tokenFile, "tokenFile"), "utf8")).trim()
   const match = /^spool_v1\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/.exec(token)
   if (!match) throw new Error("Spool tokenFile does not contain a valid source token")
-  // Accepted for existing installations; automatic full-content sweeps no longer run.
+  // sweepIntervalMs and readerUrl are accepted for existing installations: full-content
+  // sweeps no longer run, and retrieval now uses url with the source token.
   const sweepIntervalMs = options.sweepIntervalMs
   if (sweepIntervalMs !== undefined && (typeof sweepIntervalMs !== "number" || !Number.isSafeInteger(sweepIntervalMs) || sweepIntervalMs < 1_000 || sweepIntervalMs > 86_400_000)) {
     throw new Error("Spool sweepIntervalMs must be an integer between 1000 and 86400000")
@@ -81,7 +66,6 @@ export async function configure(options: Record<string, unknown>): Promise<Confi
     token,
     sourceID,
     cachePrefix: `v1/${createHash("sha256").update(`${destination}\0${sourceID}`).digest("hex")}/`,
-    readerUrl,
     repositoryRemote,
     sourceAlias,
     serviceFile: options.serviceFile === undefined ? undefined : filename(options.serviceFile, "serviceFile"),

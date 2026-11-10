@@ -3,21 +3,18 @@ import { mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import path from "node:path"
 import type { Plugin, Skill } from "@opencode/plugin"
-import { configure, readerURL } from "./config"
+import { configure } from "./config"
 import { registerRetrieval, requestReader, validInput } from "./retrieval"
 
-test("public configuration keeps retrieval opt-in and validates its options", async () => {
+test("configuration validates options and ignores the retired readerUrl", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "spool-config-"))
   try {
     const tokenFile = path.join(root, "synthetic-token")
     await writeFile(tokenFile, `spool_v1.00000000-0000-0000-0000-000000000001.${"A".repeat(43)}`)
     const options = { url: "http://127.0.0.1:8377", tokenFile }
-    expect((await configure(options)).readerUrl).toBeUndefined()
     expect(await configure({ ...options, sweepIntervalMs: 1000 })).toEqual(await configure(options))
-    const configured = await configure({ ...options, readerUrl: "http://100.64.1.2:8378/", repositoryRemote: "archive-origin" })
-    expect(configured.readerUrl).toBe("http://100.64.1.2:8378")
-    expect(configured.repositoryRemote).toBe("archive-origin")
-    await expect(configure({ ...options, readerUrl: "http://localhost:8378" })).rejects.toThrow()
+    expect(await configure({ ...options, readerUrl: "http://100.64.1.2:8378" })).toEqual(await configure(options))
+    expect((await configure({ ...options, repositoryRemote: "archive-origin" })).repositoryRemote).toBe("archive-origin")
     await expect(configure({ ...options, repositoryRemote: "bad\0remote" })).rejects.toThrow()
     const original = await configure(options)
     expect(original.sourceAlias).toBeUndefined()
@@ -31,15 +28,6 @@ test("public configuration keeps retrieval opt-in and validates its options", as
       await expect(configure({ ...options, sourceAlias })).rejects.toThrow("sourceAlias")
     }
   } finally { await rm(root, { recursive: true, force: true }) }
-})
-
-test("reader URL matches the Rust loopback/Tailscale address boundary without DNS", () => {
-  for (const host of ["127.0.0.1", "127.99.1.2", "[::1]", "100.64.0.1", "100.127.255.254", "[fd7a:115c:a1e0::1]"]) {
-    expect(readerURL(`http://${host}:8378`)).toBe(`http://${host}:8378`)
-  }
-  for (const value of ["http://localhost", "https://127.0.0.1", "http://0.0.0.0", "http://[::]", "http://192.168.1.1", "http://100.63.255.255", "http://100.128.0.1", "http://[fd7a:115c:a1e1::1]", "http://[::ffff:127.0.0.1]", "http://127.0.0.1/?token=secret", "http://user:secret@127.0.0.1", "http://127.0.0.1/#fragment", "http://127.0.0.1/path"]) {
-    expect(() => readerURL(value)).toThrow()
-  }
 })
 
 test("tool inputs distinguish cursor-only from bounded initial arguments", () => {
@@ -73,27 +61,30 @@ test("session references accept native IDs, aliases and legacy UUIDs within byte
   }
 })
 
-test("reader transport is bounded, unauthenticated, redirect-free and hides error bodies", async () => {
+test("archive transport is bounded, token-authenticated, redirect-free and hides error bodies", async () => {
   let mode = "success"
   let calls = 0
+  const token = `spool_v1.00000000-0000-0000-0000-000000000001.${"A".repeat(43)}`
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     calls++
-    expect(request.headers.get("authorization")).toBeNull()
+    expect(request.headers.get("authorization")).toBe(`Bearer ${token}`)
     expect(request.method).toBe("POST")
-    expect(new URL(request.url).pathname).toBe("/api/agent/find")
+    expect(new URL(request.url).pathname).toBe("/v1/agent/find")
     expect(await request.json()).toEqual({ query: "needle" })
     switch (mode) {
       case "redirect": return new Response(null, { status: 302, headers: { location: "http://127.0.0.1:1/secret" } })
       case "too-large": return Response.json({ text: "界".repeat(9000) })
       case "changed": return Response.json({ error: { code: "session_changed", current_revision: "42", detail: "SECRET_ERROR_BODY" } }, { status: 409 })
       case "malformed": return Response.json({ error: { code: "malformed_request", detail: "SECRET_ERROR_BODY" } }, { status: 400 })
+      case "unauthorized": return Response.json({ error: { code: "unauthorized" } }, { status: 401 })
       case "error": return new Response("SECRET_HTTP_LOG", { status: 500 })
       case "cancel": await Bun.sleep(100); return Response.json({ late: true })
       default: return new Response('{"sessions":[],"next_cursor":null}')
     }
   } })
   try {
-    const call = (signal?: AbortSignal) => requestReader(server.url.origin, "find", { query: "needle" }, signal)
+    const archive = { url: server.url.origin, token }
+    const call = (signal?: AbortSignal) => requestReader(archive, "find", { query: "needle" }, signal)
     expect(await call()).toBe('{"sessions":[],"next_cursor":null}')
     mode = "too-large"
     expect(JSON.parse(await call()).error.code).toBe("response_too_large")
@@ -101,6 +92,8 @@ test("reader transport is bounded, unauthenticated, redirect-free and hides erro
     expect(JSON.parse(await call())).toEqual({ error: { code: "session_changed", current_revision: "42" } })
     mode = "malformed"
     expect(JSON.parse(await call())).toEqual({ error: { code: "malformed_request" } })
+    mode = "unauthorized"
+    expect(JSON.parse(await call())).toEqual({ error: { code: "unauthorized" } })
     mode = "error"
     expect(await call()).not.toContain("SECRET_HTTP_LOG")
     mode = "redirect"
@@ -108,7 +101,7 @@ test("reader transport is bounded, unauthenticated, redirect-free and hides erro
     mode = "cancel"
     expect(JSON.parse(await call(AbortSignal.timeout(10))).error.code).toBe("reader_unavailable")
     const before = calls
-    expect(JSON.parse(await requestReader(server.url.origin, "find", { cursor: "cursor", query: "mixed" })).error.code).toBe("malformed_request")
+    expect(JSON.parse(await requestReader(archive, "find", { cursor: "cursor", query: "mixed" })).error.code).toBe("malformed_request")
     expect(calls).toBe(before)
   } finally { await server.stop(true) }
 })
@@ -122,7 +115,7 @@ test("ambiguous sessions forward only bounded qualified candidates and a boolean
     return Response.json({ error, secret: "SECRET_ERROR_BODY" }, { status })
   } })
   try {
-    const call = async () => JSON.parse(await requestReader(server.url.origin, "read", { session: "ses_fixture" }))
+    const call = async () => JSON.parse(await requestReader({ url: server.url.origin, token: "synthetic" }, "read", { session: "ses_fixture" }))
     expect(await call()).toEqual({ error: { code: "ambiguous_session", candidates, more: false } })
     const maximum = Array.from({ length: 10 }, (_, i) => `source-${i}/${"x".repeat(512)}`)
     error = { code: "ambiguous_session", candidates: maximum, more: true }
@@ -143,7 +136,7 @@ test("ambiguous sessions forward only bounded qualified candidates and a boolean
   } finally { await server.stop(true) }
 })
 
-test("public transform registration exposes exactly the spool tools and packaged skill only when configured", async () => {
+test("public transform registration exposes exactly the spool tools and packaged skill", async () => {
   const tools: {
     name: string
     description: string
@@ -159,10 +152,7 @@ test("public transform registration exposes exactly the spool tools and packaged
     }) },
     skill: { transform: async (callback: (editor: unknown) => void) => callback({ add: (skill: Skill.Info) => skills.push(skill) }) },
   } as unknown as Plugin.Context
-  await registerRetrieval(ctx, undefined)
-  expect(tools).toHaveLength(0)
-  expect(skills).toHaveLength(0)
-  await registerRetrieval(ctx, "http://127.0.0.1:8378")
+  await registerRetrieval(ctx, { url: "http://127.0.0.1:8378", token: "synthetic" })
   expect(namespaces).toEqual(["spool"])
   expect(tools.map((tool) => `${tool.options?.namespace}_${tool.name}`)).toEqual(["spool_find_sessions", "spool_search_messages", "spool_read_messages"])
   expect(tools.every((tool) => tool.options?.codemode === false)).toBe(true)

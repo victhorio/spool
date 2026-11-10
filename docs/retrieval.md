@@ -1,7 +1,6 @@
 # Agent retrieval
 
-Spool exposes three read-only OpenCode tools when the plugin has a `readerUrl`.
-They search the central archive across machines; they do not call a model or
+The plugin always registers three read-only OpenCode tools. They search the central archive across machines; they do not call a model or
 create their own reader agent. The bundled `searching-sessions` skill explains
 navigation, optional delegation, evidence and archive limitations.
 
@@ -39,15 +38,12 @@ names are never used to guess its repository.
 ## Configuration and access
 
 Follow [client setup](client-setup.md) on each machine for the complete plugin
-entry, the private reader address, reload requirements and verification. An active
-capture plugin alone does not establish retrieval readiness.
+entry, reload requirements and verification.
 
-Reader URLs must use HTTP and a literal loopback or Tailscale address, with no
-credentials, path, query or fragment. DNS names and public/LAN addresses are
-rejected. The plugin never sends its ingestion bearer token to the reader and
+The tools call the plugin's `url` with its source token: any valid, unrevoked
+source token may read the whole archive, not just its own source. The plugin
 does not follow redirects. Requests have a five-second timeout and a 24 KiB
-response limit. Without `readerUrl`, capture still works and retrieval tools and
-the skill are not registered. These settings do not change any tailnet policy.
+response limit. The former `readerUrl` option is accepted and ignored.
 
 Registration does not override agent permissions. General can use tools allowed
 by its configuration; Explore's restricted defaults are not broadened. The
@@ -78,13 +74,13 @@ identity; no replacement session IDs are introduced.
 
 ## Tool and HTTP contract
 
-The tools call JSON POST endpoints on the private `browse` listener only:
+The tools call JSON POST endpoints with `Authorization: Bearer <source token>`:
 
 | Tool | Endpoint | Initial arguments |
 | --- | --- | --- |
-| `spool_find_sessions` | `/api/agent/find` | `query?`, `repository?`, `include_tools?`, `limit?` |
-| `spool_search_messages` | `/api/agent/search` | `session`, `query`, `revision?`, `include_tools?`, `limit?` |
-| `spool_read_messages` | `/api/agent/read` | `session`, `revision?`, `start?`, `end?` |
+| `spool_find_sessions` | `/v1/agent/find` | `query?`, `repository?`, `include_tools?`, `limit?` |
+| `spool_search_messages` | `/v1/agent/search` | `session`, `query`, `revision?`, `include_tools?`, `limit?` |
+| `spool_read_messages` | `/v1/agent/read` | `session`, `revision?`, `start?`, `end?` |
 
 Every operation alternatively accepts **only** `{ "cursor": "…" }`. Mixing a
 cursor with initial arguments is rejected. There are no source or directory
@@ -138,8 +134,9 @@ acceptance, even a no-op confirmation, rejects continuation with
 version rather than silently combine versions. Discovery uses live keyset
 pagination, not a frozen archive snapshot. Malformed arguments/cursors return
 `malformed_request`, missing/purged sessions return `not_found`, and an archive
-without a complete text projection returns `not_indexed`. Transport failures
-are reported as `reader_unavailable` without disclosing server error bodies.
+without a complete text projection returns `not_indexed`. A missing, invalid or
+revoked token returns `unauthorized`. Transport failures are reported as
+`reader_unavailable` without disclosing server error bodies.
 
 Cursors encode versioned compact binary state as unpadded base64url: UUID bytes,
 native IDs, variable-length numbers and the filters needed to resume. They are
@@ -164,13 +161,10 @@ accepted, but their unprojected uploads invalidate the session's search title
 and activity to prevent stale results, not its known repository association.
 Raw archival JSON and the browser remain available.
 
-Deploy server migrations and updated reader privileges before activating the
-new plugin. An existing `spool_reader` needs the added column SELECT grants from
-`deploy/reader-role.sql`; do not rerun that script's CREATE ROLE against an
-existing role. Source aliases specifically require migration `0003_source_alias`
-and `GRANT SELECT (alias) ON public.sources TO spool_reader`. Update all retrieval
-clients before enabling source aliases, since older plugins reject non-UUID
-qualifiers. Creating `pg_trgm` requires appropriate database privileges.
+Deploy the server before updating plugins: current plugins call `/v1/agent/*`,
+which older servers do not serve. Update all retrieval clients before enabling
+source aliases, since older plugins reject non-UUID qualifiers. Creating
+`pg_trgm` requires appropriate database privileges.
 Budget database memory for concurrent projected uploads and index construction,
 not just their wire size; the local stack reserves a 1 GiB database cap after a
 maximum-envelope workload exhausted its previous 256 MiB cap. This is a tested

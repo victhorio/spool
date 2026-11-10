@@ -25,8 +25,9 @@ should win. Imported IDs in different sources remain separate archives.
 With `DATABASE_URL` set, run `spool-server source add --label <label>` after
 migrations. It returns JSON with `source_id` and a `token` of the form
 `spool_v1.<uuid>.<base64url-secret>`. Only the SHA-256 secret digest is stored.
-Send `Authorization: Bearer <token>` over HTTPS. A token permits only its own
-sync operations, not reading transcripts or administrative writes.
+Send `Authorization: Bearer <token>` over HTTPS. A token permits its own sync
+operations and reading the whole archive through [agent retrieval](retrieval.md),
+not administrative writes.
 
 `source rotate <uuid>` issues a new token without changing identity; update its
 local token file and reload all plugin instances. `source revoke <uuid>` blocks
@@ -166,7 +167,7 @@ messages. Its separate source reads are not one transaction.
 leaves a revisioned tombstone, including for a previously absent session. Future
 uploads receive 410. Backups/WAL retain old content until their expiry: this is
 not immediate physical erasure. Configure and test database backups before
-treating Spool as the only surviving archive. Public ingestion exposes no reads;
-the separate local/tailnet listener hosts the read-only [browser](browser.md) and
-[agent retrieval](retrieval.md). A capture daemon, blob fetching, automatic
-redaction and historical snapshots remain out of scope.
+treating Spool as the only surviving archive. The same service hosts
+token-authenticated [agent retrieval](retrieval.md) and the read-only
+[browser](browser.md) behind Cloudflare Access. A capture daemon, blob fetching,
+automatic redaction and historical snapshots remain out of scope.

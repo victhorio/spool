@@ -20,7 +20,7 @@ export default Plugin.define({
     } else if (!collector.matches(config)) {
       throw new Error("Conflicting Spool configuration for the same source; reload all plugin instances after changing credentials or options")
     }
-    await registerRetrieval(ctx, config.readerUrl)
+    await registerRetrieval(ctx, config)
     const active = collector
     await ctx.command.transform((editor) => editor.add({
       name: "spool-repair",

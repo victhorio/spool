@@ -1,15 +1,13 @@
-use std::{env, net::IpAddr, path::PathBuf};
+use std::{env, net::IpAddr};
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use serde_json::json;
-use spool_server::{
-    admin, browse_router, connect, connect_browse, migrate, router, validate_browse_bind,
-};
+use spool_server::{Access, Reader, admin, connect, connect_read, migrate, router};
 use uuid::Uuid;
 
 #[derive(Parser)]
-#[command(version, about = "Spool session archive ingestion service")]
+#[command(version, about = "Spool session archive service")]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -18,18 +16,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Serve HTTP; applies pending migrations before listening (the default).
+    /// ACCESS_ISSUER and ACCESS_AUD enable the web reader behind Cloudflare Access.
     Serve,
-    /// Read-only, unauthenticated browser for loopback/tailnet only; never runs migrations.
-    Browse {
-        /// Loopback or Tailscale IP only; use the literal IP URL (or localhost), not DNS/proxies.
-        #[arg(long, default_value = "127.0.0.1")]
-        bind: IpAddr,
-        #[arg(long, default_value_t = 8090)]
-        port: u16,
-        /// Built frontend directory containing index.html.
-        #[arg(long, default_value = "web/dist")]
-        assets: PathBuf,
-    },
     /// Apply pending database migrations and exit.
     Migrate,
     /// Manage source credentials using direct database access.
@@ -67,28 +55,17 @@ enum SessionCommand {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let command = cli.command.unwrap_or(Command::Serve);
-    if let Command::Browse { bind, .. } = &command {
-        validate_browse_bind(*bind)?;
-    }
-    let database_url = env::var("DATABASE_URL").context("DATABASE_URL is required")?;
-    let pool = if matches!(command, Command::Browse { .. }) {
-        connect_browse(&database_url).await?
-    } else {
-        connect(&database_url).await?
+    let reader = match command {
+        Command::Serve => reader()?,
+        _ => None,
     };
+    let database_url = env::var("DATABASE_URL").context("DATABASE_URL is required")?;
+    let pool = connect(&database_url).await?;
     match command {
-        Command::Browse { bind, port, assets } => {
-            let app = browse_router(pool.clone(), assets)?;
-            let listener = tokio::net::TcpListener::bind((bind, port)).await?;
-            eprintln!(
-                "Spool browse (read-only, unauthenticated; loopback/tailnet only) at http://{}",
-                listener.local_addr()?
-            );
-            axum::serve(listener, app)
-                .with_graceful_shutdown(shutdown())
-                .await?;
-        }
         Command::Serve => {
+            let enabled = reader.is_some();
+            let read = connect_read(&database_url).await?;
+            let app = router(pool.clone(), read.clone(), reader)?;
             migrate(&pool).await?;
             let bind: IpAddr = env::var("BIND_ADDR")
                 .unwrap_or_else(|_| "0.0.0.0".into())
@@ -99,10 +76,15 @@ async fn main() -> anyhow::Result<()> {
                 .parse()
                 .context("PORT must be a valid port")?;
             let listener = tokio::net::TcpListener::bind((bind, port)).await?;
-            eprintln!("Spool listening on {}", listener.local_addr()?);
-            axum::serve(listener, router(pool.clone()))
+            eprintln!(
+                "Spool listening on {} (web reader {})",
+                listener.local_addr()?,
+                if enabled { "enabled" } else { "disabled" }
+            );
+            axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown())
                 .await?;
+            read.close().await;
         }
         Command::Migrate => migrate(&pool).await?,
         Command::Source { command } => match command {
@@ -138,6 +120,20 @@ async fn main() -> anyhow::Result<()> {
     }
     pool.close().await;
     Ok(())
+}
+
+fn reader() -> anyhow::Result<Option<Reader>> {
+    let access = match (env::var("ACCESS_ISSUER"), env::var("ACCESS_AUD")) {
+        (Ok(issuer), Ok(audience)) => Access::new(&issuer, &audience)?,
+        (Err(_), Err(_)) => return Ok(None),
+        _ => anyhow::bail!("set both ACCESS_ISSUER and ACCESS_AUD, or neither"),
+    };
+    Ok(Some(Reader {
+        access,
+        assets: env::var("ASSETS_DIR")
+            .unwrap_or_else(|_| "web/dist".into())
+            .into(),
+    }))
 }
 
 async fn shutdown() {
