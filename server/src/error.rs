@@ -8,6 +8,7 @@ pub(crate) struct ApiError {
     code: &'static str,
     revision: Option<Option<i64>>,
     candidates: Option<(Vec<String>, bool)>,
+    edit: Option<usize>,
 }
 
 impl ApiError {
@@ -17,6 +18,15 @@ impl ApiError {
             code,
             revision: None,
             candidates: None,
+            edit: None,
+        }
+    }
+
+    /// A failed artifact edit, with the zero-based index of the edit.
+    pub fn edit(code: &'static str, index: usize) -> Self {
+        Self {
+            edit: Some(index),
+            ..Self::new(StatusCode::UNPROCESSABLE_ENTITY, code)
         }
     }
 
@@ -30,19 +40,15 @@ impl ApiError {
 
     pub fn conflict(current: Option<i64>) -> Self {
         Self {
-            status: StatusCode::CONFLICT,
-            code: "revision_conflict",
             revision: Some(current),
-            candidates: None,
+            ..Self::new(StatusCode::CONFLICT, "revision_conflict")
         }
     }
 
     pub fn session_changed(current: i64) -> Self {
         Self {
-            status: StatusCode::CONFLICT,
-            code: "session_changed",
             revision: Some(Some(current)),
-            candidates: None,
+            ..Self::new(StatusCode::CONFLICT, "session_changed")
         }
     }
 
@@ -78,6 +84,9 @@ impl ApiError {
 impl IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         let mut error = json!({ "code": self.code });
+        if let Some(index) = self.edit {
+            error["edit"] = json!(index);
+        }
         if let Some(revision) = self.revision {
             error["current_revision"] = json!(revision.map(|value| value.to_string()));
         }

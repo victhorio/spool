@@ -1,5 +1,6 @@
 import { Plugin } from "@opencode/plugin"
 import { Collector } from "./collector"
+import { registerArtifacts } from "./artifacts"
 import { configure } from "./config"
 import { registerRetrieval } from "./retrieval"
 
@@ -21,6 +22,7 @@ export default Plugin.define({
       throw new Error("Conflicting Spool configuration for the same source; reload all plugin instances after changing credentials or options")
     }
     await registerRetrieval(ctx, config)
+    await registerArtifacts(ctx, config)
     const active = collector
     await ctx.command.transform((editor) => editor.add({
       name: "spool-repair",

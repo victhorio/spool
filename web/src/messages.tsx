@@ -17,11 +17,28 @@ const markdown = new Marked({
   },
 })
 
-export function Markdown({ text }: { text: string }) {
-  const html = DOMPurify.sanitize(markdown.parse(text, { async: false }), {
+// Links to image artifacts, on this reader or as written by agents with its full URL.
+const artifactImage = /^(?:https?:\/\/[^/]+)?\/artifacts\/(art_[a-z0-9]{12})(?:\/content)?$/
+const artifactMarkdown = new Marked({
+  gfm: true,
+  renderer: {
+    html: ({ text }) => escape(text),
+    image: ({ href, text }) => {
+      const match = artifactImage.exec(href)
+      return match
+        ? `<img src="/artifacts/${match[1]}/content" alt="${escape(text)}">`
+        : `<span class="attachment">Image · ${escape(text || "not loaded")}</span>`
+    },
+  },
+})
+
+/** Sanitized Markdown. Only artifact Markdown may show images, and only image artifacts. */
+export function Markdown({ text, artifact = false }: { text: string; artifact?: boolean }) {
+  const parser = artifact ? artifactMarkdown : markdown
+  const html = DOMPurify.sanitize(parser.parse(text, { async: false }), {
     USE_PROFILES: { html: true },
     FORBID_TAGS: [
-      "img",
+      ...(artifact ? [] : ["img"]),
       "style",
       "form",
       "input",

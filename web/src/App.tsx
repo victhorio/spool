@@ -35,12 +35,26 @@ export function SpoolMark({ large = false }: { large?: boolean }) {
   )
 }
 
-function PanelIcon() {
+export function PanelIcon() {
   return (
     <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
       <rect x="3" y="4" width="18" height="16" rx="2" stroke="currentColor" strokeWidth="1.5" />
       <path d="M9 4v16" stroke="currentColor" strokeWidth="1.5" />
     </svg>
+  )
+}
+
+/** Switches between the session archive and artifacts, which are separate sections. */
+export function ModeSwitch({ current }: { current: "sessions" | "artifacts" }) {
+  return (
+    <nav className="mode-switch" aria-label="Archive section">
+      <a href="/" aria-current={current === "sessions" ? "page" : undefined}>
+        Sessions
+      </a>
+      <a href="/artifacts" aria-current={current === "artifacts" ? "page" : undefined}>
+        Artifacts
+      </a>
+    </nav>
   )
 }
 
@@ -221,6 +235,7 @@ export function App() {
             <PanelIcon />
           </button>
         </div>
+        <ModeSwitch current="sessions" />
         <div className="sidebar-controls">
           <div className="search-field">
             <svg width="16" height="16" viewBox="0 0 24 24" fill="none" aria-hidden="true">

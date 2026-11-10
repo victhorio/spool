@@ -1,6 +1,7 @@
 # Agent retrieval
 
-The plugin always registers three read-only OpenCode tools. They search the central archive across machines; they do not call a model or
+The plugin always registers three read-only OpenCode tools for archived sessions;
+its [artifact](artifacts.md) tools are separate. They search the central archive across machines; they do not call a model or
 create their own reader agent. The bundled `searching-sessions` skill explains
 navigation, optional delegation, evidence and archive limitations.
 

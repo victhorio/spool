@@ -754,3 +754,88 @@ pre code {
 .device-panel strong {
   white-space: nowrap;
 }
+.mode-switch {
+  display: flex;
+  gap: 2px;
+  margin: 0 12px 10px;
+  padding: 2px;
+  border-radius: 7px;
+  background: #e6ece1;
+}
+.mode-switch a {
+  flex: 1;
+  text-align: center;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 26px;
+  border-radius: 5px;
+  color: var(--muted);
+  text-decoration: none;
+}
+.mode-switch a:hover {
+  color: #253229;
+}
+.mode-switch a[aria-current="page"] {
+  background: #f8faf6;
+  color: #233a24;
+  box-shadow: 0 1px 2px #23332314;
+}
+.artifact-row {
+  flex-direction: column;
+  align-items: stretch;
+  gap: 1px;
+  text-decoration: none;
+  min-width: 0;
+}
+.artifact-row .session-title {
+  display: block;
+}
+.artifact-row-meta {
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 16px;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.artifact .prose {
+  font-size: 15px;
+  line-height: 1.6;
+}
+.artifact .prose img {
+  max-width: 100%;
+  height: auto;
+  border-radius: 6px;
+}
+.artifact-wide {
+  max-width: 1200px;
+  display: flex;
+  flex-direction: column;
+  min-height: 100%;
+}
+.artifact-frame {
+  flex: 1;
+  width: 100%;
+  min-height: 70vh;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}
+.artifact-text {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 0;
+}
+.artifact-image {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 0 auto;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+}

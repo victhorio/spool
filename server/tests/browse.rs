@@ -22,7 +22,7 @@ use ring::{
     signature::{RSA_PKCS1_SHA256, RsaKeyPair},
 };
 use serde_json::{Value, json};
-use spool_server::{Access, Reader, connect, connect_read, migrate, router};
+use spool_server::{Access, Reader, admin, connect, connect_read, migrate, router};
 use sqlx::{PgPool, postgres::PgPoolOptions};
 use tokio::task::JoinHandle;
 use uuid::Uuid;
@@ -191,7 +191,7 @@ fn privacy(response: &Response) {
         "base-uri 'none'",
         "form-action 'none'",
         "frame-ancestors 'none'",
-        "frame-src 'none'",
+        "frame-src 'self'",
     ] {
         assert!(csp.split(';').any(|part| part.trim() == directive));
     }
@@ -545,6 +545,7 @@ async fn postgres_browse_contract() {
         snapshot_consistency(&client, &url, &pool).await;
         limits(&client, &url, &pool).await;
         device_login(&client, &url, &pool).await;
+        artifacts(&client, &url, &pool).await;
         read.close().await;
         error(
             client
@@ -1331,4 +1332,446 @@ async fn device_login(client: &Client, url: &str, pool: &PgPool) {
     let page = client.get(format!("{url}/device")).send().await.unwrap();
     assert_eq!(page.status(), StatusCode::OK);
     assert!(page.text().await.unwrap().contains("Browse test"));
+}
+
+async fn artifacts(client: &Client, url: &str, pool: &PgPool) {
+    let machine = Client::new();
+    let token = admin::add_source(pool, "artifact machine")
+        .await
+        .unwrap()
+        .token;
+    sqlx::query("UPDATE sources SET alias = 'artifact-box' WHERE label = 'artifact machine'")
+        .execute(pool)
+        .await
+        .unwrap();
+    let send = |request: reqwest::RequestBuilder| {
+        let token = token.clone();
+        async move {
+            let response = request.bearer_auth(token).send().await.unwrap();
+            let status = response.status();
+            (status, response.json::<Value>().await.unwrap())
+        }
+    };
+    let create = |title: &str, media_type: &str, body: Vec<u8>, session: Option<&str>| {
+        let mut query = vec![("title", title.to_owned())];
+        if let Some(session) = session {
+            query.push(("session", session.to_owned()));
+        }
+        send(
+            machine
+                .post(format!("{url}/v1/artifacts"))
+                .query(&query)
+                .header("content-type", media_type)
+                .body(body),
+        )
+    };
+    let failed = |result: (StatusCode, Value), status: StatusCode, code: &str| {
+        assert_eq!(result.0, status, "{}", result.1);
+        assert_eq!(result.1["error"]["code"], code, "{}", result.1);
+    };
+
+    // Creation records the source and session; the session is a retrieval reference.
+    let (status, created) = create(
+        "  Rollout plan  ",
+        "text/markdown; charset=utf-8",
+        "# Plan\n\nShip the quartz parser.\n\n![chart](/artifacts/art_aaaaaaaaaaaa)".into(),
+        Some("ses_planner"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let plan = created["artifact"].clone();
+    let plan_id = plan["id"].as_str().unwrap().to_owned();
+    assert!(
+        plan_id.starts_with("art_") && plan_id.len() == 16,
+        "{plan_id}"
+    );
+    assert_eq!(plan["title"], "Rollout plan");
+    assert_eq!(plan["type"], "text/markdown");
+    assert_eq!(plan["revision"], "1");
+    assert_eq!(plan["source"], "artifact-box");
+    assert_eq!(plan["session"], "artifact-box/ses_planner");
+    assert_eq!(plan["session_id"], "ses_planner");
+
+    // Requests that must not create anything.
+    let png = b"\x89PNG\r\n\x1a\nsynthetic image bytes".to_vec();
+    failed(
+        create("x", "application/json", b"{}".to_vec(), None).await,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "unsupported_content_type",
+    );
+    failed(
+        create("x", "image/png", b"GIF89a".to_vec(), None).await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_content",
+    );
+    failed(
+        create("x", "text/plain", vec![0xff], None).await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_content",
+    );
+    for title in ["", "   ", "line\nbreak", &"t".repeat(257)] {
+        failed(
+            create(title, "text/plain", b"x".to_vec(), None).await,
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        );
+    }
+    failed(
+        create("x", "text/plain", b"x".to_vec(), Some("")).await,
+        StatusCode::BAD_REQUEST,
+        "malformed_request",
+    );
+    failed(
+        create("x", "text/plain", vec![b'x'; (32 << 20) + 1], None).await,
+        StatusCode::PAYLOAD_TOO_LARGE,
+        "payload_too_large",
+    );
+    let anonymous = machine
+        .post(format!("{url}/v1/artifacts?title=x"))
+        .header("content-type", "text/plain")
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    for request in [
+        machine.get(format!("{url}/v1/artifacts")),
+        machine.get(format!("{url}/v1/artifacts/{plan_id}")),
+        machine
+            .put(format!("{url}/v1/artifacts/{plan_id}?revision=1"))
+            .header("content-type", "text/plain")
+            .body("x"),
+        machine
+            .patch(format!("{url}/v1/artifacts/{plan_id}"))
+            .json(&json!({"revision": "1", "title": "x"})),
+    ] {
+        assert_eq!(
+            request.send().await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    failed(
+        send(
+            machine
+                .patch(format!("{url}/v1/artifacts/{plan_id}"))
+                .header("content-type", "text/plain")
+                .body(r#"{"revision":"1","title":"x"}"#),
+        )
+        .await,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+        "unsupported_content_type",
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM artifacts")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 1);
+
+    // Edits apply on the server, all or nothing, against the current revision.
+    let change = |id: &str, body: Value| {
+        send(
+            machine
+                .patch(format!("{url}/v1/artifacts/{id}"))
+                .json(&body),
+        )
+    };
+    let (status, edited) = change(
+        &plan_id,
+        json!({"revision": "1", "title": "Rollout plan v2", "edits": [
+            {"old": "quartz parser", "new": "basalt parser"},
+            {"old": "# Plan", "new": "# Plan (revised)"},
+        ]}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{edited}");
+    assert_eq!(edited["artifact"]["revision"], "2");
+    assert_eq!(edited["artifact"]["title"], "Rollout plan v2");
+    let stale = change(&plan_id, json!({"revision": "1", "title": "stale"})).await;
+    assert_eq!(stale.0, StatusCode::CONFLICT);
+    assert_eq!(
+        stale.1,
+        json!({"error": {"code": "revision_conflict", "current_revision": "2"}})
+    );
+    let missing = change(
+        &plan_id,
+        json!({"revision": "2", "edits": [{"old": "basalt", "new": "x"}, {"old": "absent", "new": "y"}]}),
+    )
+    .await;
+    assert_eq!(missing.0, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(
+        missing.1,
+        json!({"error": {"code": "edit_not_found", "edit": 1}})
+    );
+    failed(
+        change(
+            &plan_id,
+            json!({"revision": "2", "edits": [{"old": "a", "new": "b"}]}),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "edit_not_unique",
+    );
+    for body in [
+        json!({"revision": "2"}),
+        json!({"revision": "2", "edits": []}),
+        json!({"revision": "2", "edits": [{"old": "", "new": "x"}]}),
+        json!({"revision": "0", "title": "x"}),
+        json!({"revision": 2, "title": "x"}),
+        json!({"revision": "2", "title": "x", "extra": true}),
+    ] {
+        failed(
+            change(&plan_id, body).await,
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        );
+    }
+    failed(
+        change("art_bbbbbbbbbbbb", json!({"revision": "1", "title": "x"})).await,
+        StatusCode::NOT_FOUND,
+        "not_found",
+    );
+
+    // Reading returns text in bounded chunks that reassemble exactly.
+    let read = |id: &str, offset: Option<i64>| {
+        let mut request = machine.get(format!("{url}/v1/artifacts/{id}"));
+        if let Some(offset) = offset {
+            request = request.query(&[("offset", offset)]);
+        }
+        send(request)
+    };
+    let (_, current) = read(&plan_id, None).await;
+    assert_eq!(
+        current["text"],
+        "# Plan (revised)\n\nShip the basalt parser.\n\n![chart](/artifacts/art_aaaaaaaaaaaa)"
+    );
+    assert_eq!(current["next_offset"], Value::Null);
+    let long: String = "é".repeat(9000) + "end";
+    let (_, notes) = create("Long notes", "text/plain", long.clone().into(), None).await;
+    let notes_id = notes["artifact"]["id"].as_str().unwrap().to_owned();
+    let mut assembled = String::new();
+    let mut offset = None;
+    let mut chunks = 0;
+    loop {
+        let (status, chunk) = read(&notes_id, offset).await;
+        assert_eq!(status, StatusCode::OK, "{chunk}");
+        let text = chunk["text"].as_str().unwrap();
+        assert!(text.len() <= 8 * 1024);
+        assembled.push_str(text);
+        chunks += 1;
+        match chunk["next_offset"].as_i64() {
+            Some(next) => offset = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!((assembled == long, chunks), (true, 3));
+    failed(
+        read(&notes_id, Some(-1)).await,
+        StatusCode::BAD_REQUEST,
+        "malformed_request",
+    );
+
+    // Replacing content may change its type; images have no text and cannot be edited.
+    let replace = |id: &str, revision: &str, media_type: &str, body: Vec<u8>| {
+        send(
+            machine
+                .put(format!("{url}/v1/artifacts/{id}"))
+                .query(&[("revision", revision)])
+                .header("content-type", media_type)
+                .body(body),
+        )
+    };
+    let (status, replaced) = replace(&notes_id, "1", "text/html", b"<h1>Notes</h1>".to_vec()).await;
+    assert_eq!(status, StatusCode::OK, "{replaced}");
+    assert_eq!(replaced["artifact"]["type"], "text/html");
+    assert_eq!(replaced["artifact"]["title"], "Long notes");
+    assert_eq!(replaced["artifact"]["size"], 14);
+    assert_eq!(
+        replace(&notes_id, "1", "text/html", b"x".to_vec()).await.0,
+        StatusCode::CONFLICT
+    );
+    let (_, image) = create("Chart", "image/png", png.clone(), Some("ses_planner")).await;
+    let image_id = image["artifact"]["id"].as_str().unwrap().to_owned();
+    let (_, image_read) = read(&image_id, None).await;
+    assert_eq!(
+        (
+            image_read["text"].clone(),
+            image_read["next_offset"].clone()
+        ),
+        (Value::Null, Value::Null)
+    );
+    failed(
+        change(
+            &image_id,
+            json!({"revision": "1", "edits": [{"old": "PNG", "new": "x"}]}),
+        )
+        .await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "not_text",
+    );
+
+    // Find matches literal terms in titles and text, newest first, with cursor-only paging.
+    let find =
+        |query: &[(&str, &str)]| send(machine.get(format!("{url}/v1/artifacts")).query(query));
+    let ids = |page: &Value| {
+        page["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|artifact| artifact["id"].as_str().unwrap().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let (_, all) = find(&[]).await;
+    assert_eq!(
+        ids(&all),
+        [image_id.clone(), notes_id.clone(), plan_id.clone()]
+    );
+    assert_eq!(
+        ids(&find(&[("query", "BASALT parser")]).await.1),
+        [plan_id.as_str()]
+    );
+    assert_eq!(
+        ids(&find(&[("query", "notes")]).await.1),
+        [notes_id.as_str()]
+    );
+    assert_eq!(
+        ids(&find(&[("query", "100%")]).await.1),
+        Vec::<String>::new()
+    );
+    let (_, first) = find(&[("limit", "2")]).await;
+    assert_eq!(ids(&first), [image_id.clone(), notes_id.clone()]);
+    let cursor = first["next_cursor"].as_str().unwrap();
+    let (_, second) = find(&[("cursor", cursor)]).await;
+    assert_eq!(
+        (ids(&second), second["next_cursor"].clone()),
+        (vec![plan_id.clone()], Value::Null)
+    );
+    failed(
+        find(&[("cursor", cursor), ("limit", "2")]).await,
+        StatusCode::BAD_REQUEST,
+        "malformed_request",
+    );
+    failed(
+        find(&[("limit", "51")]).await,
+        StatusCode::BAD_REQUEST,
+        "malformed_request",
+    );
+
+    // The reader lists and shows artifacts; content is served isolated.
+    let listed = get(client, &format!("{url}/api/artifacts?q=basalt")).await;
+    assert_eq!(ids(&listed), [plan_id.as_str()]);
+    let shown = get(client, &format!("{url}/api/artifacts/{plan_id}")).await;
+    assert_eq!(
+        shown["artifact"]["source_id"],
+        listed["artifacts"][0]["source_id"]
+    );
+    error(
+        client
+            .get(format!("{url}/api/artifacts/art_bbbbbbbbbbbb"))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::NOT_FOUND,
+        "not_found",
+    )
+    .await;
+    for (id, content_type, body) in [
+        (
+            &notes_id,
+            "text/html; charset=utf-8",
+            b"<h1>Notes</h1>".to_vec(),
+        ),
+        (&image_id, "image/png", png.clone()),
+    ] {
+        let response = client
+            .get(format!("{url}/artifacts/{id}/content"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers();
+        assert_eq!(headers["content-type"], content_type);
+        assert_eq!(headers["x-frame-options"], "SAMEORIGIN");
+        assert_eq!(headers["cache-control"], "no-store");
+        assert_eq!(headers["x-content-type-options"], "nosniff");
+        let csp = headers["content-security-policy"].to_str().unwrap();
+        assert!(
+            csp.starts_with("sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox;"),
+            "{csp}"
+        );
+        assert!(!csp.contains("allow-same-origin"));
+        for directive in [
+            "default-src 'none'",
+            "frame-ancestors 'self'",
+            "form-action 'none'",
+        ] {
+            assert!(csp.split(';').any(|part| part.trim() == directive), "{csp}");
+        }
+        assert_eq!(response.bytes().await.unwrap().as_ref(), body.as_slice());
+    }
+    let (_, diagram) = create(
+        "Diagram",
+        "image/svg+xml",
+        b"<svg xmlns='http://www.w3.org/2000/svg'/>".to_vec(),
+        None,
+    )
+    .await;
+    let diagram_id = diagram["artifact"]["id"].as_str().unwrap().to_owned();
+    let svg = client
+        .get(format!("{url}/artifacts/{diagram_id}/content"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        svg.headers()["content-type"],
+        "image/svg+xml; charset=utf-8"
+    );
+    assert!(
+        svg.headers()["content-security-policy"]
+            .to_str()
+            .unwrap()
+            .starts_with("sandbox allow-scripts ")
+    );
+    let markdown = client
+        .get(format!("{url}/artifacts/{plan_id}/content"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        markdown.headers()["content-type"],
+        "text/plain; charset=utf-8"
+    );
+    for path in [
+        format!("/artifacts/{plan_id}/content"),
+        "/api/artifacts".into(),
+    ] {
+        error(
+            machine.get(format!("{url}{path}")).send().await.unwrap(),
+            StatusCode::FORBIDDEN,
+            "forbidden",
+        )
+        .await;
+    }
+    for path in ["/artifacts".to_owned(), format!("/artifacts/{plan_id}")] {
+        let page = client.get(format!("{url}{path}")).send().await.unwrap();
+        privacy(&page);
+        assert!(page.text().await.unwrap().contains("Browse test"));
+    }
+
+    // Purging a session removes the artifacts it created; artifacts can be purged alone.
+    let source: Uuid = shown["artifact"]["source_id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    admin::purge_session(pool, source, "ses_planner")
+        .await
+        .unwrap();
+    assert_eq!(
+        ids(&find(&[]).await.1),
+        [diagram_id.as_str(), notes_id.as_str()]
+    );
+    admin::purge_artifact(pool, &diagram_id).await.unwrap();
+    admin::purge_artifact(pool, &notes_id).await.unwrap();
+    assert!(admin::purge_artifact(pool, &notes_id).await.is_err());
+    assert_eq!(ids(&find(&[]).await.1), Vec::<String>::new());
 }

@@ -23,6 +23,7 @@ const releaseSignals = runtime.handleSignals()
 const hosts: Host[] = []
 const cases: string[] = []
 const names = { find: "spool_find_sessions", search: "spool_search_messages", read: "spool_read_messages" }
+const artifactNames = ["spool_create_artifact", "spool_update_artifact", "spool_edit_artifact", "spool_find_artifacts", "spool_read_artifact"]
 const repoKey = "github.com/synthetic-spool/retrieval-fixture"
 const sharedID = "ses_retrieval_shared"
 const worktreeID = "ses_retrieval_worktree"
@@ -67,8 +68,12 @@ async function converged(host: Host, source: Source, id: string) {
 }
 
 async function tool<T>(host: Host, route: keyof typeof names, input: Record<string, JsonValue>): Promise<T> {
+  return execute<T>(host, names[route], input)
+}
+
+async function execute<T>(host: Host, name: string, input: Record<string, JsonValue>): Promise<T> {
   const result = await host.client.rpc.call({ rpcID: "spool-retrieval-fixture", method: "execute", location: location(host),
-    input: { tool: names[route], input, sessionID: sharedID } })
+    input: { tool: name, input, sessionID: sharedID } })
   assert.equal(typeof result.output?.content, "string", JSON.stringify(result))
   assert.ok(Buffer.byteLength(result.output.content) <= 24 * 1024, "Tool response exceeds the model-facing 24 KiB budget")
   calls++
@@ -222,7 +227,7 @@ try {
   const agentsBefore = await first.client.agent.list({ location: location(first) })
   const general = JSON.parse((await agent(first, "general")).text)
   const explore = JSON.parse((await agent(first, "explore")).text)
-  for (const name of Object.values(names)) {
+  for (const name of [...Object.values(names), ...artifactNames]) {
     assert.ok(general.tools.includes(name), `${name} missing from General`)
     assert.ok(!explore.tools.includes(name), `${name} unexpectedly granted to Explore`)
   }
@@ -234,6 +239,26 @@ try {
   assert.deepEqual((await first.client.agent.list({ location: location(first) })).data.map(({ id, permissions }) => ({ id, permissions })),
     agentsBefore.data.map(({ id, permissions }) => ({ id, permissions })))
   pass("real General agent loop loads the skill, executes find/search/read and receives evidence; Explore permissions unchanged (scripted AI SDK, not provider validation or model judgment)")
+
+  interface Published { artifact: { id: string; revision: string; type: string; title: string; session: string | null; url: string } }
+  assert.ok((await first.client.skill.list({ location: location(first) })).data.some((skill) => skill.id === "spool.publishing-artifacts"))
+  const markdownFile = path.join(root, "synthetic-findings.md")
+  await Bun.write(markdownFile, "# Findings\n\nThe quartz cache misses on cold start.\n")
+  const published = await execute<Published>(first, "spool_create_artifact", { title: "Synthetic findings", path: markdownFile })
+  assert.equal(published.artifact.type, "text/markdown")
+  assert.equal(published.artifact.session, `${primary.alias}/${sharedID}`)
+  assert.equal(published.artifact.url, `${runtime.url}/artifacts/${published.artifact.id}`)
+  const edited = await execute<Published>(first, "spool_edit_artifact", { id: published.artifact.id, revision: "1", edits: [{ old: "cold start", new: "a cold start" }] })
+  assert.equal(edited.artifact.revision, "2")
+  const conflict = await execute<{ error: { code: string; current_revision: string } }>(first, "spool_update_artifact", { id: published.artifact.id, revision: "1", title: "Stale" })
+  assert.deepEqual(conflict.error, { code: "revision_conflict", current_revision: "2" })
+  const retitled = await execute<Published>(second, "spool_update_artifact", { id: published.artifact.id, revision: "2", title: "Synthetic findings, revised" })
+  assert.equal(retitled.artifact.title, "Synthetic findings, revised")
+  const readBack = await execute<{ text: string; next_offset: number | null }>(second, "spool_read_artifact", { id: published.artifact.id })
+  assert.deepEqual(readBack, { ...readBack, text: "# Findings\n\nThe quartz cache misses on a cold start.\n", next_offset: null })
+  const listedArtifacts = await execute<{ artifacts: { id: string }[] }>(second, "spool_find_artifacts", { query: "QUARTZ cache" })
+  assert.deepEqual(listedArtifacts.artifacts.map((item) => item.id), [published.artifact.id])
+  pass("real plugin publishes a file as an artifact with its session, edits it on the server, rejects a stale revision, and another source updates, reads and finds it")
 
   await first.client.debug.location.evict({ location: { directory: worktree } })
   await git(main, "worktree", "remove", "--force", worktree)

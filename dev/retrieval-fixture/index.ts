@@ -4,7 +4,8 @@ const sdk = "@opencode/plugin"
 const { Model, Plugin, Provider } = await import(sdk) as typeof import("../../plugin/node_modules/@opencode/plugin/dist/promise/index.js")
 
 export const providerID = "spool-retrieval-fixture"
-export const toolNames = ["spool_find_sessions", "spool_search_messages", "spool_read_messages"]
+export const toolNames = ["spool_find_sessions", "spool_search_messages", "spool_read_messages",
+  "spool_create_artifact", "spool_update_artifact", "spool_edit_artifact", "spool_find_artifacts", "spool_read_artifact"]
 
 export default Plugin.define({
   id: "spool-retrieval-fixture",
@@ -95,7 +96,7 @@ export default Plugin.define({
       async tools() { return (await ctx.tool.list()).filter((tool) => toolNames.includes(tool.id)).map(({ id, name, input }) => ({ id, name, input })) },
       async execute(value, context) {
         const { tool: name, input, sessionID } = value as { tool: string; input: unknown; sessionID: string }
-        assert.ok(toolNames.includes(name), "Fixture RPC only exposes Spool read-only tools")
+        assert.ok(toolNames.includes(name), "Fixture RPC only exposes Spool tools")
         const tool = (await ctx.tool.list()).find((tool) => tool.id === name)
         assert.ok(tool, `Unregistered tool: ${name}`)
         return tool.execute(input, {

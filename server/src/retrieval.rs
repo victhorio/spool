@@ -103,7 +103,7 @@ fn revision(value: Option<&str>) -> Result<Option<i64>, ApiError> {
         .transpose()
 }
 
-fn pattern(term: &str) -> String {
+pub(crate) fn pattern(term: &str) -> String {
     format!(
         "%{}%",
         term.replace('\\', "\\\\")

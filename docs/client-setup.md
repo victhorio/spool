@@ -93,7 +93,9 @@ wrong or revoked; a timeout is a network or service availability problem.
 After reload, check the intended agent's available tools, not just plugin status:
 
 - `spool_find_sessions`, `spool_search_messages`, `spool_read_messages`
-- Bundled skill `spool.searching-sessions` (name `searching-sessions`)
+- `spool_create_artifact`, `spool_update_artifact`, `spool_edit_artifact`,
+  `spool_find_artifacts`, `spool_read_artifact` ([artifacts](artifacts.md))
+- Bundled skills `spool.searching-sessions` and `spool.publishing-artifacts`
 
 Use an agent allowed to use these tools, such as a permitted General agent.
 Explore's restricted defaults are not broadened by the plugin; delegation does

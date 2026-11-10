@@ -1,7 +1,6 @@
-import { readFile } from "node:fs/promises"
-import { fileURLToPath } from "node:url"
-import { Skill, type Plugin } from "@opencode/plugin"
+import type { Plugin } from "@opencode/plugin"
 import { type Config, validSourceAlias } from "./config"
+import { bundledSkill } from "./skills"
 
 type Route = "find" | "search" | "read"
 const maximumBytes = 24 * 1024
@@ -112,17 +111,9 @@ export async function requestReader(archive: Archive, route: Route, input: unkno
 }
 
 export async function registerRetrieval(ctx: Plugin.Context, archive: Archive): Promise<void> {
-  const location = new URL("../skills/searching-sessions/SKILL.md", import.meta.url)
-  const source = await readFile(location, "utf8")
-  const frontmatter = /^---\nname: ([^\n]+)\ndescription: ([^\n]+)\n---\n([\s\S]*)$/.exec(source)
-  if (!frontmatter) throw new Error("Invalid bundled searching-sessions skill")
-  const skill = {
-    id: Skill.ID.make("spool.searching-sessions"), name: Skill.Name.make(frontmatter[1]!),
-    description: frontmatter[2]!, path: fileURLToPath(location) as Skill.Info["path"],
-    content: frontmatter[3]!.trim(),
-  }
+  const skill = await bundledSkill("searching-sessions")
   await ctx.tool.transform((tools) => {
-    tools.namespace({ name: "spool", description: "Read-only archived coding-agent session retrieval." })
+    tools.namespace({ name: "spool", description: "Archived coding-agent session retrieval, and artifacts published for people to read." })
     for (const route of ["find", "search", "read"] as const) {
       const definition = definitions[route]
       tools.add({

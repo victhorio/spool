@@ -25,11 +25,22 @@ enum Command {
         #[command(subcommand)]
         command: SourceCommand,
     },
-    /// Permanently remove archived session bodies using direct database access.
+    /// Permanently remove archived session bodies, and the artifacts the session
+    /// created, using direct database access.
     Session {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Permanently remove artifacts using direct database access.
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ArtifactCommand {
+    Purge { id: String },
 }
 
 #[derive(Subcommand)]
@@ -117,6 +128,12 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
         },
+        Command::Artifact {
+            command: ArtifactCommand::Purge { id },
+        } => {
+            admin::purge_artifact(&pool, &id).await?;
+            println!("{}", json!({"id": id, "deleted": true}));
+        }
     }
     pool.close().await;
     Ok(())

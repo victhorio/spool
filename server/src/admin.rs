@@ -81,6 +81,11 @@ pub async fn purge_session(pool: &PgPool, source: Uuid, session: &str) -> anyhow
     } else {
         current.checked_add(1).context("revision exhausted")?
     };
+    sqlx::query("DELETE FROM artifacts WHERE source_id = $1 AND session_id = $2")
+        .bind(source)
+        .bind(session)
+        .execute(&mut *tx)
+        .await?;
     sqlx::query("DELETE FROM messages WHERE source_id = $1 AND session_id = $2")
         .bind(source)
         .bind(session)
@@ -99,4 +104,16 @@ pub async fn purge_session(pool: &PgPool, source: Uuid, session: &str) -> anyhow
     .await?;
     tx.commit().await?;
     Ok(revision)
+}
+
+pub async fn purge_artifact(pool: &PgPool, id: &str) -> anyhow::Result<()> {
+    let deleted = sqlx::query("DELETE FROM artifacts WHERE id = $1")
+        .bind(id)
+        .execute(pool)
+        .await?
+        .rows_affected();
+    if deleted == 0 {
+        bail!("artifact not found");
+    }
+    Ok(())
 }

@@ -1,5 +1,6 @@
 mod access;
 pub mod admin;
+mod artifacts;
 mod auth;
 mod browse;
 mod device;

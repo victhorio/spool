@@ -23,7 +23,7 @@ use uuid::Uuid;
 
 use crate::{
     access::{self, Access},
-    device,
+    artifacts, device,
     error::ApiError,
     snapshot::valid_id,
 };
@@ -50,10 +50,13 @@ pub(crate) fn router(
     Ok(Router::new()
         .route("/api/sessions", get(sessions))
         .route("/api/sources/{source}/sessions/{session}", get(session))
+        .merge(artifacts::reader_routes())
         .with_state(read)
         .merge(device::reader_routes().with_state(write))
         .route_service("/", ServeFile::new(index.clone()))
         .route_service("/device", ServeFile::new(index.clone()))
+        .route_service("/artifacts", ServeFile::new(index.clone()))
+        .route_service("/artifacts/{id}", ServeFile::new(index.clone()))
         .route_service("/index.html", ServeFile::new(index))
         .nest_service("/assets", ServeDir::new(assets.join("assets")))
         .route_service("/favicon.ico", ServeFile::new(assets.join("favicon.ico")))
@@ -71,6 +74,7 @@ async fn privacy(request: Request, next: Next) -> Response {
     } else {
         ApiError::new(StatusCode::FORBIDDEN, "forbidden_origin").into_response()
     };
+    // Artifact content sets its own framing and content policy.
     let headers = response.headers_mut();
     for (name, value) in [
         ("cache-control", "no-store"),
@@ -81,10 +85,12 @@ async fn privacy(request: Request, next: Next) -> Response {
         ("strict-transport-security", "max-age=31536000"),
         (
             "content-security-policy",
-            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src 'none'",
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src 'self'",
         ),
     ] {
-        headers.insert(name, HeaderValue::from_static(value));
+        headers
+            .entry(name)
+            .or_insert(HeaderValue::from_static(value));
     }
     response
 }

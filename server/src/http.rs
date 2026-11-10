@@ -20,7 +20,8 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
-    access::Access, auth, browse, device, error::ApiError, retrieval, snapshot, snapshot::MAX_BODY,
+    access::Access, artifacts, auth, browse, device, error::ApiError, retrieval, snapshot,
+    snapshot::MAX_BODY,
 };
 
 #[derive(Clone)]
@@ -57,7 +58,8 @@ pub fn router(pool: PgPool, read: PgPool, reader: Option<Reader>) -> anyhow::Res
             uploads: Arc::new(Semaphore::new(2)),
         })
         .merge(agent)
-        .merge(device::machine_routes().with_state(pool.clone()));
+        .merge(device::machine_routes().with_state(pool.clone()))
+        .merge(artifacts::machine_routes(pool.clone(), read.clone()));
     Ok(match reader {
         Some(reader) => {
             app.fallback_service(browse::router(pool, read, reader.access, reader.assets)?)

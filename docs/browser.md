@@ -32,7 +32,8 @@ Startup fails if only one Access variable is set or the assets are missing.
 
 Reads use a separate two-connection pool with PostgreSQL's
 `default_transaction_read_only=on`. This prevents accidental writes; it is not a
-privilege boundary. Responses prohibit caching, framing and cross-origin API
+privilege boundary. Responses prohibit caching, framing (except
+[artifact content](artifacts.md#isolation), framed by the reader itself) and cross-origin API
 access. `/api/*` additionally rejects cross-site Fetch Metadata and any Origin
 that does not match the request's Host. When an Access session expires, API
 requests are redirected to Cloudflare's login; the page reloads to follow it.
@@ -41,6 +42,11 @@ A local copy of the production archive is useful for a preview without changing
 the cloud deployment. Treat that copy as private data, not a synthetic fixture;
 it is a point-in-time snapshot and does not follow new uploads automatically.
 Never expose PostgreSQL outside loopback for this.
+
+## Artifacts
+
+`/artifacts` lists and shows documents that agents published; see
+[artifacts](artifacts.md). The sidebar switches between sessions and artifacts.
 
 ## Device approval
 
