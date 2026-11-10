@@ -6,27 +6,27 @@ type Route = "find" | "search" | "read"
 const maximumBytes = 24 * 1024
 const errorResult = (code: string, current_revision?: string) => JSON.stringify({ error: { code, ...(current_revision ? { current_revision } : {}) } })
 const string = { type: "string", minLength: 1 }
-const session = { ...string, maxLength: 549, description: "Native OpenCode ID (when globally unique), alias/ID, or legacy source-UUID/ID. On ambiguous_session, select a returned qualified candidate." }
+const session = { ...string, maxLength: 549, description: "Session reference from find, such as `work-m5/ses_…`. A bare OpenCode ID works when it's unique." }
 const revision = { ...string, maxLength: 19, pattern: "^[0-9]+$" }
-const query = { ...string, maxLength: 512, description: "Case-insensitive literal whitespace terms, AND within one title/message; at most 512 UTF-8 bytes and 16 terms. No query DSL." }
+const query = { ...string, maxLength: 512, description: "Case-insensitive words, all of which must occur in one title or message; at most 16." }
 const boolean = { type: "boolean" }
 const integer = (maximum?: number, defaultValue?: number) => ({ type: "integer", minimum: 1, ...(maximum ? { maximum } : {}), ...(defaultValue ? { default: defaultValue } : {}) })
 const definitions = {
   find: {
     name: "find_sessions",
-    description: "Find archived sessions across sources. Query and exact repository key are optional; no implicit current-repository filter. Returns source-qualified session references, one snippet each, revisions, capture times and archive coverage.",
-    properties: { query, repository: { ...string, description: "Exact normalized host/path key (not a folder name or URL)." }, include_tools: boolean, limit: integer(50, 10) },
+    description: "Find archived sessions across all machines and repositories. Returns each session's reference, title and a matching snippet.",
+    properties: { query, repository: { ...string, description: "Limit to one repository, as a normalized host/path such as `github.com/owner/repo`." }, include_tools: boolean, limit: integer(50, 10) },
     required: [],
   },
   search: {
     name: "search_messages",
-    description: "Find indexed messages in one archived session; initial arguments require session and query. Returns message indexes, excerpts and read cursors. Ordinary user/assistant text only unless include_tools is true; reasoning and binary are not searched.",
+    description: "Find messages in one session that match `query`. Returns message indexes and excerpts. Searches user and assistant text; `include_tools` adds tool calls and output. Reasoning and attachments are never searched.",
     properties: { session, query, revision, include_tools: boolean, limit: integer(100, 20) },
     required: ["session", "query"],
   },
   read: {
     name: "read_messages",
-    description: "Read a 1-based inclusive message range; initial arguments require session. Start defaults to 1, end to start. Returns full textual evidence in bounded byte chunks, message indexes/IDs/roles and a continuation cursor.",
+    description: "Read messages `start` through `end` (1-based, inclusive) from one session; `start` defaults to 1 and `end` to `start`. Returns their full text, including tool calls and output, with a `next_cursor` while more of the range remains.",
     properties: { session, revision, start: integer(100_000, 1), end: integer(100_000) },
     required: ["session"],
   },
@@ -113,17 +113,17 @@ export async function requestReader(archive: Archive, route: Route, input: unkno
 export async function registerRetrieval(ctx: Plugin.Context, archive: Archive): Promise<void> {
   const skill = await bundledSkill("searching-sessions")
   await ctx.tool.transform((tools) => {
-    tools.namespace({ name: "spool", description: "Archived coding-agent session retrieval, and artifacts published for people to read." })
+    tools.namespace({ name: "spool", description: "Search past coding-agent sessions, and publish documents for the user to read." })
     for (const route of ["find", "search", "read"] as const) {
       const definition = definitions[route]
       tools.add({
         name: definition.name,
         options: { namespace: "spool", codemode: false },
-        description: `${definition.description} Supply initial arguments or a cursor alone, never both.`,
+        description: definition.description,
         input: {
           type: "object",
           additionalProperties: false,
-          properties: { ...definition.properties, cursor: { ...string, maxLength: 8192 } },
+          properties: { ...definition.properties, cursor: { ...string, maxLength: 8192, description: "`next_cursor` from a previous result, given without other arguments." } },
         },
         execute: async (input, context) => ({ content: await requestReader(archive, route, input, context.signal) }),
       })

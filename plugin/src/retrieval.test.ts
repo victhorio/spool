@@ -165,7 +165,7 @@ test("public transform registration exposes exactly the spool tools and packaged
     expect(tool.input.additionalProperties).toBe(false)
     for (const key of ["oneOf", "anyOf", "allOf", "required"]) expect(tool.input).not.toHaveProperty(key)
     expect(tool.input.properties).toHaveProperty("cursor")
-    expect(tool.description).toContain("cursor alone")
+    expect(JSON.stringify(tool.input.properties)).toContain("without other arguments")
     expect(JSON.parse((await tool.execute({ cursor: "cursor", limit: 1 }, { signal: new AbortController().signal })).content)).toEqual({ error: { code: "malformed_request" } })
   }
   expect(tools[1]!.input.properties).toHaveProperty("session")

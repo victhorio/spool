@@ -36,7 +36,7 @@ const file = { ...string, description: "Absolute path (or ~/…) of a local file
 export const definitions = {
   create: {
     name: "create_artifact",
-    description: "Publish a document (Markdown, HTML, text or an image) to Spool for the user to read, and return its link. Records the current session. Give the user the returned url.",
+    description: "Publish a document (Markdown, HTML, text or an image). Returns its `url`, the reader page, and `content_url`, the raw content for embedding.",
     properties: { title, type, content, path: file },
     required: ["title"],
   },
@@ -48,7 +48,7 @@ export const definitions = {
   },
   edit: {
     name: "edit_artifact",
-    description: "Apply exact find-and-replace edits to a text artifact on the server, in order, all or nothing. Each old string must occur exactly once at that point; include enough context to make it unique.",
+    description: "Apply exact find-and-replace edits to a text artifact, in order, all or nothing. Each `old` string must occur exactly once when its edit applies.",
     properties: {
       id, revision,
       edits: { type: "array", minItems: 1, maxItems: 100, items: { type: "object", additionalProperties: false, required: ["old", "new"], properties: { old: string, new: { type: "string" } } } },
@@ -57,13 +57,13 @@ export const definitions = {
   },
   find: {
     name: "find_artifacts",
-    description: "List published artifacts, most recently updated first. Query is optional: case-insensitive literal whitespace terms, all of which must occur in the title or text content.",
-    properties: { query: { ...string, maxLength: 512 }, limit: { type: "integer", minimum: 1, maximum: 50, default: 20 }, cursor: { ...string, maxLength: 2048, description: "next_cursor from a previous result, alone." } },
+    description: "List published artifacts, most recently updated first.",
+    properties: { query: { ...string, maxLength: 512, description: "Case-insensitive words, all of which must occur in the title or text." }, limit: { type: "integer", minimum: 1, maximum: 50, default: 20 }, cursor: { ...string, maxLength: 2048, description: "`next_cursor` from a previous result, given without other arguments." } },
     required: [],
   },
   read: {
     name: "read_artifact",
-    description: "Read an artifact's metadata and, for text types, up to 8 KiB of content from a character offset. Follow next_offset for the rest; null means the end.",
+    description: "Read an artifact's metadata and, for text types, up to 8 KiB of its content starting at `offset`. Returns `next_offset` for the rest, or null at the end.",
     properties: { id, offset: { type: "integer", minimum: 0, maximum: maximumSize } },
     required: ["id"],
   },
@@ -128,7 +128,7 @@ async function body(input: Input): Promise<{ bytes: Uint8Array<ArrayBuffer> | st
 
 function present(archive: Archive, artifact: Input): Input {
   const { id, title, type, revision, size, source, session, created_at, updated_at } = artifact
-  return { id, title, type, revision, size, source, session, created_at, updated_at, url: `${archive.url}/artifacts/${id}` }
+  return { id, title, type, revision, size, source, session, created_at, updated_at, url: `${archive.url}/artifacts/${id}`, content_url: `${archive.url}/artifacts/${id}/content` }
 }
 
 async function call(archive: Archive, route: string, init: RequestInit, timeout: number, signal?: AbortSignal): Promise<Input> {

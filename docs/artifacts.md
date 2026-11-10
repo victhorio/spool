@@ -71,7 +71,7 @@ or its UUID if it has none. `session` is the creating session as a reference for
 the retrieval tools (`alias/native-ID` or `source-UUID/native-ID`), and
 `session_id` its native ID; both are null when no session was given. The plugin
 passes agents only `{id, title, type, revision, size, source, session,
-created_at, updated_at}` plus the artifact's `url`.
+created_at, updated_at}` plus the artifact's reader `url` and its raw `content_url`.
 
 - `POST /v1/artifacts?title=…&session=…` creates an artifact from the raw
   request body, whose `Content-Type` is the media type (a `charset` parameter is

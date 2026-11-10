@@ -31,6 +31,7 @@ test("create sends inline content with its media type and session, and returns a
     expect(result.artifact).toEqual({
       id: artifact.id, title: "Plan", type: "text/markdown", revision: "1", size: 6, source: "laptop", session: "laptop/ses_one",
       created_at: artifact.created_at, updated_at: artifact.updated_at, url: `${url}/artifacts/${artifact.id}`,
+      content_url: `${url}/artifacts/${artifact.id}/content`,
     })
     expect(seen[0]!.method).toBe("POST")
     expect(seen[0]!.path).toBe("/v1/artifacts")
@@ -88,6 +89,7 @@ test("edits, renames, find and read use their routes; errors keep their details"
     const found = JSON.parse(await runArtifact(archive, "find", { query: "plan", limit: 5 }))
     expect(found.next_cursor).toBe("next")
     expect(found.artifacts[0].url).toBe(`${url}/artifacts/${artifact.id}`)
+    expect(found.artifacts[0].content_url).toBe(`${url}/artifacts/${artifact.id}/content`)
     expect(found.artifacts[0].source_id).toBeUndefined()
     expect(seen[2]!.search).toBe("?query=plan&limit=5")
     const read = JSON.parse(await runArtifact(archive, "read", { id: artifact.id, offset: 0 }))
