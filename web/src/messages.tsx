@@ -25,14 +25,12 @@ const artifactMarkdown = new Marked({
     html: ({ text }) => escape(text),
     image: ({ href, text }) => {
       const match = artifactImage.exec(href)
-      return match
-        ? `<img src="/artifacts/${match[1]}/content" alt="${escape(text)}">`
-        : `<span class="attachment">Image · ${escape(text || "not loaded")}</span>`
+      return `<img src="${escape(match ? `/artifacts/${match[1]}/content` : href)}" alt="${escape(text)}">`
     },
   },
 })
 
-/** Sanitized Markdown. Only artifact Markdown may show images, and only image artifacts. */
+/** Sanitized Markdown. Only artifact Markdown shows images. */
 export function Markdown({ text, artifact = false }: { text: string; artifact?: boolean }) {
   const parser = artifact ? artifactMarkdown : markdown
   const html = DOMPurify.sanitize(parser.parse(text, { async: false }), {

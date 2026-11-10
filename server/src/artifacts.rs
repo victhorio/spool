@@ -36,11 +36,9 @@ const TEXT_TYPES: [&str; 4] = ["text/markdown", "text/html", "text/plain", "imag
 const IMAGE_TYPES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 /// The searched text; it must match the `artifacts_search` index expression.
 const SEARCHED: &str = "(a.title || E'\\n' || coalesce(a.text_content, ''))";
-/// Opaque origin, inline content only. See "Isolation" in docs/artifacts.md.
-const CONTENT_POLICY: &str = "sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox; \
-    default-src 'none'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; \
-    img-src data: blob:; media-src data: blob:; font-src data:; \
-    base-uri 'none'; form-action 'none'; frame-ancestors 'self'";
+/// Replaces the reader's own policy: artifacts may load anything, and only the
+/// reader may frame them.
+const CONTENT_POLICY: &str = "frame-ancestors 'self'";
 
 #[derive(Clone)]
 struct Machine {

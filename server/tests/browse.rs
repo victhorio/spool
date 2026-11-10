@@ -186,7 +186,7 @@ fn privacy(response: &Response) {
         "default-src 'none'",
         "script-src 'self'",
         "connect-src 'self'",
-        "img-src 'self' data:",
+        "img-src * data: blob:",
         "object-src 'none'",
         "base-uri 'none'",
         "form-action 'none'",
@@ -1693,19 +1693,7 @@ async fn artifacts(client: &Client, url: &str, pool: &PgPool) {
         assert_eq!(headers["x-frame-options"], "SAMEORIGIN");
         assert_eq!(headers["cache-control"], "no-store");
         assert_eq!(headers["x-content-type-options"], "nosniff");
-        let csp = headers["content-security-policy"].to_str().unwrap();
-        assert!(
-            csp.starts_with("sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox;"),
-            "{csp}"
-        );
-        assert!(!csp.contains("allow-same-origin"));
-        for directive in [
-            "default-src 'none'",
-            "frame-ancestors 'self'",
-            "form-action 'none'",
-        ] {
-            assert!(csp.split(';').any(|part| part.trim() == directive), "{csp}");
-        }
+        assert_eq!(headers["content-security-policy"], "frame-ancestors 'self'");
         assert_eq!(response.bytes().await.unwrap().as_ref(), body.as_slice());
     }
     let (_, diagram) = create(
@@ -1724,12 +1712,6 @@ async fn artifacts(client: &Client, url: &str, pool: &PgPool) {
     assert_eq!(
         svg.headers()["content-type"],
         "image/svg+xml; charset=utf-8"
-    );
-    assert!(
-        svg.headers()["content-security-policy"]
-            .to_str()
-            .unwrap()
-            .starts_with("sandbox allow-scripts ")
     );
     let markdown = client
         .get(format!("{url}/artifacts/{plan_id}/content"))

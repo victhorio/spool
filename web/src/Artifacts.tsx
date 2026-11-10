@@ -318,7 +318,6 @@ function ArtifactView({ id }: { id: string }) {
             className="artifact-frame"
             title={artifact.title}
             src={content}
-            sandbox="allow-scripts allow-popups allow-popups-to-escape-sandbox"
           />
         ) : artifact.type === "text/markdown" ? (
           <Markdown text={text ?? ""} artifact />

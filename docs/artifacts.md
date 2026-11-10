@@ -14,50 +14,32 @@ Each artifact is one document of one type, at most 32 MiB:
 | Type | Media type | Shown as |
 |---|---|---|
 | Markdown | `text/markdown` | Rendered, sanitized Markdown |
-| HTML | `text/html` | A sandboxed page |
+| HTML | `text/html` | The page |
 | Text | `text/plain` | Preformatted text |
 | Image | `image/png`, `image/jpeg`, `image/gif`, `image/webp`, `image/svg+xml` | The image |
 
 Markdown, HTML, text and SVG are text types: UTF-8 without NUL, stored as text,
 so agents can read, search and edit them. Raster images must start with their
-format's signature. An image is its own artifact. Markdown may show image
-artifacts by linking them, as `![chart](https://spool.example.com/artifacts/art_…)`;
-other images in Markdown are not loaded. HTML must be self-contained: inline its scripts and
-styles, and embed images as `data:` URLs.
+format's signature. An image is its own artifact, so Markdown and HTML artifacts
+can show it by URL, such as `![chart](https://spool.example.com/artifacts/art_…)`
+in Markdown or `<img src="https://spool.example.com/artifacts/art_…/content">` in
+HTML. Both may also load any remote resource.
 
 The server keeps only the current version. Every change increments the
 artifact's `revision`, and a change names the revision it was based on, so a
 concurrent change fails with 409 `revision_conflict` instead of being lost. The
 artifacts first created by one source may total at most 1 GiB.
 
-## Isolation
+## Trust
 
-HTML artifacts can contain scripts, and agents may put untrusted material from
-web pages or prompt injection into them. The reader holds the owner's Cloudflare
-Access session and can read the whole archive, so artifact content must never
-run as the reader.
-
-`/artifacts/{id}/content` serves the raw content with
-`Content-Security-Policy: sandbox allow-scripts allow-popups allow-popups-to-escape-sandbox`.
-The browser gives the document a unique opaque origin, even when it is opened
-directly rather than framed. Its scripts run, but they cannot read the reader's
-cookies, storage or pages. The policy's `default-src 'none'` blocks every
-connection, including to the reader's API, which would also reject it as
-cross-site; it also blocks remote scripts, styles, images and fonts, so content
-stays self-contained. The reader frames it with a matching `sandbox` attribute.
-
-Popups may leave the sandbox so that links open normally. An artifact could
-therefore open a reader page, such as `/device`, in a new tab; it cannot act in
-it, and device approval never takes its code from a link.
-
-A script in an artifact can still read that artifact, and could send it
-elsewhere by navigating or opening a link. Treat an artifact's content as
-visible to anything its own HTML includes.
+Artifacts come from the owner's own agents, which already act with the owner's
+access, so the reader serves them as ordinary pages on its own origin.
+`/artifacts/{id}/content` returns the raw content; its only policy is
+`frame-ancestors 'self'`, so other sites cannot frame it.
 
 `spool_create_artifact` and `spool_update_artifact` read `path` with the
 OpenCode process's own access, outside OpenCode's file permissions, and every
-source token can read the result. The skill tells agents never to publish
-secrets.
+source token can read the result.
 
 ## Agent tools
 

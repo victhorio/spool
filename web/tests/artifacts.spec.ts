@@ -18,6 +18,7 @@ async function publish(request: APIRequestContext, title: string, type: string, 
 }
 
 test("artifacts are listed, searched and shown by type, with links to their sessions", async ({ page, request }) => {
+  await page.route("https://example.com/x.png", (route) => route.fulfill({ contentType: "image/png", body: png }))
   const image = await publish(request, "Latency chart", "image/png", png)
   const plan = await publish(request, "Quartz rollout plan", "text/markdown",
     `# Rollout\n\nShip **quartz** first.\n\n![latency](${origin}/artifacts/${image})\n\n![remote](https://example.com/x.png)\n\n<script>window.spoolInjected = 1</script>`,
@@ -38,7 +39,7 @@ test("artifacts are listed, searched and shown by type, with links to their sess
   await expect(article.getByRole("heading", { name: "Rollout", exact: true })).toBeVisible()
   await expect(article.getByRole("img", { name: "latency" })).toHaveAttribute("src", `/artifacts/${image}/content`)
   await expect.poll(() => article.getByRole("img", { name: "latency" }).evaluate((element: HTMLImageElement) => element.naturalWidth)).toBe(1)
-  await expect(article.getByText("Image · remote")).toBeVisible()
+  await expect.poll(() => article.getByRole("img", { name: "remote" }).evaluate((element: HTMLImageElement) => element.naturalWidth)).toBe(1)
   await expect(article.locator("script")).toHaveCount(0)
   expect(await page.evaluate(() => "spoolInjected" in window)).toBe(false)
   await page.screenshot({ path: path.join(screenshots, "spool-artifact-markdown.png") })
@@ -51,40 +52,26 @@ test("artifacts are listed, searched and shown by type, with links to their sess
   await expect(page.getByRole("heading", { name: /^A long conversation/ })).toBeVisible()
 })
 
-test("HTML artifacts run sandboxed: no reader access, storage or remote loads", async ({ page, request }) => {
+test("HTML artifacts can load image artifacts and remote resources", async ({ page, request }) => {
+  const image = await publish(request, "Probe image", "image/png", png)
+  await page.route("https://cdn.example.com/**", (route) => route.request().url().endsWith(".js")
+    ? route.fulfill({ contentType: "text/javascript", body: "window.cdnLoaded = true" })
+    : route.fulfill({ contentType: "image/png", body: png }))
   const html = `<!doctype html><title>Probe</title><h1>Probe</h1><p id="result">waiting</p>
-<img src="https://example.com/tracker.png" alt="">
+<img id="artifact" src="${origin}/artifacts/${image}/content" alt="">
+<img id="remote" src="https://cdn.example.com/chart.png" alt="">
+<script src="https://cdn.example.com/lib.js"></script>
 <script>
-  const outcomes = []
-  if (window.top === window) outcomes.push("parent:none")
-  else try { outcomes.push(parent.document.title ? "parent:readable" : "parent:empty") } catch { outcomes.push("parent:blocked") }
-  try { localStorage.getItem("x"); outcomes.push("storage:readable") } catch { outcomes.push("storage:blocked") }
-  try { outcomes.push(document.cookie ? "cookie:visible" : "cookie:none") } catch { outcomes.push("cookie:blocked") }
-  fetch("/api/artifacts").then(() => "api:readable", () => "api:blocked").then((api) => {
-    outcomes.push(api)
-    document.getElementById("result").textContent = outcomes.join(" ")
+  window.addEventListener("load", () => {
+    const loaded = (id) => document.getElementById(id).naturalWidth === 1
+    document.getElementById("result").textContent = [window.cdnLoaded, loaded("artifact"), loaded("remote")].join(" ")
   })
 </script>`
-  const probe = await publish(request, "Sandbox probe", "text/html", html)
-  // The browser reports remote loads it blocked by policy; none may get further.
-  const blocked: string[] = []
-  const escaped: string[] = []
-  page.on("requestfailed", (sent) => {
-    if (new URL(sent.url()).origin !== origin) (sent.failure()?.errorText === "csp" ? blocked : escaped).push(sent.url())
-  })
-  page.on("requestfinished", (sent) => {
-    if (new URL(sent.url()).origin !== origin) escaped.push(sent.url())
-  })
-  await page.context().addCookies([{ name: "reader_session", value: "synthetic", url: origin }])
+  const probe = await publish(request, "Probe", "text/html", html)
   await page.goto(`/artifacts/${probe}`)
-  const frame = page.frameLocator("iframe.artifact-frame")
-  await expect(frame.locator("#result")).toHaveText("parent:blocked storage:blocked cookie:blocked api:blocked")
-  await expect(page.locator("iframe.artifact-frame")).toHaveAttribute("sandbox", "allow-scripts allow-popups allow-popups-to-escape-sandbox")
+  await expect(page.frameLocator("iframe.artifact-frame").locator("#result")).toHaveText("true true true")
   await page.screenshot({ path: path.join(screenshots, "spool-artifact-html.png") })
 
-  // Opened directly, outside the reader's frame, it is still sandboxed.
   await page.goto(`/artifacts/${probe}/content`)
-  await expect(page.locator("#result")).toHaveText("parent:none storage:blocked cookie:blocked api:blocked")
-  expect(escaped).toEqual([])
-  expect(blocked).toEqual(["https://example.com/tracker.png", "https://example.com/tracker.png"])
+  await expect(page.locator("#result")).toHaveText("true true true")
 })

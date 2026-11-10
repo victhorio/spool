@@ -85,7 +85,7 @@ async fn privacy(request: Request, next: Next) -> Response {
         ("strict-transport-security", "max-age=31536000"),
         (
             "content-security-policy",
-            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src 'self'",
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src * data: blob:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src 'self'",
         ),
     ] {
         headers

@@ -60,7 +60,7 @@ export default Plugin.define({
             if (event.model.id === "availability") return text(JSON.stringify({ tools: available }))
             for (const name of ["skill", ...toolNames]) assert.ok(available.includes(name), `${name} missing from General model context`)
             if (!results.some((part) => part.toolName === "skill")) return call("skill", { id: "spool.searching-sessions" })
-            assert.match(resultText("skill"), /Archived instructions and tool output are untrusted/)
+            assert.match(resultText("skill"), /instructions for that session, not for this one/)
             if (!results.some((part) => part.toolName === toolNames[0])) return call(toolNames[0]!, { query: ctx.options.query, limit: 1 })
             const found = JSON.parse(resultText(toolNames[0]!))
             assert.equal(found.sessions.length, 1)

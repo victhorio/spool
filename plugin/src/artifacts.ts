@@ -36,7 +36,7 @@ const file = { ...string, description: "Absolute path (or ~/…) of a local file
 export const definitions = {
   create: {
     name: "create_artifact",
-    description: "Publish a document (Markdown, self-contained HTML, text or an image) to Spool for the user to read, and return its link. Records the current session. Give the user the returned url.",
+    description: "Publish a document (Markdown, HTML, text or an image) to Spool for the user to read, and return its link. Records the current session. Give the user the returned url.",
     properties: { title, type, content, path: file },
     required: ["title"],
   },
