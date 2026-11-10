@@ -676,3 +676,81 @@ pre code {
     font-size: 24px;
   }
 }
+.device {
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  padding: 24px 20px;
+}
+.device > .brand {
+  align-self: flex-start;
+}
+.device-panel {
+  width: 100%;
+  max-width: 440px;
+  margin: auto;
+  transform: translateY(-24px);
+}
+.device-panel h1 {
+  font-size: 26px;
+  font-weight: 450;
+  letter-spacing: -0.9px;
+  margin: 0 0 14px;
+}
+.device-panel p {
+  font-size: 14px;
+  line-height: 1.5;
+  margin: 0 0 16px;
+}
+.device-entry {
+  display: flex;
+  gap: 8px;
+}
+.device-entry input {
+  flex: 1;
+  min-width: 0;
+  border: 1px solid #d5ddcf;
+  border-radius: 7px;
+  background: #fff;
+  padding: 8px 10px;
+  font-size: 15px;
+  letter-spacing: 1px;
+  text-transform: uppercase;
+}
+.device-entry input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.device-panel .device-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 24px;
+  letter-spacing: 3px;
+  text-align: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: #fff;
+  padding: 14px;
+}
+.device-note,
+.device-outcome {
+  color: var(--muted);
+}
+.device-problem {
+  color: #9a3b2f;
+}
+.device-actions {
+  display: flex;
+  gap: 8px;
+}
+.device-approve {
+  font-size: 12px;
+  font-weight: 500;
+  color: #fff;
+  background: var(--accent);
+  padding: 9px 16px;
+  border-radius: 7px;
+}
+.device-panel strong {
+  white-space: nowrap;
+}

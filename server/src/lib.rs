@@ -2,6 +2,7 @@ mod access;
 pub mod admin;
 mod auth;
 mod browse;
+mod device;
 mod error;
 mod http;
 mod retrieval;

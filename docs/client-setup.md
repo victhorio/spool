@@ -9,24 +9,28 @@ OpenCode installs the plugin from GitHub, pinned to a full commit hash, into its
 own package cache. The machine needs Bun and Git credentials that can read this
 private repository. A checkout is needed only to run the installer.
 
-1. For a new independent OpenCode store, have the archive operator provision a
-   source using [source add](ingestion.md#identity-and-credentials). Save its token
-   in `~/.config/spool/source.token`, mode 0600, outside tracked configuration.
-   For an existing installation, keep its token and checkpoints. Never copy
-   another store's token or source name: each independent store needs its own
-   credential and globally unique, stable name, even on the same machine.
-2. From an up-to-date checkout of a commit that is on GitHub, run:
+From an up-to-date checkout of a commit that is on GitHub, run:
 
-   ```sh
-   bun run install-plugin --url https://spool.example.com \
-     --token-file ~/.config/spool/source.token --source-alias work-laptop
-   ```
+```sh
+bun run install-plugin --url https://spool.example.com --source-alias work-laptop
+```
 
-   It writes one entry to `plugins` in the global `opencode.json`, preserving
-   other configuration, and replaces any earlier Spool entry, including one that
-   points at a checkout. Options already configured are kept unless a flag
-   overrides them; the retired `readerUrl` and `sweepIntervalMs` are dropped.
-   `--dry-run` prints the entry without writing it. The result looks like this:
+Without a token file (by default `~/.config/spool/source.token`), the
+installer logs the machine in. It prints the reader's `/device` address and a
+code. Open the address, log in through Cloudflare if asked, type the code, check
+that the page shows this machine's alias, and approve. The installer saves the
+new token, mode 0600, and continues; the config records `tokenFile` either way.
+If saving fails after approval, it prints the new source's ID so an operator
+can issue a replacement with `spool-server source rotate`. Each independent OpenCode store needs its own login and a
+globally unique, stable alias, even on the same machine; never copy another
+store's token. For an existing installation, keep its token file and
+checkpoints: the installer reuses them.
+
+It writes one entry to `plugins` in the global `opencode.json`, preserving
+other configuration, and replaces any earlier Spool entry, including one that
+points at a checkout. Options already configured are kept unless a flag
+overrides them; the retired `readerUrl` and `sweepIntervalMs` are dropped.
+`--dry-run` prints the entry without writing it. The result looks like this:
 
 ```json
 {

@@ -45,7 +45,7 @@ cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 bun install --frozen-lockfile
 bun run typecheck
-bun test plugin
+bun test plugin scripts
 bun run validate
 bun run retrieval:validate
 bun run web:validate

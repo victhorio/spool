@@ -544,6 +544,7 @@ async fn postgres_browse_contract() {
         api_contract(&client, &url, &pool).await;
         snapshot_consistency(&client, &url, &pool).await;
         limits(&client, &url, &pool).await;
+        device_login(&client, &url, &pool).await;
         read.close().await;
         error(
             client
@@ -995,4 +996,339 @@ async fn limits(client: &Client, url: &str, pool: &PgPool) {
     assert_eq!(tail["messages"].as_array().unwrap().len(), 5);
     assert_eq!(tail["messages"][0]["id"], "m200");
     assert_eq!(tail["next_cursor"], Value::Null);
+}
+
+async fn device_login(client: &Client, url: &str, pool: &PgPool) {
+    let machine = Client::new();
+    let post = |path: String, body: Value| {
+        let machine = machine.clone();
+        async move {
+            let response = machine.post(path).json(&body).send().await.unwrap();
+            let status = response.status();
+            (status, response.json::<Value>().await.unwrap())
+        }
+    };
+    let request = |alias: &str| post(format!("{url}/v1/device/code"), json!({"alias": alias}));
+    let collect = |code: &Value| {
+        post(
+            format!("{url}/v1/device/token"),
+            json!({"device_code": code}),
+        )
+    };
+    let decide = |code: &str, decision: &str| {
+        client
+            .post(format!("{url}/api/device/{code}/{decision}"))
+            .send()
+    };
+    let failed = |result: (StatusCode, Value), status: StatusCode, code: &str| {
+        assert_eq!(result.0, status, "{}", result.1);
+        assert_eq!(result.1, json!({"error": {"code": code}}));
+    };
+
+    // Malformed requests never create codes.
+    for body in [
+        json!({}),
+        json!({"alias": "Not-Valid"}),
+        json!({"alias": ""}),
+        json!({"alias": "a".repeat(33)}),
+        json!({"alias": "laptop", "extra": true}),
+        json!("laptop"),
+    ] {
+        failed(
+            post(format!("{url}/v1/device/code"), body).await,
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        );
+    }
+    for body in [
+        json!({}),
+        json!({"device_code": "short"}),
+        json!({"device_code": 1}),
+    ] {
+        failed(
+            post(format!("{url}/v1/device/token"), body).await,
+            StatusCode::BAD_REQUEST,
+            "malformed_request",
+        );
+    }
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM device_logins")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+
+    // Approval, collection once, and a working token for the requested alias.
+    let response = machine
+        .post(format!("{url}/v1/device/code"))
+        .json(&json!({"alias": "device-laptop"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    let code: Value = response.json().await.unwrap();
+    assert_eq!(code["expires_in"], 600);
+    assert_eq!(code["interval"], 5);
+    let user_code = code["user_code"].as_str().unwrap().to_owned();
+    assert!(
+        user_code.len() == 9
+            && user_code.as_bytes()[4] == b'-'
+            && user_code
+                .bytes()
+                .all(|byte| byte == b'-' || b"BCDFGHJKLMNPQRSTVWXZ".contains(&byte)),
+        "{user_code}"
+    );
+    let device_code = &code["device_code"];
+    assert_eq!(
+        URL_SAFE_NO_PAD
+            .decode(device_code.as_str().unwrap())
+            .unwrap()
+            .len(),
+        32
+    );
+    let stored: Vec<u8> = sqlx::query_scalar("SELECT device_code_hash FROM device_logins")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_ne!(
+        stored,
+        URL_SAFE_NO_PAD
+            .decode(device_code.as_str().unwrap())
+            .unwrap()
+    );
+    failed(
+        collect(device_code).await,
+        StatusCode::BAD_REQUEST,
+        "authorization_pending",
+    );
+    let typed = user_code.replace('-', "").to_lowercase();
+    let shown = get(client, &format!("{url}/api/device/{typed}")).await;
+    assert_eq!(shown["user_code"], user_code);
+    assert_eq!(shown["alias"], "device-laptop");
+    assert_eq!(shown["status"], "pending");
+    let approved = decide(&user_code, "approve").await.unwrap();
+    privacy(&approved);
+    assert_eq!(approved.status(), StatusCode::OK);
+    assert_eq!(
+        approved.json::<Value>().await.unwrap()["status"],
+        "approved"
+    );
+    error(
+        decide(&user_code, "approve").await.unwrap(),
+        StatusCode::CONFLICT,
+        "device_not_pending",
+    )
+    .await;
+    failed(
+        request("device-laptop").await,
+        StatusCode::CONFLICT,
+        "login_pending",
+    );
+    // Two concurrent collections: exactly one receives the token.
+    let (first, second) = tokio::join!(collect(device_code), collect(device_code));
+    let (status, credential, other) = if first.0 == StatusCode::OK {
+        (first.0, first.1, second)
+    } else {
+        (second.0, second.1, first)
+    };
+    failed(other, StatusCode::BAD_REQUEST, "invalid_device_code");
+    assert_eq!(status, StatusCode::OK, "{credential}");
+    assert_eq!(credential["alias"], "device-laptop");
+    let token = credential["token"].as_str().unwrap();
+    assert!(token.starts_with(&format!(
+        "spool_v1.{}.",
+        credential["source_id"].as_str().unwrap()
+    )));
+    let inventory = machine
+        .get(format!("{url}/v1/sync/sessions"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inventory.status(), StatusCode::OK);
+    let (label, alias): (String, Option<String>) =
+        sqlx::query_as("SELECT label, alias FROM sources WHERE id = $1")
+            .bind(
+                credential["source_id"]
+                    .as_str()
+                    .unwrap()
+                    .parse::<Uuid>()
+                    .unwrap(),
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (label.as_str(), alias.as_deref()),
+        ("device-laptop", Some("device-laptop"))
+    );
+    failed(
+        collect(device_code).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_device_code",
+    );
+    assert_eq!(
+        get(client, &format!("{url}/api/device/{user_code}")).await["status"],
+        "completed"
+    );
+    failed(
+        request("device-laptop").await,
+        StatusCode::CONFLICT,
+        "source_alias_conflict",
+    );
+
+    // Denial, expiry, and unknown or malformed codes.
+    let (_, denied) = request("device-denied").await;
+    let denied_code = denied["user_code"].as_str().unwrap();
+    assert_eq!(
+        decide(denied_code, "deny").await.unwrap().status(),
+        StatusCode::OK
+    );
+    failed(
+        collect(&denied["device_code"]).await,
+        StatusCode::BAD_REQUEST,
+        "access_denied",
+    );
+    let (_, expired) = request("device-expired").await;
+    sqlx::query("UPDATE device_logins SET expires_at = now() - interval '1 second' WHERE alias = 'device-expired'")
+        .execute(pool)
+        .await
+        .unwrap();
+    failed(
+        collect(&expired["device_code"]).await,
+        StatusCode::BAD_REQUEST,
+        "expired_token",
+    );
+    let expired_code = expired["user_code"].as_str().unwrap();
+    assert_eq!(
+        get(client, &format!("{url}/api/device/{expired_code}")).await["status"],
+        "expired"
+    );
+    error(
+        decide(expired_code, "approve").await.unwrap(),
+        StatusCode::CONFLICT,
+        "device_not_pending",
+    )
+    .await;
+    failed(
+        collect(&json!(URL_SAFE_NO_PAD.encode([9; 32]))).await,
+        StatusCode::BAD_REQUEST,
+        "invalid_device_code",
+    );
+    for (code, status, name) in [
+        ("BBBB-BBBB", StatusCode::NOT_FOUND, "not_found"),
+        ("AAAA-AAAA", StatusCode::BAD_REQUEST, "malformed_request"),
+        ("BBBB", StatusCode::BAD_REQUEST, "malformed_request"),
+    ] {
+        error(
+            client
+                .get(format!("{url}/api/device/{code}"))
+                .send()
+                .await
+                .unwrap(),
+            status,
+            name,
+        )
+        .await;
+    }
+
+    // An approval can be withdrawn until collection, and restarts the deadline.
+    let (_, withdrawn) = request("device-withdrawn").await;
+    let withdrawn_code = withdrawn["user_code"].as_str().unwrap();
+    sqlx::query("UPDATE device_logins SET expires_at = now() + interval '5 seconds' WHERE alias = 'device-withdrawn'")
+        .execute(pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        decide(withdrawn_code, "approve").await.unwrap().status(),
+        StatusCode::OK
+    );
+    let remaining: f64 = sqlx::query_scalar(
+        "SELECT extract(epoch FROM expires_at - now())::float8 FROM device_logins WHERE alias = 'device-withdrawn'",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    assert!(remaining > 590.0, "{remaining}");
+    let denied = decide(withdrawn_code, "deny").await.unwrap();
+    assert_eq!(denied.json::<Value>().await.unwrap()["status"], "denied");
+    failed(
+        collect(&withdrawn["device_code"]).await,
+        StatusCode::BAD_REQUEST,
+        "access_denied",
+    );
+    // A denied login no longer holds its alias.
+    assert_eq!(request("device-withdrawn").await.0, StatusCode::OK);
+
+    // If another source takes the alias before collection, collection fails.
+    let (_, raced) = request("device-raced").await;
+    sqlx::query("INSERT INTO sources (id, label, token_hash, alias) VALUES ($1, 'other', $2, 'device-raced')")
+        .bind(Uuid::new_v4())
+        .bind(vec![0u8; 32])
+        .execute(pool)
+        .await
+        .unwrap();
+    let raced_code = raced["user_code"].as_str().unwrap();
+    assert_eq!(
+        decide(raced_code, "approve").await.unwrap().status(),
+        StatusCode::OK
+    );
+    failed(
+        collect(&raced["device_code"]).await,
+        StatusCode::CONFLICT,
+        "source_alias_conflict",
+    );
+
+    // Only a few codes may wait for approval at once.
+    sqlx::query("DELETE FROM device_logins")
+        .execute(pool)
+        .await
+        .unwrap();
+    for index in 0..5 {
+        assert_eq!(
+            request(&format!("device-pending-{index}")).await.0,
+            StatusCode::OK
+        );
+    }
+    failed(
+        request("device-pending-5").await,
+        StatusCode::TOO_MANY_REQUESTS,
+        "too_many_pending",
+    );
+
+    // Approval is part of the reader: it needs Access and a same-origin request.
+    sqlx::query("DELETE FROM device_logins")
+        .execute(pool)
+        .await
+        .unwrap();
+    let (_, guarded) = request("device-guarded").await;
+    let guarded_code = guarded["user_code"].as_str().unwrap();
+    error(
+        machine
+            .post(format!("{url}/api/device/{guarded_code}/approve"))
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::FORBIDDEN,
+        "forbidden",
+    )
+    .await;
+    error(
+        client
+            .post(format!("{url}/api/device/{guarded_code}/approve"))
+            .header("sec-fetch-site", "cross-site")
+            .send()
+            .await
+            .unwrap(),
+        StatusCode::FORBIDDEN,
+        "forbidden_origin",
+    )
+    .await;
+    assert_eq!(
+        get(client, &format!("{url}/api/device/{guarded_code}")).await["status"],
+        "pending"
+    );
+    let page = client.get(format!("{url}/device")).send().await.unwrap();
+    assert_eq!(page.status(), StatusCode::OK);
+    assert!(page.text().await.unwrap().contains("Browse test"));
 }

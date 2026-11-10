@@ -11,7 +11,7 @@ import {
 } from "./api"
 import { Message } from "./messages"
 
-function SpoolMark({ large = false }: { large?: boolean }) {
+export function SpoolMark({ large = false }: { large?: boolean }) {
   return (
     <svg
       className={large ? "spool-mark large" : "spool-mark"}

@@ -42,6 +42,13 @@ the cloud deployment. Treat that copy as private data, not a synthetic fixture;
 it is a point-in-time snapshot and does not follow new uploads automatically.
 Never expose PostgreSQL outside loopback for this.
 
+## Device approval
+
+`/device` approves or denies a machine's [device login](ingestion.md#device-login).
+It is the only reader page that writes, using the service's normal database pool
+rather than the read-only one. Its API is subject to the same Access and
+same-origin checks as the rest of `/api/*`.
+
 ## Read API
 
 Metadata and message documents remain opaque JSON, including unknown fields and

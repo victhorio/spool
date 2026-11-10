@@ -7,7 +7,7 @@ export async function command(args: string[], cwd = process.cwd(), env?: Record<
     new Response(child.stderr).text(),
     child.exited,
   ])
-  if (code !== 0) throw new Error(`${args[0]} exited ${code}: ${stderr || stdout}`)
+  if (code !== 0) throw new Error(`${args[0]} exited ${code}:\n${stdout}\n${stderr}`)
   return stdout.trim()
 }
 

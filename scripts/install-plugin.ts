@@ -2,13 +2,15 @@
 // plugin, pinned by full hash. OpenCode installs the package itself, so the checkout
 // is not used after this. Usage: bun run install-plugin [--url …] [--token-file …]
 // [--source-alias …] [--dry-run]. Existing Spool options are kept unless overridden.
+// Without a token file, it logs the machine in: the owner approves it in the reader.
 
 import { existsSync } from "node:fs"
-import { mkdir, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
+import { mkdir, open, readFile, realpath, rename, rm, stat, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { parseArgs } from "node:util"
+import { DeviceLoginError, deviceLogin } from "./device-login"
 
 type Entry = string | { package: string; options?: Record<string, unknown> }
 
@@ -72,7 +74,7 @@ const configured = previous.find((item) => typeof item === "object")
 const kept: Record<string, unknown> = typeof configured === "object" ? { ...configured.options } : {}
 delete kept.readerUrl // Retired: retrieval uses url.
 delete kept.sweepIntervalMs // Retired: capture is event-driven.
-const options = {
+const options: Record<string, unknown> = {
   ...kept,
   ...(flags.url ? { url: flags.url } : {}),
   ...(flags["token-file"] ? { tokenFile: flags["token-file"] } : {}),
@@ -88,10 +90,42 @@ const url = URL.parse(options.url)
 if (!url || !(url.protocol === "https:" || (url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)))) {
   fail(`url must be an HTTPS URL: ${options.url}`)
 }
-if (typeof options.tokenFile !== "string") fail("no Spool token file configured; pass --token-file")
+options.tokenFile ??= "~/.config/spool/source.token"
+if (typeof options.tokenFile !== "string") fail("tokenFile must be a path")
 const tokenFile = expand(options.tokenFile)
 if (!path.isAbsolute(tokenFile)) fail(`token file must be an absolute path or start with ~/: ${options.tokenFile}`)
-if (!existsSync(tokenFile)) fail(`token file ${options.tokenFile} does not exist`)
+if (!existsSync(tokenFile)) {
+  const alias = options.sourceAlias
+  if (typeof alias !== "string") fail(`${options.tokenFile} does not exist; pass --source-alias to log this machine in`)
+  if (flags["dry-run"]) console.log(`Would log in as ${alias} and save the token to ${options.tokenFile}`)
+  else await login(url.toString().replace(/\/$/, ""), alias, tokenFile)
+}
+
+// The token file is created before the login, so the token, which the server
+// issues only once, has somewhere to go; "wx" never replaces an existing file.
+async function login(server: string, alias: string, file: string): Promise<void> {
+  await mkdir(path.dirname(file), { recursive: true, mode: 0o700 })
+  const handle = await open(file, "wx", 0o600)
+  let token: string
+  try {
+    token = await deviceLogin(server, alias, (code, page) => {
+      console.log(`To log in this machine as ${alias}, open\n\n  ${page}\n\nand enter code ${code}. Waiting for approval…`)
+    })
+  } catch (error) {
+    await handle.close()
+    await rm(file, { force: true })
+    if (error instanceof DeviceLoginError) fail(`login failed: ${error.message}`)
+    throw error
+  }
+  try {
+    await handle.writeFile(`${token}\n`)
+    await handle.close()
+  } catch (error) {
+    const source = token.split(".")[1]
+    fail(`logged in as source ${source}, but could not save the token (${error}); have an operator run \`spool-server source rotate ${source}\` and save the new token to ${options.tokenFile}`)
+  }
+  console.log(`Logged in; saved the token to ${options.tokenFile}`)
+}
 
 const entry = { package: spec, options }
 const index = plugins.findIndex((item) => previous.includes(item))

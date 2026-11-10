@@ -20,7 +20,7 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
-    access::Access, auth, browse, error::ApiError, retrieval, snapshot, snapshot::MAX_BODY,
+    access::Access, auth, browse, device, error::ApiError, retrieval, snapshot, snapshot::MAX_BODY,
 };
 
 #[derive(Clone)]
@@ -53,12 +53,15 @@ pub fn router(pool: PgPool, read: PgPool, reader: Option<Reader>) -> anyhow::Res
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
         })
         .with_state(App {
-            pool,
+            pool: pool.clone(),
             uploads: Arc::new(Semaphore::new(2)),
         })
-        .merge(agent);
+        .merge(agent)
+        .merge(device::machine_routes().with_state(pool.clone()));
     Ok(match reader {
-        Some(reader) => app.fallback_service(browse::router(read, reader.access, reader.assets)?),
+        Some(reader) => {
+            app.fallback_service(browse::router(pool, read, reader.access, reader.assets)?)
+        }
         None => app.fallback(not_found),
     })
 }
@@ -128,12 +131,7 @@ async fn assign_source_alias(
         return Err(ApiError::malformed());
     }
     let SourceAlias { alias } = serde_json::from_slice(&body).map_err(|_| ApiError::malformed())?;
-    if !(1..=32).contains(&alias.len())
-        || !alias.as_bytes()[0].is_ascii_lowercase()
-        || !alias
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-    {
+    if !device::valid_alias(&alias) {
         return Err(ApiError::malformed());
     }
     let assigned = sqlx::query("UPDATE sources SET alias = $2 WHERE id = $1 AND alias IS NULL")

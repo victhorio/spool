@@ -22,9 +22,10 @@ even on the same computer. Do not copy one source token into two independent
 stores: CAS fences stale observations but cannot choose which divergent store
 should win. Imported IDs in different sources remain separate archives.
 
-With `DATABASE_URL` set, run `spool-server source add --label <label>` after
-migrations. It returns JSON with `source_id` and a `token` of the form
-`spool_v1.<uuid>.<base64url-secret>`. Only the SHA-256 secret digest is stored.
+A machine normally gets a source through [device login](#device-login). An
+operator can also run `spool-server source add --label <label>` with
+`DATABASE_URL` set, after migrations. Either way the token has the form
+`spool_v1.<uuid>.<base64url-secret>`, and only the SHA-256 secret digest is stored.
 Send `Authorization: Bearer <token>` over HTTPS. A token permits its own sync
 operations and reading the whole archive through [agent retrieval](retrieval.md),
 not administrative writes.
@@ -32,7 +33,43 @@ not administrative writes.
 `source rotate <uuid>` issues a new token without changing identity; update its
 local token file and reload all plugin instances. `source revoke <uuid>` blocks
 future authentication. Already authenticated in-flight work may finish.
-Admin commands require direct database access; there is no enrollment endpoint.
+Admin commands require direct database access.
+
+### Device login
+
+A machine without a token asks for one, and the owner approves it in the reader
+(after RFC 8628). `bun run install-plugin` does this when the token file is
+missing; see [client setup](client-setup.md).
+
+1. `POST /v1/device/code` with `{ "alias": "work-laptop" }` (unauthenticated)
+   returns `{ device_code, user_code, expires_in, interval }`. The alias must not
+   belong to a source (409 `source_alias_conflict`) or to another login still
+   waiting or approved (409 `login_pending`). At most five codes may await
+   approval at once (429 `too_many_pending`), and each waits up to 600 seconds.
+   Responses carrying device codes or tokens are `Cache-Control: no-store`.
+2. The owner opens `/device` in the reader, behind Cloudflare Access, and types
+   the code from the machine's terminal. The page never takes a code from its
+   link, so a link sent by someone else cannot pose as the owner's own request.
+   It shows the alias and how long ago the code was requested; the owner
+   approves or denies. An approval can still be withdrawn by denying until the
+   machine collects its token. The reader API is `GET /api/device/{code}` and
+   `POST /api/device/{code}/approve` or `/deny`, returning the login's `status`
+   (`pending`, `approved`, `denied`, `expired` or `completed`). Codes are
+   case-insensitive and the hyphen is optional. An unknown code is 404
+   `not_found`; deciding one that is no longer open is 409 `device_not_pending`.
+3. The machine polls `POST /v1/device/token` with `{ "device_code": … }` every
+   `interval` seconds. Until approval it receives 400 `authorization_pending`;
+   then 200 `{ source_id, alias, token }` exactly once. That creates the source,
+   with the alias as its label and name. Afterwards, like an unknown code, it is
+   `invalid_device_code`. A denied one is `access_denied`, even after its
+   deadline; an unapproved or uncollected one past its deadline is
+   `expired_token`. Approval restarts the
+   600-second deadline for collection. If another source took the alias
+   meanwhile, collection returns 409 `source_alias_conflict`.
+
+Only a hash of the device code is stored, and the token exists only in the
+collection response. User codes have eight letters from a 20-letter alphabet
+without vowels. Requesting a code deletes records older than a day.
 
 The optional plugin `sourceAlias` registers a short, globally unique name for
 that credential's source. Names are stable and reserved even after revocation;

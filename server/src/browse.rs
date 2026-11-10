@@ -23,13 +23,15 @@ use uuid::Uuid;
 
 use crate::{
     access::{self, Access},
+    device,
     error::ApiError,
     snapshot::valid_id,
 };
 
-/// The web reader and its API. Every request requires a Cloudflare Access assertion;
-/// `read` should be a read-only pool.
+/// The web reader and its API. Every request requires a Cloudflare Access assertion.
+/// Archive reads use `read`, which should be a read-only pool; device approval writes.
 pub(crate) fn router(
+    write: PgPool,
     read: PgPool,
     access: Access,
     assets: impl AsRef<FilePath>,
@@ -48,7 +50,10 @@ pub(crate) fn router(
     Ok(Router::new()
         .route("/api/sessions", get(sessions))
         .route("/api/sources/{source}/sessions/{session}", get(session))
+        .with_state(read)
+        .merge(device::reader_routes().with_state(write))
         .route_service("/", ServeFile::new(index.clone()))
+        .route_service("/device", ServeFile::new(index.clone()))
         .route_service("/index.html", ServeFile::new(index))
         .nest_service("/assets", ServeDir::new(assets.join("assets")))
         .route_service("/favicon.ico", ServeFile::new(assets.join("favicon.ico")))
@@ -56,7 +61,6 @@ pub(crate) fn router(
         .method_not_allowed_fallback(|| async {
             ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
         })
-        .with_state(read)
         .layer(middleware::from_fn_with_state(access, access::require))
         .layer(middleware::from_fn(privacy)))
 }
