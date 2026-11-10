@@ -14,8 +14,9 @@ in `server/migrations/`. `plugin/` contains the TypeScript OpenCode plugin,
 which owns capture, repository discovery, OpenCode text projections, uploads and
 tool/skill registration. Keep OpenCode-specific parsing in the plugin and `web/`
 reader rather than the database. One public service hosts everything: `/v1/*`
-is for machines with source tokens, `/healthz` is open, and every other route is
-the web reader behind Cloudflare Access, which the server verifies itself.
+is for machines with source tokens, `/healthz` needs no credentials, and every
+other route is the web reader behind Cloudflare Access, which the server
+verifies itself.
 
 [Client setup](docs/client-setup.md) covers capture and retrieval on each machine.
 [Ingestion](docs/ingestion.md) describes the consistency and wire contract.

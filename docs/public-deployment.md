@@ -11,9 +11,11 @@ through Cloudflare. The service runs migrations at startup.
   SSL/TLS mode is **Full**; Railway does not support Full (Strict) here.
 - Bot Fight Mode stays off so machine uploads are not challenged. Session
   uploads (at most 64 MiB) fit Cloudflare's request limit.
-- Railway also serves a `*.up.railway.app` domain and the custom domain's CNAME
-  target. Neither passes through Access, which is why the server verifies Access
-  assertions itself. Remove the generated domain once no client uses it.
+- The service has no generated `*.up.railway.app` domain. Railway's edge still
+  serves `spool.example.com` to anyone who connects to it directly, bypassing
+  Cloudflare, which is why the server verifies Access assertions itself.
+- Railway's health check calls `/healthz` at the origin, where it needs no
+  credentials. Through Cloudflare it is behind Access like other non-`/v1` paths.
 
 ## Cloudflare Access
 
@@ -40,6 +42,11 @@ Without both variables, the service runs ingestion and the agent API only.
   archive.
 - `curl https://spool.example.com/v1/sync/sessions` returns 401 `unauthorized`
   (the bypass reaches Spool, which requires a token).
-- `curl https://<railway-domain>/` returns 403 `forbidden`: the origin rejects
-  requests without an Access assertion.
+- Connecting to Railway directly returns 403 `forbidden`, because the origin
+  rejects requests without an Access assertion:
+
+  ```sh
+  IP=$(dig +short <the custom domain's CNAME target> | tail -1)
+  curl --resolve spool.example.com:443:$IP https://spool.example.com/api/sessions
+  ```
 - An agent's `spool_find_sessions` call succeeds from a configured machine.
