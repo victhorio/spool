@@ -7,6 +7,9 @@ use spool_server::{admin, connect, connect_read, migrate, router};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// The reader URL the plugin sends, so results link to it.
+const READER: &str = "https://spool.example";
+
 struct Harness {
     pool: PgPool,
     client: Client,
@@ -74,6 +77,7 @@ impl Harness {
             .client
             .post(format!("{}/v1/agent/{operation}", self.url))
             .bearer_auth(&self.token)
+            .header("spool-reader-url", READER)
             .json(&input)
             .send()
             .await
@@ -99,6 +103,7 @@ impl Harness {
             .client
             .post(format!("{}/v1/agent/{operation}", self.url))
             .bearer_auth(&self.token)
+            .header("spool-reader-url", READER)
             .json(&input)
             .send()
             .await
@@ -646,7 +651,7 @@ async fn exercise(h: &Harness, a: &admin::Credential, b: &admin::Credential) {
             .as_array()
             .unwrap()
             .iter()
-            .find(|item| item["session"] == reference)
+            .find(|item| item["session"] == "eligible-passages")
             .unwrap();
         for passage in [&search["matches"][0], &found["match"]] {
             assert!(passage["excerpt"].as_str().unwrap().contains(expected));
@@ -708,7 +713,12 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
     let legacy_reference = format!("{}/{id}", a.source_id);
     for reference in [&id, &qualified, &legacy_reference] {
         let read = h.call("read", json!({"session":reference,"start":2})).await;
-        assert_eq!(read["session"], qualified);
+        assert_eq!(read["session"], id, "unique IDs need no qualifier");
+        assert_eq!(read["url"], format!("{READER}/sessions/{id}"));
+        assert_eq!(
+            read["messages"][0]["url"],
+            format!("{READER}/sessions/{id}#2")
+        );
         assert_eq!(
             read["messages"][0]["text"],
             "compactneedle later correction"
@@ -720,7 +730,11 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
             json!({"session":id,"query":"compactneedle","limit":1}),
         )
         .await;
-    assert_eq!(searched["session"], qualified);
+    assert_eq!(searched["session"], id);
+    assert_eq!(
+        searched["matches"][0]["url"],
+        format!("{READER}/sessions/{id}#3")
+    );
     assert_eq!(searched["matches"][0]["index"], 3);
     let reading = h
         .call("read", json!({"session":id,"start":1,"end":3}))
@@ -808,6 +822,10 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
         .await;
     assert_eq!(continuation["session"], qualified);
     assert_eq!(
+        continuation["url"],
+        format!("{READER}/sessions/{qualified}")
+    );
+    assert_eq!(
         continuation["messages"][0]["offset_bytes"],
         reading["messages"][0]["text"].as_str().unwrap().len()
     );
@@ -819,6 +837,14 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
     assert_eq!(h.call("find", json!({"cursor":v2_find})).await, found);
     let first = &found["sessions"][0];
     let first_reference = first["session"].as_str().unwrap();
+    assert_eq!(first["url"], format!("{READER}/sessions/{first_reference}"));
+    assert_eq!(
+        first["match"]["url"],
+        format!(
+            "{READER}/sessions/{first_reference}#{}",
+            first["match"]["index"]
+        )
+    );
     let first_source = if first_reference.starts_with("work-m5/") {
         a.source_id
     } else {
@@ -866,6 +892,22 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
             .await;
         }
     }
+    for reader in [
+        "ftp://spool.example",
+        "https://spool.example/",
+        "spool.example",
+    ] {
+        let response = h
+            .client
+            .post(format!("{}/v1/agent/read", h.url))
+            .bearer_auth(&h.token)
+            .header("spool-reader-url", reader)
+            .json(&json!({"session":qualified}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{reader}");
+    }
     h.error(
         "read",
         json!({"session":"ses_missing_compact"}),
@@ -912,8 +954,12 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
     )
     .await;
     assert_eq!(
-        h.call("read", json!({"session":"alias-edge"})).await["session"],
-        format!("{}/alias-edge", c.source_id)
+        h.call(
+            "read",
+            json!({"session":format!("{}/alias-edge", c.source_id)})
+        )
+        .await["session"],
+        "alias-edge"
     );
     let alias = "a".repeat(32);
     assert_eq!(
@@ -969,6 +1015,10 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
                 .all(|value| value.as_str().unwrap().ends_with(&escaped))
         );
         assert_eq!(error["error"]["more"], true);
-        h.call("read", json!({"session":candidates[0]})).await;
+        let read = h.call("read", json!({"session":candidates[0]})).await;
+        assert!(
+            read["url"].as_str().unwrap().ends_with(&"%01".repeat(512)),
+            "references are percent-encoded in links"
+        );
     }
 }

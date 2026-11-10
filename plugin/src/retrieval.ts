@@ -6,7 +6,7 @@ type Route = "find" | "search" | "read"
 const maximumBytes = 24 * 1024
 const errorResult = (code: string, current_revision?: string) => JSON.stringify({ error: { code, ...(current_revision ? { current_revision } : {}) } })
 const string = { type: "string", minLength: 1 }
-const session = { ...string, maxLength: 549, description: "Session reference from find, such as `work-m5/ses_…`. A bare OpenCode ID works when it's unique." }
+const session = { ...string, maxLength: 2048, description: "Session reference or Spool link, such as `ses_…`, `work-m5/ses_…` or `https://…/sessions/ses_…#12`. A link's `#12` is message 12." }
 const revision = { ...string, maxLength: 19, pattern: "^[0-9]+$" }
 const query = { ...string, maxLength: 512, description: "Case-insensitive words, all of which must occur in one title or message; at most 16." }
 const boolean = { type: "boolean" }
@@ -14,19 +14,19 @@ const integer = (maximum?: number, defaultValue?: number) => ({ type: "integer",
 const definitions = {
   find: {
     name: "find_sessions",
-    description: "Find archived sessions across all machines and repositories. Returns each session's reference, title and a matching snippet.",
+    description: "Find archived sessions across all machines and repositories. Returns each session's reference, link, title and a matching snippet.",
     properties: { query, repository: { ...string, description: "Limit to one repository, as a normalized host/path such as `github.com/owner/repo`." }, include_tools: boolean, limit: integer(50, 10) },
     required: [],
   },
   search: {
     name: "search_messages",
-    description: "Find messages in one session that match `query`. Returns message indexes and excerpts. Searches user and assistant text; `include_tools` adds tool calls and output. Reasoning and attachments are never searched.",
+    description: "Find messages in one session that match `query`. Returns message indexes, links and excerpts. Searches user and assistant text; `include_tools` adds tool calls and output. Reasoning and attachments are never searched.",
     properties: { session, query, revision, include_tools: boolean, limit: integer(100, 20) },
     required: ["session", "query"],
   },
   read: {
     name: "read_messages",
-    description: "Read messages `start` through `end` (1-based, inclusive) from one session; `start` defaults to 1 and `end` to `start`. Returns their full text, including tool calls and output, with a `next_cursor` while more of the range remains.",
+    description: "Read messages `start` through `end` (1-based, inclusive) from one session; `start` defaults to a link's message, or 1, and `end` to `start`. Returns their full text and links, including tool calls and output, with a `next_cursor` while more of the range remains.",
     properties: { session, revision, start: integer(100_000, 1), end: integer(100_000) },
     required: ["session"],
   },
@@ -71,13 +71,28 @@ export function validInput(route: Route, value: unknown): value is Record<string
 }
 
 type Archive = Pick<Config, "url" | "token">
+type Json = Record<string, any>
 
-export async function requestReader(archive: Archive, route: Route, input: unknown, signal?: AbortSignal): Promise<string> {
+/** A reader link given as `session` becomes its reference; for reads, its `#index` is the default message. */
+function fromLink(archive: Archive, route: Route, input: unknown): unknown {
+  const value = input as Json
+  if (typeof value?.session !== "string" || !value.session.startsWith(`${archive.url}/sessions/`)) return input
+  try {
+    const url = new URL(value.session)
+    const session = url.pathname.slice("/sessions/".length).split("/").map(decodeURIComponent).join("/")
+    const index = /^#([1-9][0-9]*)$/.exec(url.hash)?.[1]
+    return { ...value, session, ...(route === "read" && index && !("start" in value) && !("end" in value) ? { start: Number(index) } : {}) }
+  } catch { return input }
+}
+
+export async function requestReader(archive: Archive, route: Route, given: unknown, signal?: AbortSignal): Promise<string> {
+  const input = fromLink(archive, route, given)
   if (!validInput(route, input)) return errorResult("malformed_request")
   try {
     const response = await fetch(`${archive.url}/v1/agent/${route}`, {
       method: "POST", body: JSON.stringify(input), redirect: "error", credentials: "omit",
-      headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${archive.token}` },
+      // The reader URL lets results link to the reader within the server's page budget.
+      headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${archive.token}`, "spool-reader-url": archive.url },
       signal: AbortSignal.any([AbortSignal.timeout(5_000), ...(signal ? [signal] : [])]),
     })
     if (!response.body) return errorResult("reader_unavailable")

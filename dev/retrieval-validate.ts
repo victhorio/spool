@@ -13,7 +13,7 @@ interface Source { source_id: string; token: string; alias?: string }
 interface FoundSession { session: string; repository: string | null; revision: string; captured_at: string; message_count: number; match: { index: number; excerpt: string; read_cursor: string } | null }
 interface Found { sessions: FoundSession[]; coverage: { total_sessions: number; indexed_sessions: number; unassigned_repository_sessions: number }; next_cursor: string | null }
 interface Searched { session: string; revision: string; matches: { index: number; excerpt: string; read_cursor: string }[]; next_cursor: string | null }
-interface Read { session: string; revision: string; messages: { index: number; id: string; role: string; text: string; offset_bytes: number; total_bytes: number }[]; next_cursor: string | null }
+interface Read { session: string; url: string; revision: string; messages: { index: number; id: string; role: string; text: string; offset_bytes: number; total_bytes: number; url: string }[]; next_cursor: string | null }
 
 const repository = path.resolve(import.meta.dir, "..")
 const root = await mkdtemp(path.join(tmpdir(), "retrieval-validate-"))
@@ -145,9 +145,9 @@ try {
   assert.ok(skills.data.some((skill) => skill.id === "spool.searching-sessions"))
   const broad = await findAll(first, { query: needle, limit: 1 })
   const reference = `${primary.alias}/${sharedID}`
-  const worktreeReference = `${primary.alias}/${worktreeID}`
+  const worktreeReference = worktreeID
   const secondReference = `${secondary.alias}/${sharedID}`
-  assert.deepEqual(broad.sessions.map((item) => item.session).sort(), [reference, worktreeReference, secondReference, `${primary.alias}/${unassignedID}`].sort())
+  assert.deepEqual(broad.sessions.map((item) => item.session).sort(), [reference, worktreeReference, secondReference, unassignedID].sort())
   assert.equal(broad.coverage.indexed_sessions, broad.coverage.total_sessions)
   assert.ok(broad.coverage.unassigned_repository_sessions >= 1)
   const filtered = await findAll(first, { query: needle.toUpperCase(), repository: repoKey, limit: 1 })
@@ -168,7 +168,10 @@ try {
   assert.deepEqual(ambiguous.error.candidates.sort(), [reference, secondReference].sort())
   assert.equal(ambiguous.error.more, false)
   assert.equal((await tool<Read>(first, "read", { session: secondReference })).session, secondReference)
-  pass("registered tools resolve unique native IDs and legacy UUID references; ambiguous copies offer alias-qualified choices without merging stores")
+  const linked = await tool<Read>(first, "read", { session: `${runtime.url}/sessions/${reference}#2` })
+  assert.equal(linked.url, `${runtime.url}/sessions/${reference}`)
+  assert.deepEqual(linked.messages.map((message) => [message.index, message.url]), [[2, `${runtime.url}/sessions/${reference}#2`]])
+  pass("registered tools resolve unique native IDs, legacy UUID references and reader links; ambiguous copies offer alias-qualified choices without merging stores")
 
   const search = await tool<Searched>(first, "search", { session: reference, revision: found.revision, query: needle, limit: 1 })
   assert.deepEqual(search.matches.map((match) => match.index), [2])

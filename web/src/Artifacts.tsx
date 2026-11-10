@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react"
 import { ModeSwitch, PanelIcon, SpoolMark } from "./App"
-import { ArchiveError, read, readText, type Artifact, type ArtifactPage } from "./api"
+import { ArchiveError, read, readText, sessionHref, type Artifact, type ArtifactPage } from "./api"
 import { Markdown } from "./messages"
 
 const kinds: Record<string, string> = {
@@ -295,10 +295,10 @@ function ArtifactView({ id }: { id: string }) {
             <span>{artifact.source_label}</span>
             <span aria-hidden="true">·</span>
             <time dateTime={artifact.updated_at}>{dateTime.format(Date.parse(artifact.updated_at))}</time>
-            {artifact.session_id && (
+            {artifact.session && (
               <>
                 <span aria-hidden="true">·</span>
-                <a href={`/#${new URLSearchParams({ source: artifact.source_id, session: artifact.session_id })}`}>
+                <a href={sessionHref(artifact.session)}>
                   Open session
                 </a>
               </>

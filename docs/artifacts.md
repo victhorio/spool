@@ -67,8 +67,9 @@ All routes need a source token, like the rest of `/v1`. Artifact objects are
 `{id, title, type, revision, size, source, source_id, source_label, session,
 session_id, created_at, updated_at}`. `type` is the media type and `size` is in
 bytes. `revision` is a decimal string. `source` is the creating source's alias,
-or its UUID if it has none. `session` is the creating session as a reference for
-the retrieval tools (`alias/native-ID` or `source-UUID/native-ID`), and
+or its UUID if it has none. `session` is the creating session as a
+[reference](retrieval.md#session-references) for the retrieval tools and reader
+links (the native ID, qualified only when another source has the same ID), and
 `session_id` its native ID; both are null when no session was given. The plugin
 passes agents only `{id, title, type, revision, size, source, session,
 created_at, updated_at}` plus the artifact's reader `url` and its raw `content_url`.

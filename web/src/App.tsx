@@ -1,8 +1,10 @@
-import { memo, useEffect, useMemo, useRef, useState } from "react"
+import { memo, useCallback, useEffect, useRef, useState } from "react"
 import {
   ArchiveError,
+  linkedSession,
   object,
   read,
+  sessionHref,
   sessionKey,
   sessionPath,
   type Session,
@@ -78,11 +80,10 @@ function title(session: Session): string {
     : "Untitled session"
 }
 
-function selectedKey(): string | null {
-  const params = new URLSearchParams(window.location.hash.slice(1))
-  const source = params.get("source"),
-    session = params.get("session")
-  return source && session ? `${source}/${session}` : null
+/** The one-based message index in the URL fragment, such as `#12`. */
+function linkedIndex(): number | null {
+  const index = /^#([1-9][0-9]{0,5})$/.exec(window.location.hash)?.[1]
+  return index ? Number(index) : null
 }
 
 function errorText(error: unknown): string {
@@ -101,7 +102,9 @@ export function App() {
   const [listAttempt, setListAttempt] = useState(0)
   const [query, setQuery] = useState("")
   const [source, setSource] = useState("")
-  const [selection, setSelection] = useState(selectedKey)
+  const [selection, setSelection] = useState(linkedSession)
+  // The source and session the selected reference resolved to, once loaded.
+  const [opened, setOpened] = useState<{ reference: string; key: string }>()
   const [mobile, setMobile] = useState(() => window.matchMedia("(max-width: 720px)").matches)
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth > 720)
   const search = useRef<HTMLInputElement>(null)
@@ -170,7 +173,7 @@ export function App() {
       setMobile(viewport.matches)
       setSidebarOpen(!viewport.matches)
     }
-    const onHashChange = () => setSelection(selectedKey())
+    const onPopState = () => setSelection(linkedSession())
     const onKeyDown = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault()
@@ -180,31 +183,32 @@ export function App() {
       if (event.key === "Escape" && window.innerWidth <= 720) setSidebarOpen(false)
     }
     viewport.addEventListener("change", onResize)
-    window.addEventListener("hashchange", onHashChange)
+    window.addEventListener("popstate", onPopState)
     window.addEventListener("keydown", onKeyDown)
     return () => {
       viewport.removeEventListener("change", onResize)
-      window.removeEventListener("hashchange", onHashChange)
+      window.removeEventListener("popstate", onPopState)
       window.removeEventListener("keydown", onKeyDown)
     }
   }, [])
 
-  const selected = sessions.find((session) => sessionKey(session) === selection)
-  const direct = useMemo(() => {
-    const params = new URLSearchParams(window.location.hash.slice(1))
-    const source_id = params.get("source"),
-      session_id = params.get("session")
-    return source_id && session_id ? { source_id, session_id } : null
-  }, [selection])
+  const selected =
+    opened?.reference === selection
+      ? sessions.find((session) => sessionKey(session) === opened.key)
+      : sessions.find((session) => session.session === selection)
 
   function select(session: Session) {
-    window.location.hash = new URLSearchParams({
-      source: session.source_id,
-      session: session.session_id,
-    }).toString()
-    setSelection(sessionKey(session))
+    window.history.pushState(null, "", sessionHref(session.session))
+    setSelection(session.session)
     if (window.innerWidth <= 720) setSidebarOpen(false)
   }
+
+  const open = useCallback((reference: string, transcript: Transcript) => {
+    setOpened({ reference, key: sessionKey(transcript) })
+    // Prefer the shortest reference, such as for links that name the source by UUID.
+    if (reference !== transcript.session)
+      window.history.replaceState(null, "", sessionHref(transcript.session) + window.location.hash)
+  }, [])
 
   return (
     <div className="app">
@@ -223,7 +227,17 @@ export function App() {
         hidden={!sidebarOpen}
       >
         <div className="brand-row">
-          <a className="brand" href="#" aria-label="Spool home">
+          <a
+            className="brand"
+            href="/"
+            aria-label="Spool home"
+            onClick={(event) => {
+              if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return
+              event.preventDefault()
+              window.history.pushState(null, "", "/")
+              setSelection(null)
+            }}
+          >
             <SpoolMark />
             <span>Spool</span>
           </a>
@@ -304,15 +318,20 @@ export function App() {
             </div>
           )}
           {sessions.map((session) => (
-            <button
-              className={`session-row ${sessionKey(session) === selection ? "selected" : ""}`}
+            <a
+              className={`session-row ${session === selected ? "selected" : ""}`}
               key={sessionKey(session)}
-              aria-current={sessionKey(session) === selection ? "page" : undefined}
-              onClick={() => select(session)}
+              href={sessionHref(session.session)}
+              aria-current={session === selected ? "page" : undefined}
+              onClick={(event) => {
+                if (event.metaKey || event.ctrlKey || event.shiftKey || event.button !== 0) return
+                event.preventDefault()
+                select(session)
+              }}
               title={`${title(session)}\n${session.source_label}`}
             >
               <span className="session-title">{title(session)}</span>
-            </button>
+            </a>
           ))}
           {nextCursor && !listError && (
             <button
@@ -356,8 +375,8 @@ export function App() {
           </span>
           <span className="read-only">Read only</span>
         </header>
-        {direct ? (
-          <Conversation key={selection} session={selected || direct} />
+        {selection ? (
+          <Conversation key={selection} reference={selection} onOpen={open} />
         ) : (
           <div className="empty-state">
             <SpoolMark large />
@@ -380,38 +399,67 @@ export function App() {
 }
 
 const Conversation = memo(function Conversation({
-  session,
+  reference,
+  onOpen,
 }: {
-  session: Pick<Session, "source_id" | "session_id">
+  reference: string
+  onOpen: (reference: string, transcript: Transcript) => void
 }) {
   const [transcript, setTranscript] = useState<Transcript>()
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState("")
+  const [candidates, setCandidates] = useState<string[]>()
   const [attempt, setAttempt] = useState(0)
   const [loadingMore, setLoadingMore] = useState(false)
   const [stale, setStale] = useState(false)
+  const [target, setTarget] = useState(linkedIndex)
+  const reached = useRef<number | null>(null)
   const lifetime = useRef<AbortController | null>(null)
   const column = useRef<HTMLDivElement>(null)
-  const path = sessionPath(session)
+  const path = sessionPath(reference)
 
   useEffect(() => {
     const controller = new AbortController()
     lifetime.current = controller
     setTranscript(undefined)
     setError("")
+    setCandidates(undefined)
     setStale(false)
     setLoading(true)
+    reached.current = null
     column.current?.scrollTo(0, 0)
     void read<Transcript>(path, controller.signal)
-      .then(setTranscript)
+      .then((transcript) => {
+        setTranscript(transcript)
+        onOpen(reference, transcript)
+      })
       .catch((error: unknown) => {
-        if (!controller.signal.aborted) setError(errorText(error))
+        if (controller.signal.aborted) return
+        setError(errorText(error))
+        if (error instanceof ArchiveError) setCandidates(error.candidates)
       })
       .finally(() => {
         if (!controller.signal.aborted) setLoading(false)
       })
     return () => controller.abort()
   }, [path, attempt])
+
+  useEffect(() => {
+    const onHashChange = () => setTarget(linkedIndex())
+    window.addEventListener("hashchange", onHashChange)
+    return () => window.removeEventListener("hashchange", onHashChange)
+  }, [])
+
+  // A linked message may be past the first page: keep loading until it is shown.
+  useEffect(() => {
+    if (!transcript || !target || reached.current === target) return
+    if (target > transcript.messages.length) {
+      if (transcript.next_cursor && !error) void more()
+      return
+    }
+    reached.current = target
+    document.getElementById(String(target))?.scrollIntoView({ block: "start" })
+  }, [transcript, target, error])
 
   async function more() {
     if (!transcript?.next_cursor || loadingMore || stale) return
@@ -464,6 +512,8 @@ const Conversation = memo(function Conversation({
               {transcript.messages.map((message, index) => (
                 <Message
                   key={message.id}
+                  index={index + 1}
+                  linked={index + 1 === target}
                   message={message}
                   previous={transcript.messages[index - 1]}
                 />
@@ -477,15 +527,25 @@ const Conversation = memo(function Conversation({
         {error && (
           <div className="error-state" role="alert">
             <p>{error}</p>
-            <button
-              className="subtle-button"
-              onClick={() => {
-                if (transcript && !stale) void more()
-                else setAttempt((attempt) => attempt + 1)
-              }}
-            >
-              {stale ? "Reload session" : "Try again"}
-            </button>
+            {candidates ? (
+              <ul className="candidates">
+                {candidates.map((candidate) => (
+                  <li key={candidate}>
+                    <a href={sessionHref(candidate) + window.location.hash}>{candidate}</a>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <button
+                className="subtle-button"
+                onClick={() => {
+                  if (transcript && !stale) void more()
+                  else setAttempt((attempt) => attempt + 1)
+                }}
+              >
+                {stale ? "Reload session" : "Try again"}
+              </button>
+            )}
           </div>
         )}
         {transcript?.next_cursor && !stale && !error && (

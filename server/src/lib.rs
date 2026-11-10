@@ -6,6 +6,7 @@ mod browse;
 mod device;
 mod error;
 mod http;
+mod reference;
 mod retrieval;
 mod snapshot;
 

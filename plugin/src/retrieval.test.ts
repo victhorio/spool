@@ -110,6 +110,30 @@ test("archive transport is bounded, token-authenticated, redirect-free and hides
   } finally { await server.stop(true) }
 })
 
+test("reader links work as session input, and requests name the reader for result links", async () => {
+  let received: unknown
+  let reader: string | null | undefined
+  const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    received = await request.json()
+    reader = request.headers.get("spool-reader-url")
+    return Response.json({ session: "ses_a", messages: [], next_cursor: null })
+  } })
+  try {
+    const archive = { url: server.url.origin, token: "synthetic" }
+    const call = async (route: "search" | "read", input: unknown) => JSON.parse(await requestReader(archive, route, input))
+    const linked = `${archive.url}/sessions/work-m5/ses%20b#12`
+    await call("read", { session: linked })
+    expect(received).toEqual({ session: "work-m5/ses b", start: 12 })
+    expect(reader).toBe(archive.url)
+    await call("read", { session: linked, start: 1, end: 2 })
+    expect(received).toEqual({ session: "work-m5/ses b", start: 1, end: 2 })
+    await call("search", { session: `${archive.url}/sessions/ses_a#4`, query: "x" })
+    expect(received).toEqual({ session: "ses_a", query: "x" })
+    // Links to other hosts are not references.
+    expect((await call("read", { session: "https://elsewhere.example/sessions/ses_a" })).error.code).toBe("malformed_request")
+  } finally { await server.stop(true) }
+})
+
 test("ambiguous sessions forward only bounded qualified candidates and a boolean more flag", async () => {
   const candidates = ["laptop/ses_fixture", "00000000-0000-0000-0000-000000000001/ses_fixture"]
   let error: Record<string, unknown> = { code: "ambiguous_session", candidates, more: false, detail: "SECRET_ERROR_BODY" }

@@ -7,7 +7,7 @@ const sources: Record<string, { source_id: string; token: string }> = JSON.parse
 )
 const artifacts = path.resolve(import.meta.dirname, "../../.amp/in/artifacts")
 const selection = (source: string, session: string) =>
-  `/#${new URLSearchParams({ source: sources[source]!.source_id, session })}`
+  `/sessions/${sources[source]!.source_id}/${session}`
 
 test("browse, filter independent stores, deep-link and return with browser history", async ({
   page,
@@ -17,10 +17,10 @@ test("browse, filter independent stores, deep-link and return with browser histo
   await expect(page.getByRole("heading", { name: "A little less lost." })).toBeVisible()
   await page.screenshot({ path: path.join(artifacts, "spool-home.png") })
   await page.getByRole("textbox", { name: "Find a session" }).fill("quieter")
-  await expect(page.getByRole("navigation", { name: "Sessions" }).getByRole("button")).toHaveCount(
+  await expect(page.getByRole("navigation", { name: "Sessions" }).getByRole("link")).toHaveCount(
     1,
   )
-  await page.getByRole("button", { name: "A quieter session browser" }).click()
+  await page.getByRole("link", { name: "A quieter session browser" }).click()
   await expect(
     page.getByRole("heading", { name: "A quieter session browser", exact: true }),
   ).toBeVisible()
@@ -28,8 +28,8 @@ test("browse, filter independent stores, deep-link and return with browser histo
   await page
     .getByRole("combobox", { name: "Filter by source" })
     .selectOption(sources.laptop!.source_id)
-  await expect(page.getByRole("button", { name: "A quieter session browser" })).toHaveCount(0)
-  await page.getByRole("button", { name: "The same ID, another machine" }).click()
+  await expect(page.getByRole("link", { name: "A quieter session browser" })).toHaveCount(0)
+  await page.getByRole("link", { name: "The same ID, another machine" }).click()
   await expect(
     page.getByText("This conversation belongs to the laptop source.", { exact: true }),
   ).toBeVisible()
@@ -41,6 +41,40 @@ test("browse, filter independent stores, deep-link and return with browser histo
   await expect(
     page.getByRole("heading", { name: "A quieter session browser", exact: true }),
   ).toBeVisible()
+})
+
+test("links name sessions by ID, open a linked message and accept older link forms", async ({
+  page,
+}) => {
+  // A qualified link to a unique ID is shortened once loaded.
+  await page.goto(`${selection("laptop", "ses_paged")}#150`)
+  await expect(page).toHaveURL("/sessions/ses_paged#150")
+  const linked = page.locator('[id="150"]')
+  await expect(linked).toBeInViewport()
+  await expect(linked).toContainText("Conversation entry 149")
+  await expect(linked).toContainClass("linked")
+  await expect(page.locator("[data-message-id]")).toHaveCount(200)
+  await page.screenshot({ path: path.join(artifacts, "spool-linked-message.png") })
+  await page.locator('[id="148"]').hover()
+  await page.getByRole("link", { name: "Link to message 148" }).click()
+  await expect(page).toHaveURL("/sessions/ses_paged#148")
+  await expect(page.locator('[id="148"]')).toContainClass("linked")
+  await expect(linked).not.toContainClass("linked")
+
+  // An ID that several sources archived asks which one.
+  await page.goto("/sessions/ses_reader")
+  await expect(page.getByRole("alert")).toContainText("More than one source")
+  await page.getByRole("link", { name: `${sources.laptop!.source_id}/ses_reader` }).click()
+  await expect(
+    page.getByText("This conversation belongs to the laptop source.", { exact: true }),
+  ).toBeVisible()
+
+  // Earlier links named the source by UUID in the fragment.
+  await page.goto(
+    `/#${new URLSearchParams({ source: sources.laptop!.source_id, session: "ses_paged" })}`,
+  )
+  await expect(page).toHaveURL("/sessions/ses_paged")
+  await expect(page.getByRole("heading", { name: /^A long conversation/ })).toBeVisible()
 })
 
 test("read Markdown, reasoning, tool inputs/results and compaction with the keyboard", async ({
@@ -149,7 +183,7 @@ test("empty, missing, no matches and failed transport have distinct recoverable 
   await page.getByRole("textbox", { name: "Find a session" }).fill("there-is-no-such-session")
   await expect(page.getByText("No matching sessions.")).toBeVisible()
   await page.getByRole("button", { name: "Clear filters" }).click()
-  await expect(page.getByRole("button", { name: "An empty session" })).toBeVisible()
+  await expect(page.getByRole("link", { name: "An empty session" })).toBeVisible()
   await page.goto(selection("studio", "missing"))
   await expect(page.getByRole("alert")).toContainText("This session is no longer in the archive.")
   let fail = true
@@ -204,7 +238,7 @@ test("mobile navigation, keyboard search and long output do not overflow the vie
   await expect(page.getByRole("complementary", { name: "Session archive" })).toBeHidden()
   await page.getByRole("button", { name: "Show sessions" }).click()
   await expect(page.locator("main")).toHaveAttribute("inert", "")
-  await page.getByRole("button", { name: "A quieter session browser" }).click()
+  await page.getByRole("link", { name: "A quieter session browser" }).click()
   await expect(page.getByRole("complementary", { name: "Session archive" })).toBeHidden()
   await expect(
     page.getByRole("heading", { name: "A quieter session browser", exact: true }),
@@ -268,7 +302,7 @@ test("malformed opaque documents stay inspectable without breaking other session
   expect(response.status()).toBe(201)
   await page.goto("/")
   await expect(page.getByText("7 sessions", { exact: true })).toBeVisible()
-  await page.getByRole("button", { name: "Untitled session" }).click()
+  await page.getByRole("link", { name: "Untitled session" }).click()
   await expect(page.getByRole("heading", { name: "Untitled session", exact: true })).toBeVisible()
   await page.locator('[data-message-id="malformed-user"] summary').click()
   await expect(page.getByText("not-a-message-text", { exact: false })).toBeVisible()
@@ -277,7 +311,7 @@ test("malformed opaque documents stay inspectable without breaking other session
   await page.locator('[data-message-id="future-shell-output"] summary').click()
   await expect(page.getByText('"preserved": "future shape"', { exact: false })).toBeVisible()
   await page.screenshot({ path: path.join(artifacts, "spool-raw-document.png") })
-  await page.getByRole("button", { name: "A quieter session browser" }).click()
+  await page.getByRole("link", { name: "A quieter session browser" }).click()
   await expect(page.getByRole("heading", { name: "Keep the conversation in focus" })).toBeVisible()
   expect(errors).toEqual([])
 })

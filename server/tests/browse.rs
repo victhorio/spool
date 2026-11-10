@@ -259,6 +259,8 @@ async fn access_assertions_and_origin_guards() {
     for (path, content_type) in [
         ("/", "text/html"),
         ("/index.html", "text/html"),
+        ("/sessions/ses_link", "text/html"),
+        ("/sessions/work-m5/ses_link", "text/html"),
         ("/assets/test.js", "text/javascript"),
     ] {
         let response = client.get(format!("{url}{path}")).send().await.unwrap();
@@ -724,8 +726,18 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
     for row in rows {
         assert_eq!(
             row.as_object().unwrap().len(),
-            6,
+            7,
             "only contract fields; no token_hash or message payloads"
+        );
+        let session_id = row["session_id"].as_str().unwrap();
+        assert_eq!(
+            row["session"],
+            if session_id == "same" {
+                format!("{}/same", row["source_id"].as_str().unwrap())
+            } else {
+                session_id.to_owned()
+            },
+            "references are qualified only when another source has the same ID"
         );
         assert_eq!(row["revision"], "1");
         DateTime::parse_from_rfc3339(row["received_at"].as_str().unwrap()).unwrap();
@@ -763,7 +775,7 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
         paged, *rows,
         "keyset must cross source boundaries without dropping colliding session IDs"
     );
-    let path = format!("{url}/api/sources/{A}/sessions/same");
+    let path = format!("{url}/api/sessions/{A}/same");
     let response = client
         .get(&path)
         .query(&[("limit", "1")])
@@ -775,7 +787,8 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
     assert!(text.contains(RAW_INFO));
     assert!(text.contains(RAW_MESSAGE));
     let first: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(first.as_object().unwrap().len(), 8);
+    assert_eq!(first.as_object().unwrap().len(), 9);
+    assert_eq!(first["session"], format!("{A}/same"));
     assert_eq!(first["info"]["unknown"]["text"], "x\0y");
     assert_eq!(first["messages"][0]["parts"][0]["text"], "a\0b");
     assert_eq!(first["messages"][0]["id"], "m3");
@@ -792,14 +805,41 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
     .await;
     assert_eq!(last["messages"][0]["id"], "m2");
     assert_eq!(last["next_cursor"], Value::Null);
-    let other = get(client, &format!("{url}/api/sources/{B}/sessions/same")).await;
+    let other = get(client, &format!("{url}/api/sessions/{B}/same")).await;
     assert_eq!(other["info"]["source"], B.to_string());
     assert_eq!(other["messages"], json!([]));
     assert_eq!(other["next_cursor"], Value::Null);
+    let bare = get(client, &format!("{url}/api/sessions/aaa")).await;
+    assert_eq!(
+        (&bare["source_id"], &bare["session"]),
+        (&json!(A), &json!("aaa"))
+    );
+    let ambiguous = client
+        .get(format!("{url}/api/sessions/same"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ambiguous.status(), StatusCode::CONFLICT);
+    assert_eq!(
+        ambiguous.json::<Value>().await.unwrap(),
+        json!({"error":{"code":"ambiguous_session","candidates":[format!("{A}/same"),format!("{B}/same")],"more":false}})
+    );
+    sqlx::query("UPDATE sources SET alias = 'machine-b' WHERE id = $1")
+        .bind(B)
+        .execute(pool)
+        .await
+        .unwrap();
+    let aliased = get(client, &format!("{url}/api/sessions/machine-b/same")).await;
+    assert_eq!(aliased["session"], "machine-b/same");
+    sqlx::query("UPDATE sources SET alias = NULL WHERE id = $1")
+        .bind(B)
+        .execute(pool)
+        .await
+        .unwrap();
     for id in ["purged", "missing"] {
         error(
             client
-                .get(format!("{url}/api/sources/{A}/sessions/{id}"))
+                .get(format!("{url}/api/sessions/{A}/{id}"))
                 .send()
                 .await
                 .unwrap(),
@@ -809,8 +849,8 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
         .await;
     }
     for endpoint in [
-        format!("{url}/api/sources/{B}/sessions/same"),
-        format!("{url}/api/sources/{A}/sessions/zzz"),
+        format!("{url}/api/sessions/{B}/same"),
+        format!("{url}/api/sessions/{A}/zzz"),
         format!("{url}/api/sessions"),
     ] {
         error(
@@ -887,7 +927,7 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
     .await;
     error(
         client
-            .get(format!("{url}/api/sources/not-a-uuid/sessions/same"))
+            .get(format!("{url}/api/sessions/Not_An_Alias/same"))
             .send()
             .await
             .unwrap(),
@@ -929,9 +969,7 @@ async fn snapshot_consistency(client: &Client, url: &str, pool: &PgPool) {
         .execute(&mut *writer)
         .await
         .unwrap();
-    let request = client
-        .get(format!("{url}/api/sources/{A}/sessions/same"))
-        .send();
+    let request = client.get(format!("{url}/api/sessions/{A}/same")).send();
     let request = tokio::spawn(async move { request.await.unwrap() });
     // Stop the transcript between its metadata and message queries, then atomically
     // replace both. The reader must retain the pre-commit snapshot for both pieces.
@@ -957,7 +995,7 @@ async fn snapshot_consistency(client: &Client, url: &str, pool: &PgPool) {
         serde_json::from_str::<Value>(RAW_INFO).unwrap()
     );
     assert_eq!(before["messages"][0]["id"], "m3");
-    let after = get(client, &format!("{url}/api/sources/{A}/sessions/same")).await;
+    let after = get(client, &format!("{url}/api/sessions/{A}/same")).await;
     assert_eq!(after["revision"], "3");
     assert_eq!(after["info"]["generation"], 3);
     assert_eq!(after["messages"][0]["generation"], 3);
@@ -983,7 +1021,7 @@ async fn limits(client: &Client, url: &str, pool: &PgPool) {
     let max = get(client, &format!("{url}/api/sessions?limit=500")).await;
     assert_eq!(max["sessions"].as_array().unwrap().len(), 209);
     assert_eq!(max["next_cursor"], Value::Null);
-    let path = format!("{url}/api/sources/{B}/sessions/limit_000");
+    let path = format!("{url}/api/sessions/{B}/limit_000");
     let messages = get(client, &path).await;
     assert_eq!(messages["messages"].as_array().unwrap().len(), 100);
     assert!(messages["next_cursor"].is_string());
@@ -1389,7 +1427,10 @@ async fn artifacts(client: &Client, url: &str, pool: &PgPool) {
     assert_eq!(plan["type"], "text/markdown");
     assert_eq!(plan["revision"], "1");
     assert_eq!(plan["source"], "artifact-box");
-    assert_eq!(plan["session"], "artifact-box/ses_planner");
+    assert_eq!(
+        plan["session"], "ses_planner",
+        "no other source has this ID"
+    );
     assert_eq!(plan["session_id"], "ses_planner");
 
     // Requests that must not create anything.

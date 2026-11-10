@@ -1,6 +1,7 @@
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State, rejection::JsonRejection},
+    http::HeaderMap,
     routing::post,
 };
 use chrono::{DateTime, Utc};
@@ -10,7 +11,11 @@ use serde_json::{Value, json};
 use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
-use crate::{error::ApiError, snapshot::valid_id};
+use crate::{
+    error::ApiError,
+    reference::{self, Reference},
+    snapshot::valid_id,
+};
 
 mod cursor;
 use cursor::{Cursor, FindKey};
@@ -189,16 +194,10 @@ struct FindRow {
     activity: i64,
     message_count: i64,
     score: i32,
+    shared: bool,
     hit_position: Option<i32>,
     hit_offset: Option<i64>,
     hit_excerpt: Option<String>,
-}
-
-fn reference(source: Uuid, alias: Option<&str>, session: &str) -> String {
-    match alias {
-        Some(alias) => format!("{alias}/{session}"),
-        None => format!("{source}/{session}"),
-    }
 }
 
 fn read_cursor(source: Uuid, session: String, revision: i64, index: i32, offset: i64) -> String {
@@ -213,15 +212,47 @@ fn read_cursor(source: Uuid, session: String, revision: i64, index: i32, offset:
     .encode()
 }
 
+/// The reader's public URL, which the plugin sends so results can link to it.
+struct ReaderUrl(Option<String>);
+
+impl ReaderUrl {
+    fn from_headers(headers: &HeaderMap) -> Result<Self, ApiError> {
+        headers
+            .get("spool-reader-url")
+            .map(|value| {
+                value
+                    .to_str()
+                    .ok()
+                    .filter(|url| {
+                        url.len() <= 256
+                            && (url.starts_with("https://") || url.starts_with("http://"))
+                            && !url.ends_with('/')
+                    })
+                    .map(str::to_owned)
+                    .ok_or_else(ApiError::malformed)
+            })
+            .transpose()
+            .map(Self)
+    }
+
+    fn link(&self, reference: &str, index: Option<i32>) -> Option<String> {
+        self.0
+            .as_deref()
+            .map(|reader| reference::link(reader, reference, index))
+    }
+}
+
 fn fits(value: &Value) -> bool {
     serde_json::to_vec(value).expect("serializable page").len() <= PAGE_BYTES
 }
 
 async fn find(
     State(pool): State<PgPool>,
+    headers: HeaderMap,
     request: Result<Json<Request<Find>>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(request) = request.map_err(|_| ApiError::malformed())?;
+    let reader = ReaderUrl::from_headers(&headers)?;
     let (query, after) = match request {
         Request::Initial(query) => (query, None),
         Request::Continuation(value) => match Cursor::decode(&value.cursor)? {
@@ -242,12 +273,14 @@ async fn find(
     {
         return Err(ApiError::malformed());
     }
-    let mut sql = QueryBuilder::new(
+    let mut sql = QueryBuilder::new(concat!(
         "WITH ranked AS (SELECT s.source_id, sources.alias, s.session_id, s.revision, \
          s.retrieval_title AS title, s.repository, s.captured_at, s.activity, \
          (SELECT count(*) FROM messages m WHERE m.source_id = s.source_id \
           AND m.session_id = s.session_id) AS message_count, ",
-    );
+        reference::shared!("s"),
+        " AS shared, "
+    ));
     if terms.is_empty() {
         sql.push("0");
     } else {
@@ -307,10 +340,15 @@ async fn find(
             response["next_cursor"] = json!(last_cursor);
             break;
         }
-        let session = reference(row.source_id, row.alias.as_deref(), &row.session_id);
+        let session = reference::format(
+            row.source_id,
+            row.alias.as_deref(),
+            &row.session_id,
+            row.shared,
+        );
         let matched = match (row.hit_position, row.hit_offset, row.hit_excerpt) {
             (Some(position), Some(offset), Some(excerpt)) => json!({
-                "index": position + 1, "excerpt": excerpt,
+                "index": position + 1, "url": reader.link(&session, Some(position + 1)), "excerpt": excerpt,
                 "read_cursor": read_cursor(row.source_id, row.session_id.clone(), row.revision, position + 1, offset),
             }),
             _ => Value::Null,
@@ -326,7 +364,7 @@ async fn find(
         }
         .encode();
         response["sessions"].as_array_mut().unwrap().push(json!({
-            "session": session, "title": row.title.chars().take(512).collect::<String>(),
+            "session": session, "url": reader.link(&session, None), "title": row.title.chars().take(512).collect::<String>(),
             "repository": row.repository, "revision": row.revision.to_string(),
             "captured_at": row.captured_at, "message_count": row.message_count, "match": matched,
         }));
@@ -352,6 +390,18 @@ struct Session {
     captured_at: DateTime<Utc>,
     retrieval_title: Option<String>,
     message_count: i64,
+    shared: bool,
+}
+
+impl Session {
+    fn reference(&self) -> String {
+        reference::format(
+            self.source_id,
+            self.alias.as_deref(),
+            &self.session_id,
+            self.shared,
+        )
+    }
 }
 
 async fn session(
@@ -359,55 +409,23 @@ async fn session(
     input: &str,
     expected: Option<i64>,
 ) -> Result<Session, ApiError> {
-    let (qualifier, id) = match input.split_once('/') {
-        Some((source, id)) => (Some(source), id),
-        None => (None, input),
-    };
-    if !valid_id(id) {
-        return Err(ApiError::malformed());
-    }
-    let mut sql = QueryBuilder::new(
+    let reference = Reference::parse(input)?;
+    let mut sql = QueryBuilder::new(concat!(
         "SELECT s.source_id, s.session_id, sources.alias, s.revision, s.captured_at, s.retrieval_title, \
-         (SELECT count(*) FROM messages m WHERE m.source_id = s.source_id AND m.session_id = s.session_id) AS message_count \
-         FROM sessions s JOIN sources ON sources.id = s.source_id WHERE s.deleted_at IS NULL AND s.session_id = ",
-    );
-    sql.push_bind(id);
-    if let Some(qualifier) = qualifier {
-        if qualifier.len() == 36 {
-            let source = qualifier
-                .parse::<Uuid>()
-                .map_err(|_| ApiError::malformed())?;
-            sql.push(" AND s.source_id = ").push_bind(source);
-        } else if qualifier.len() <= 32
-            && qualifier.starts_with(|c: char| c.is_ascii_lowercase())
-            && qualifier
-                .bytes()
-                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-        {
-            sql.push(" AND sources.alias = ").push_bind(qualifier);
-        } else {
-            return Err(ApiError::malformed());
-        }
-    }
+         (SELECT count(*) FROM messages m WHERE m.source_id = s.source_id AND m.session_id = s.session_id) AS message_count, ",
+        reference::shared!("s"),
+        " AS shared FROM sessions s JOIN sources ON sources.id = s.source_id WHERE s.deleted_at IS NULL"
+    ));
+    reference.filter(&mut sql);
     sql.push(" ORDER BY s.source_id LIMIT 11");
-    let mut sessions: Vec<Session> = sql
+    let sessions: Vec<Session> = sql
         .build_query_as()
         .fetch_all(&mut **tx)
         .await
         .map_err(|error| ApiError::database("retrieval.session", error))?;
-    if sessions.len() > 1 {
-        return Err(ApiError::ambiguous_session(
-            sessions
-                .iter()
-                .take(10)
-                .map(|s| reference(s.source_id, s.alias.as_deref(), &s.session_id))
-                .collect(),
-            sessions.len() > 10,
-        ));
-    }
-    let session = sessions
-        .pop()
-        .ok_or_else(|| ApiError::new(axum::http::StatusCode::NOT_FOUND, "not_found"))?;
+    let session = reference::one(sessions, |s| {
+        (s.source_id, s.alias.as_deref(), s.session_id.as_str())
+    })?;
     if expected.is_some_and(|revision| revision != session.revision) {
         return Err(ApiError::session_changed(session.revision));
     }
@@ -441,9 +459,11 @@ struct Match {
 
 async fn search(
     State(pool): State<PgPool>,
+    headers: HeaderMap,
     request: Result<Json<Request<Search>>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(request) = request.map_err(|_| ApiError::malformed())?;
+    let reader = ReaderUrl::from_headers(&headers)?;
     let (query, expected, before) = match request {
         Request::Initial(query) => {
             let revision = revision(query.revision.as_deref())?;
@@ -476,7 +496,7 @@ async fn search(
     let limit = limit(query.limit, 20, 100)?;
     let mut tx = transaction(&pool).await?;
     let state = session(&mut tx, &query.session, expected).await?;
-    let reference = reference(state.source_id, state.alias.as_deref(), &state.session_id);
+    let reference = state.reference();
     let mut sql = QueryBuilder::new(
         "SELECT m.position, evidence.hit_offset, evidence.hit_excerpt FROM messages m",
     );
@@ -492,7 +512,7 @@ async fn search(
     sql.push(" ORDER BY m.position DESC LIMIT ")
         .push_bind(limit as i64 + 1);
     let mut response = json!({
-        "session": reference, "revision": state.revision.to_string(),
+        "session": reference, "url": reader.link(&reference, None), "revision": state.revision.to_string(),
         "captured_at": state.captured_at, "message_count": state.message_count,
         "matches": [], "next_cursor": null,
     });
@@ -518,7 +538,7 @@ async fn search(
         }
         .encode();
         response["matches"].as_array_mut().unwrap().push(json!({
-            "index": row.position + 1, "excerpt": row.hit_excerpt,
+            "index": row.position + 1, "url": reader.link(&reference, Some(row.position + 1)), "excerpt": row.hit_excerpt,
             "read_cursor": read_cursor(state.source_id, state.session_id.clone(), state.revision, row.position + 1, row.hit_offset),
         }));
         response["next_cursor"] = json!(cursor);
@@ -548,9 +568,11 @@ struct Chunk {
 
 async fn read(
     State(pool): State<PgPool>,
+    headers: HeaderMap,
     request: Result<Json<Request<Read>>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Json(request) = request.map_err(|_| ApiError::malformed())?;
+    let reader = ReaderUrl::from_headers(&headers)?;
     let (input, expected, start, end, offset) = match request {
         Request::Initial(query) => {
             let start = query.start.unwrap_or(1);
@@ -585,10 +607,10 @@ async fn read(
     }
     let mut tx = transaction(&pool).await?;
     let state = session(&mut tx, &input, expected).await?;
-    let reference = reference(state.source_id, state.alias.as_deref(), &state.session_id);
+    let reference = state.reference();
     let end = end.min(state.message_count as i32);
     let mut response = json!({
-        "session": reference, "revision": state.revision.to_string(),
+        "session": reference, "url": reader.link(&reference, None), "revision": state.revision.to_string(),
         "captured_at": state.captured_at, "message_count": state.message_count,
         "messages": [], "next_cursor": null,
     });
@@ -634,7 +656,8 @@ async fn read(
         let mut low = 0;
         let mut high = boundaries.len() - 1;
         let entry = json!({
-            "index": row.position + 1, "id": row.message_id, "role": role,
+            "index": row.position + 1, "url": reader.link(&reference, Some(row.position + 1)),
+            "id": row.message_id, "role": role,
             "text": "", "offset_bytes": offset, "total_bytes": total,
         });
         response["messages"].as_array_mut().unwrap().push(entry);

@@ -172,6 +172,8 @@ kbd {
   font-size: 13px;
   line-height: 19px;
   color: #4b5748;
+  text-decoration: none;
+  min-width: 0;
 }
 .session-row:hover {
   background: #e9eee4;
@@ -546,6 +548,39 @@ pre code {
 .session-event .disclosure {
   font-size: 11px;
 }
+.message,
+.session-event {
+  position: relative;
+  scroll-margin-top: 16px;
+}
+/* In the left gutter, shown on hover; copying it cites the message. */
+.message-link {
+  position: absolute;
+  top: 1px;
+  right: calc(100% + 10px);
+  font-size: 11px;
+  line-height: 19px;
+  color: var(--muted);
+  text-decoration: none;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+  opacity: 0;
+}
+.message:hover > .message-link,
+.session-event:hover > .message-link,
+.message-link:focus-visible,
+.linked > .message-link {
+  opacity: 1;
+}
+.linked {
+  border-radius: 6px;
+  box-shadow: 0 0 0 6px #e6eedf;
+  background: #e6eedf;
+}
+.candidates {
+  margin: 8px 0 0;
+  padding-left: 18px;
+}
 .attachment {
   display: flex;
   flex-wrap: wrap;
@@ -784,8 +819,6 @@ pre code {
   flex-direction: column;
   align-items: stretch;
   gap: 1px;
-  text-decoration: none;
-  min-width: 0;
 }
 .artifact-row .session-title {
   display: block;

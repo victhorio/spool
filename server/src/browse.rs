@@ -17,7 +17,7 @@ use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use sqlx::{FromRow, PgPool};
+use sqlx::{FromRow, PgPool, QueryBuilder};
 use tower_http::services::{ServeDir, ServeFile};
 use uuid::Uuid;
 
@@ -25,6 +25,7 @@ use crate::{
     access::{self, Access},
     artifacts, device,
     error::ApiError,
+    reference::{self, Reference},
     snapshot::valid_id,
 };
 
@@ -49,11 +50,12 @@ pub(crate) fn router(
     }
     Ok(Router::new()
         .route("/api/sessions", get(sessions))
-        .route("/api/sources/{source}/sessions/{session}", get(session))
+        .route("/api/sessions/{*reference}", get(session))
         .merge(artifacts::reader_routes())
         .with_state(read)
         .merge(device::reader_routes().with_state(write))
         .route_service("/", ServeFile::new(index.clone()))
+        .route_service("/sessions/{*reference}", ServeFile::new(index.clone()))
         .route_service("/device", ServeFile::new(index.clone()))
         .route_service("/artifacts", ServeFile::new(index.clone()))
         .route_service("/artifacts/{id}", ServeFile::new(index.clone()))
@@ -179,17 +181,27 @@ impl Cursor {
 struct SessionRow {
     source_id: Uuid,
     source_label: String,
+    alias: Option<String>,
     session_id: String,
+    shared: bool,
     revision: i64,
     info: String,
     received_at: DateTime<Utc>,
 }
+
+const SESSION_COLUMNS: &str = concat!(
+    "SELECT s.source_id, sources.label AS source_label, sources.alias, s.session_id, ",
+    reference::shared!("s"),
+    " AS shared, s.revision, s.info::text AS info, s.received_at \
+     FROM sessions s JOIN sources ON sources.id = s.source_id WHERE s.deleted_at IS NULL"
+);
 
 #[derive(Serialize)]
 struct Session {
     source_id: Uuid,
     source_label: String,
     session_id: String,
+    session: String,
     revision: String,
     info: Box<RawValue>,
     received_at: DateTime<Utc>,
@@ -203,6 +215,12 @@ fn raw(value: String) -> Result<Box<RawValue>, ApiError> {
 impl SessionRow {
     fn response(self) -> Result<Session, ApiError> {
         Ok(Session {
+            session: reference::format(
+                self.source_id,
+                self.alias.as_deref(),
+                &self.session_id,
+                self.shared,
+            ),
             source_id: self.source_id,
             source_label: self.source_label,
             session_id: self.session_id,
@@ -306,14 +324,10 @@ async fn sessions(
     let search = query.q.as_deref().unwrap_or("").trim().to_lowercase();
     // PostgreSQL JSON extraction rejects accepted escaped NUL even in unrelated
     // fields. Rank the raw metadata here, retaining only one page of candidates.
-    let mut stream = sqlx::query_as::<_, SessionRow>(
-        "SELECT s.source_id, sources.label AS source_label, s.session_id, s.revision, \
-         s.info::text AS info, s.received_at FROM sessions s \
-         JOIN sources ON sources.id = s.source_id \
-         WHERE s.deleted_at IS NULL AND ($1::uuid IS NULL OR s.source_id = $1)",
-    )
-    .bind(query.source)
-    .fetch(&pool);
+    let sql = format!("{SESSION_COLUMNS} AND ($1::uuid IS NULL OR s.source_id = $1)");
+    let mut stream = sqlx::query_as::<_, SessionRow>(&sql)
+        .bind(query.source)
+        .fetch(&pool);
     let mut recent = BTreeMap::new();
     while let Some(row) = stream
         .try_next()
@@ -379,26 +393,22 @@ struct MessageRow {
 
 async fn session(
     State(pool): State<PgPool>,
-    path: Result<Path<(Uuid, String)>, PathRejection>,
+    path: Result<Path<String>, PathRejection>,
     query: Result<Query<Page>, QueryRejection>,
 ) -> Result<Json<Transcript>, ApiError> {
-    let Path((source, session)) = path.map_err(|_| ApiError::malformed())?;
-    if !valid_id(&session) {
-        return Err(ApiError::malformed());
-    }
+    let Path(reference) = path.map_err(|_| ApiError::malformed())?;
+    let reference = Reference::parse(&reference)?;
     let Query(page) = query.map_err(|_| ApiError::malformed())?;
     let (page, limit) = page_limit(page, 100, 200)?;
     let cursor = page.cursor.as_deref().map(Cursor::decode).transpose()?;
-    let (expected_revision, position) = match cursor {
+    let after = match cursor {
         Some(Cursor::MessagesV1 {
             source_id,
             session_id,
             revision,
             position,
-        }) if source_id == source && session_id == session && revision > 0 && position >= 0 => {
-            (Some(revision), position)
-        }
-        None => (None, -1),
+        }) if revision > 0 && position >= 0 => Some((source_id, session_id, revision, position)),
+        None => None,
         _ => return Err(ApiError::malformed()),
     };
     let mut tx = pool
@@ -409,21 +419,30 @@ async fn session(
         .execute(&mut *tx)
         .await
         .map_err(|error| ApiError::database("browse.snapshot", error))?;
-    let row: SessionRow = sqlx::query_as(
-        "SELECT s.source_id, sources.label AS source_label, s.session_id, s.revision, \
-         s.info::text AS info, s.received_at FROM sessions s \
-         JOIN sources ON sources.id = s.source_id \
-         WHERE s.source_id = $1 AND s.session_id = $2 AND s.deleted_at IS NULL",
-    )
-    .bind(source)
-    .bind(&session)
-    .fetch_optional(&mut *tx)
-    .await
-    .map_err(|error| ApiError::database("browse.session", error))?
-    .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found"))?;
-    if expected_revision.is_some_and(|revision| revision != row.revision) {
-        return Err(ApiError::conflict(Some(row.revision)));
-    }
+    let mut sql = QueryBuilder::new(SESSION_COLUMNS);
+    reference.filter(&mut sql);
+    sql.push(" ORDER BY s.source_id LIMIT 11");
+    let rows: Vec<SessionRow> = sql
+        .build_query_as()
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(|error| ApiError::database("browse.session", error))?;
+    let row = reference::one(rows, |row| {
+        (row.source_id, row.alias.as_deref(), row.session_id.as_str())
+    })?;
+    let position = match after {
+        Some((source, session, revision, position))
+            if source == row.source_id && session == row.session_id =>
+        {
+            if revision != row.revision {
+                return Err(ApiError::conflict(Some(row.revision)));
+            }
+            position
+        }
+        Some(_) => return Err(ApiError::malformed()),
+        None => -1,
+    };
+    let (source, session) = (row.source_id, row.session_id.clone());
     let mut rows: Vec<MessageRow> = sqlx::query_as(
         "SELECT position, payload::text AS payload FROM messages \
          WHERE source_id = $1 AND session_id = $2 AND position > $3 ORDER BY position LIMIT $4",

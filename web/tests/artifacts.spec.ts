@@ -49,6 +49,7 @@ test("artifacts are listed, searched and shown by type, with links to their sess
   await page.goBack()
   await expect(page).toHaveURL(`/artifacts/${plan}`)
   await page.getByRole("link", { name: "Open session" }).click()
+  await expect(page).toHaveURL("/sessions/ses_paged")
   await expect(page.getByRole("heading", { name: /^A long conversation/ })).toBeVisible()
 })
 

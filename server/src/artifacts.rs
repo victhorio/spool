@@ -22,7 +22,7 @@ use sqlx::{FromRow, PgConnection, PgPool, Postgres, QueryBuilder};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::{auth, error::ApiError, retrieval::pattern, snapshot::valid_id};
+use crate::{auth, error::ApiError, reference, retrieval::pattern, snapshot::valid_id};
 
 pub(crate) const MAX_SIZE: usize = 32 << 20;
 /// The artifacts one source created may total at most this many bytes.
@@ -120,12 +120,17 @@ struct Row {
     source_alias: Option<String>,
     source_label: String,
     session_id: Option<String>,
+    session_shared: bool,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
 
-const COLUMNS: &str = "SELECT a.id, a.title, a.media_type, a.revision, a.size, a.source_id, \
-    s.alias AS source_alias, s.label AS source_label, a.session_id, a.created_at, a.updated_at";
+const COLUMNS: &str = concat!(
+    "SELECT a.id, a.title, a.media_type, a.revision, a.size, a.source_id, \
+     s.alias AS source_alias, s.label AS source_label, a.session_id, ",
+    reference::shared!("a"),
+    " AS session_shared, a.created_at, a.updated_at"
+);
 const FROM: &str = " FROM artifacts a JOIN sources s ON s.id = a.source_id";
 
 impl Row {
@@ -143,7 +148,9 @@ impl Row {
             "source": source,
             "source_id": self.source_id,
             "source_label": self.source_label,
-            "session": self.session_id.as_ref().map(|session| format!("{source}/{session}")),
+            "session": self.session_id.as_ref().map(|session| {
+                reference::format(self.source_id, self.source_alias.as_deref(), session, self.session_shared)
+            }),
             "session_id": self.session_id,
             "created_at": self.created_at,
             "updated_at": self.updated_at,

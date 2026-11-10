@@ -91,16 +91,6 @@ function Code({ value }: { value: unknown }) {
   )
 }
 
-function RawMessage({ message }: { message: Document }) {
-  return (
-    <article className="message context-message" data-message-id={message.id}>
-      <Disclosure label="Raw message">
-        <Code value={message} />
-      </Disclosure>
-    </article>
-  )
-}
-
 function Attachment({ value }: { value: unknown }) {
   if (!object(value))
     return (
@@ -227,51 +217,60 @@ function AssistantContent({ content, error }: { content: unknown[]; error?: unkn
   return <>{parts}</>
 }
 
-export const Message = memo(function Message({
-  message,
-  previous,
-}: {
-  message: Document
-  previous?: Document
-}) {
+type Body = { className: string; children: ReactNode }
+
+const raw = (message: Document): Body => ({
+  className: "message context-message",
+  children: (
+    <Disclosure label="Raw message">
+      <Code value={message} />
+    </Disclosure>
+  ),
+})
+
+function body(message: Document, previous?: Document): Body | null {
   if (message.type === "user") {
-    if (typeof message.text !== "string") return <RawMessage message={message} />
-    return (
-      <article className="message user-message" data-message-id={message.id}>
-        <div className="message-label">You</div>
-        <div className="user-bubble">
-          <div className="user-text">{message.text}</div>
-          {Array.isArray(message.files) &&
-            message.files.map((file: unknown, index) => <Attachment key={index} value={file} />)}
-        </div>
-      </article>
-    )
+    if (typeof message.text !== "string") return raw(message)
+    return {
+      className: "message user-message",
+      children: (
+        <>
+          <div className="message-label">You</div>
+          <div className="user-bubble">
+            <div className="user-text">{message.text}</div>
+            {Array.isArray(message.files) &&
+              message.files.map((file: unknown, index) => <Attachment key={index} value={file} />)}
+          </div>
+        </>
+      ),
+    }
   }
   if (message.type === "assistant") {
-    if (!Array.isArray(message.content)) return <RawMessage message={message} />
-    return (
-      <article
-        className={`message assistant-message ${previous?.type === "assistant" ? "continuation" : ""}`}
-        data-message-id={message.id}
-      >
-        {previous?.type !== "assistant" && (
-          <div className="message-label">
-            <span className="assistant-mark" aria-hidden="true">
-              ✳
-            </span>
-            Assistant
-            <span className="agent-label">
-              {typeof message.agent === "string" ? message.agent : ""}
-            </span>
-          </div>
-        )}
-        <AssistantContent content={message.content} error={message.error} />
-      </article>
-    )
+    if (!Array.isArray(message.content)) return raw(message)
+    return {
+      className: `message assistant-message ${previous?.type === "assistant" ? "continuation" : ""}`,
+      children: (
+        <>
+          {previous?.type !== "assistant" && (
+            <div className="message-label">
+              <span className="assistant-mark" aria-hidden="true">
+                ✳
+              </span>
+              Assistant
+              <span className="agent-label">
+                {typeof message.agent === "string" ? message.agent : ""}
+              </span>
+            </div>
+          )}
+          <AssistantContent content={message.content} error={message.error} />
+        </>
+      ),
+    }
   }
   if (message.type === "compaction")
-    return (
-      <article className="message context-message" data-message-id={message.id}>
+    return {
+      className: "message context-message",
+      children: (
         <Disclosure
           label={
             message.status === "failed"
@@ -288,12 +287,13 @@ export const Message = memo(function Message({
             <Code value={message.error ?? message} />
           )}
         </Disclosure>
-      </article>
-    )
+      ),
+    }
   if (message.type === "synthetic" || message.type === "system") {
-    if (typeof message.text !== "string") return <RawMessage message={message} />
-    return (
-      <article className="message context-message" data-message-id={message.id}>
+    if (typeof message.text !== "string") return raw(message)
+    return {
+      className: "message context-message",
+      children: (
         <Disclosure
           label={
             typeof message.description === "string"
@@ -305,13 +305,14 @@ export const Message = memo(function Message({
         >
           <Markdown text={message.text} />
         </Disclosure>
-      </article>
-    )
+      ),
+    }
   }
   if (message.type === "shell") {
-    if (typeof message.command !== "string") return <RawMessage message={message} />
-    return (
-      <article className="message context-message" data-message-id={message.id}>
+    if (typeof message.command !== "string") return raw(message)
+    return {
+      className: "message context-message",
+      children: (
         <Disclosure
           label={
             <>
@@ -332,8 +333,8 @@ export const Message = memo(function Message({
             />
           )}
         </Disclosure>
-      </article>
-    )
+      ),
+    }
   }
   if (message.type === "idle") return null
   const label =
@@ -348,11 +349,43 @@ export const Message = memo(function Message({
           : message.type === "skill"
             ? "Skill activated"
             : "Session event"
-  return (
-    <div className="session-event" data-message-id={message.id}>
+  return {
+    className: "session-event",
+    children: (
       <Disclosure label={label}>
         <Code value={message} />
       </Disclosure>
-    </div>
+    ),
+  }
+}
+
+/**
+ * One archived message, addressable as `#index` like the agent tools' message indexes.
+ * `linked` highlights the message the URL names.
+ */
+export const Message = memo(function Message({
+  index,
+  linked,
+  message,
+  previous,
+}: {
+  index: number
+  linked: boolean
+  message: Document
+  previous?: Document
+}) {
+  const content = body(message, previous)
+  if (!content) return null
+  return (
+    <article
+      id={String(index)}
+      className={`${content.className} ${linked ? "linked" : ""}`}
+      data-message-id={message.id}
+    >
+      <a className="message-link" href={`#${index}`} aria-label={`Link to message ${index}`}>
+        #{index}
+      </a>
+      {content.children}
+    </article>
   )
 })

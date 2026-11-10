@@ -2,8 +2,13 @@
 
 The reader shows recent session titles first, with a source filter and
 title/directory/source matching across the archive. It loads 50 sessions initially;
-older sessions load only on request. ⌘K focuses search. Selecting a session opens its conversation;
-the URL preserves both source and session identity. It does not send prompts or
+older sessions load only on request. ⌘K focuses search. Selecting a session opens its conversation
+at `/sessions/{reference}`, using the same [session reference](retrieval.md#session-references)
+as the agent tools, such as `/sessions/ses_…`. `#12` opens message 12, the tools' message index:
+the reader loads pages until that message is shown, then scrolls to and highlights it. Each
+message's number, shown on hover, links to it. A reference that names several sources lists them
+to choose from; a longer reference than needed is replaced by the shortest one once loaded.
+Earlier `/#source={uuid}&session={id}` links still open. It does not send prompts or
 change the archive. Reasoning, tools, system context and compaction summaries are
 expandable. Attachments are labeled, not fetched from external storage. Archived
 HTML is inert, remote images are not loaded, and Markdown is sanitized.
@@ -62,7 +67,8 @@ escaped NUL. Responses contain no source credential fields. Purged sessions are
 omitted/return 404; revoked sources' already archived sessions remain readable.
 
 - `GET /api/sessions?limit=50&cursor=…&q=…&source={source_uuid}` returns
-  `{sessions: [{source_id, source_label, session_id, revision, info, received_at}], sources: [{source_id, source_label}], next_cursor}`.
+  `{sessions: [{source_id, source_label, session_id, session, revision, info, received_at}], sources: [{source_id, source_label}], next_cursor}`.
+  `session` is the session's reference.
   The limit is 1–500. Inventory is ordered by exported update time in milliseconds,
   falling back to receipt time for missing/invalid dates; source UUID/session ID
   break ties descending. The optional `q` is a case-insensitive literal substring
@@ -76,9 +82,10 @@ omitted/return 404; revoked sources' already archived sessions remain readable.
   fields, so metadata interpretation stays in Rust rather than SQL. This avoids
   downloading the whole inventory into the browser, but still scans source
   metadata per request; there is no indexed search projection in this version.
-- `GET /api/sources/{source_uuid}/sessions/{session_id}?limit=100&cursor=…` returns
-  `{source_id, source_label, session_id, revision, info, received_at, messages, next_cursor}`.
-  The limit is 1–200. Messages follow archived order. Each page reads metadata and
+- `GET /api/sessions/{reference}?limit=100&cursor=…` returns
+  `{source_id, source_label, session_id, session, revision, info, received_at, messages, next_cursor}`.
+  A reference that matches several sources returns 409 `ambiguous_session` with
+  `candidates`, as for the agent tools. The limit is 1–200. Messages follow archived order. Each page reads metadata and
   messages in one repeatable-read transaction. Cursors bind source, session,
   revision and position; if an upload changes the revision between pages, the API
   returns 409 and the reader asks for a reload rather than mixing snapshots.
@@ -98,7 +105,7 @@ calls or real conversations. Containers and volumes are removed afterward; faile
 runs retain logs under `.local/web-validate-*`. Screenshots and traces go to
 `.amp/in/artifacts/`.
 
-The checks exercise source collisions, filtering, history/deep links, Markdown,
+The checks exercise source collisions, filtering, history/deep links, linked messages, Markdown,
 tools/reasoning/compaction, ordered pagination, revision conflicts, inert hostile
 content, recoverable failures, expired Access sessions and mobile navigation. Rust
 tests independently check Access assertions (signature, issuer, audience, expiry,

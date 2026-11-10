@@ -58,8 +58,12 @@ independent stores stay distinct: an ambiguous ID returns `ambiguous_session`
 with up to ten qualified `candidates` and a `more` flag, never an arbitrary copy.
 Use discovery to narrow the choice when the candidates are incomplete.
 
-Discovery, search and read return qualified references such as
-`work-m5/ses_…`. The optional plugin `sourceAlias` names its independent store,
+Discovery, search and read return the shortest reference: the bare native ID,
+or, when another live source archives the same ID, a qualified reference such as
+`work-m5/ses_…`. The reader's links use the same references, so a link and a
+tool reference name a session the same way. A bare reference can become
+ambiguous if a copy of its ID is archived later; it then returns the candidates
+as above. The optional plugin `sourceAlias` names its independent store,
 not a project or Location. The authenticated ingestion endpoint registers that
 name centrally once per collector lifetime; it does not re-export sessions or
 change their checkpoints. Names are unique, match `^[a-z][a-z0-9-]{0,31}$`, and
@@ -67,11 +71,23 @@ cannot be renamed or reassigned, including after credential revocation. Omitting
 the setting retains the assigned name. A conflicting setting stops capture
 until corrected and reloaded; see [client setup](client-setup.md).
 
-Unnamed stores retain UUID-qualified references. Previously returned
-`source-UUID/native-ID` references remain valid after naming a source. Returned
-qualified references and cursors identify their store even if another copy of
-the native ID is archived later. UUIDs remain the internal storage and credential
-identity; no replacement session IDs are introduced.
+Unnamed stores qualify with their UUID. Qualified references, including
+`source-UUID/native-ID`, remain accepted after naming a source, and they and
+cursors identify their store even if another copy of the native ID is archived
+later. UUIDs remain the internal storage and credential identity; no replacement
+session IDs are introduced.
+
+## Links
+
+Every session reference and message index has a reader link,
+`{url}/sessions/{reference}#{index}`, such as
+`https://spool.example.com/sessions/ses_…#12`. The plugin sends its configured
+`url` in a `Spool-Reader-URL` header (an `http(s)` origin and optional path, no
+trailing slash, at most 256 bytes), and every session, match and message in the
+results then has its `url`, so agents can cite them; without the header, `url`
+is null. The `session` argument also accepts a link to the configured `url`: the
+plugin passes on its reference, and for read, `#12` sets `start` to 12 when
+neither `start` nor `end` is given.
 
 ## Tool and HTTP contract
 
@@ -96,14 +112,14 @@ binary data are not searched. Trigram indexes support text search without
 extracting fields from opaque archival JSON in PostgreSQL.
 
 Find returns `{sessions, coverage, next_cursor}`. Each session contains
-`session`, `title`, `repository`, `revision`, `captured_at`, `message_count`, and
-`match` (null or `{index, excerpt, read_cursor}`). One passage is returned per
+`session`, `url`, `title`, `repository`, `revision`, `captured_at`, `message_count`, and
+`match` (null or `{index, url, excerpt, read_cursor}`). One passage is returned per
 session. Title/ID matches precede content-only matches; ties and unqueried
 listings are recent-first. Default limit is 10, maximum 50. Titles are bounded
 to 512 characters in results; the original metadata remains in the archive.
 
-Search returns `{session, revision, captured_at, message_count, matches,
-next_cursor}`. Matches contain `{index, excerpt, read_cursor}`, newest message
+Search returns `{session, url, revision, captured_at, message_count, matches,
+next_cursor}`. Matches contain `{index, url, excerpt, read_cursor}`, newest message
 first. Default limit is 20, maximum 100. Excerpts contain at most 300 characters.
 Read cursors start near the matching passage, including inside a giant message,
 and finish that message; use indices to request surrounding messages. The plugin
@@ -111,8 +127,8 @@ supplies exact UTF-8 search spans into rendered evidence, validated transactiona
 by ingestion. Excerpts and jumps therefore select eligible conversation/tool
 text, not an earlier occurrence in excluded reasoning or metadata.
 
-Read returns `{session, revision, captured_at, message_count, messages,
-next_cursor}`. Message chunks contain `{index, id, role, text, offset_bytes,
+Read returns `{session, url, revision, captured_at, message_count, messages,
+next_cursor}`. Message chunks contain `{index, url, id, role, text, offset_bytes,
 total_bytes}`. Indices are one-based and ranges inclusive; start defaults to 1,
 end to start, with a maximum index of 100,000. Offsets and totals count UTF-8
 bytes in the deterministic rendered message, not bytes of raw JSON or escaped
@@ -121,7 +137,7 @@ message returns an empty page. `next_cursor: null` means the requested range is
 finished, not necessarily the whole session.
 
 Every serialized success response is capped at **24 KiB**, including metadata,
-JSON escaping and continuation tokens. A page may contain fewer results than
+links, JSON escaping and continuation tokens. A page may contain fewer results than
 its limit. Large individual messages continue across pages without silently
 truncating evidence. Tool names, input, output and execution state remain
 readable; binary attachments are omitted from retrieval, not from the archive.
