@@ -14,6 +14,10 @@ test("configuration validates options and ignores the retired readerUrl", async 
     const options = { url: "http://127.0.0.1:8377", tokenFile }
     expect(await configure({ ...options, sweepIntervalMs: 1000 })).toEqual(await configure(options))
     expect(await configure({ ...options, readerUrl: "http://100.64.1.2:8378" })).toEqual(await configure(options))
+    const moved = await configure({ ...options, url: "https://spool.example" })
+    expect(moved.cachePrefix).toBe("v2/00000000-0000-0000-0000-000000000001/")
+    expect(moved.cachePrefix).toBe((await configure(options)).cachePrefix)
+    expect(moved.legacyCachePrefix).not.toBe((await configure(options)).legacyCachePrefix)
     expect((await configure({ ...options, repositoryRemote: "archive-origin" })).repositoryRemote).toBe("archive-origin")
     await expect(configure({ ...options, repositoryRemote: "bad\0remote" })).rejects.toThrow()
     const original = await configure(options)

@@ -28,7 +28,8 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
     info: { id: "ses_synthetic", title: "Fixture", time: { updated: 1700000000000 }, location: { directory } },
     messages: [{ id: "msg_synthetic", type: "user", text: "fixture\0text" }],
   } as unknown as SessionTransferData
-  const checkpoints = new Map<string, unknown>([["fixture/ses_synthetic", {
+  // The current checkpoint format also starts under the legacy key, which must migrate.
+  const checkpoints = new Map<string, unknown>([[projectionVersion === 2 ? "legacy/ses_synthetic" : "fixture/ses_synthetic", {
     revision: "1", hashes: { msg_synthetic: createHash("sha256").update(JSON.stringify(transcript.messages[0])).digest("hex") },
     ...(projectionVersion ? { projectionVersion } : {}),
   }]])
@@ -70,7 +71,7 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
     return Response.json({ revision, changed: true })
   } })
   const config: Config = {
-    url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/",
+    url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", legacyCachePrefix: "legacy/",
     opencodeUrl: server.url.origin, repositoryRemote: "origin",
   }
   const events: string[] = []
@@ -79,7 +80,11 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
   const ctx = {
     // Deliberately different: capture must not probe the active plugin's Location.
     location: { directory: root },
-    storage: { get: async (key: string) => checkpoints.get(key), set: async (key: string, value: unknown) => { checkpoints.set(key, value) } },
+    storage: {
+      get: async (key: string) => checkpoints.get(key),
+      set: async (key: string, value: unknown) => { checkpoints.set(key, value) },
+      remove: async (key: string) => { checkpoints.delete(key) },
+    },
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
       const abort = () => wake?.()
       signal.addEventListener("abort", abort, { once: true })
@@ -118,6 +123,7 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
     }
     await Bun.sleep(100)
     expect((checkpoints.get("fixture/ses_synthetic") as { projectionVersion: number }).projectionVersion).toBe(2)
+    expect([...checkpoints.keys()]).toEqual(["fixture/ses_synthetic"])
     const idle = { exports, lists, uploads: uploads.length, checkpoint: checkpoints.get("fixture/ses_synthetic") }
     await Bun.sleep(400)
     expect({ exports, lists, uploads: uploads.length, checkpoint: checkpoints.get("fixture/ses_synthetic") }).toEqual(idle)
@@ -258,7 +264,7 @@ test.each([429, 503])("source registration retries HTTP %s once and stays regist
       default: return new Response(null, { status: 404 })
     }
   } })
-  const config: Config = { url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", sourceAlias: "laptop", opencodeUrl: server.url.origin }
+  const config: Config = { url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", legacyCachePrefix: "legacy/", sourceAlias: "laptop", opencodeUrl: server.url.origin }
   const ctx = {
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
       await new Promise<void>((resolve) => { signal.addEventListener("abort", () => resolve(), { once: true }) })
@@ -295,7 +301,7 @@ test.each(["source_alias_conflict", "source_alias_mismatch", "unknown_conflict",
     return Response.json(code === null ? null : { error: { code, detail: "SECRET_ERROR_BODY" } }, { status: 409 })
   } })
   const logs = spyOn(console, "info").mockImplementation(() => {})
-  const config: Config = { url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", sourceAlias: "laptop", opencodeUrl: server.url.origin }
+  const config: Config = { url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", legacyCachePrefix: "legacy/", sourceAlias: "laptop", opencodeUrl: server.url.origin }
   const ctx = {
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
       await new Promise<void>((resolve) => { signal.addEventListener("abort", () => resolve(), { once: true }) })

@@ -4,6 +4,11 @@
   "private": true,
   "type": "module",
   "exports": "./src/index.ts",
+  "files": [
+    "src",
+    "!src/**/*.test.ts",
+    "skills"
+  ],
   "dependencies": {
     "@opencode/client": "2.2.5",
     "@opencode/plugin": "2.2.5"

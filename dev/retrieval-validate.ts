@@ -5,7 +5,7 @@ import path from "node:path"
 import { isDeepStrictEqual } from "node:util"
 import type { JsonValue, SessionTransferData } from "@opencode/client"
 import { command, waitFor } from "./command"
-import { startOpenCode } from "./opencode"
+import { packPlugin, startOpenCode } from "./opencode"
 import { agentQuery, evidence, longText, needle, seed, location, type Host } from "./retrieval-fixture/conversations"
 import { RetrievalRuntime } from "./retrieval-fixture/runtime"
 
@@ -31,11 +31,13 @@ let calls = 0
 const quote = (text: string) => `'${text.replaceAll("'", "''")}'`
 const pass = (name: string) => { cases.push(name); console.log(`PASS ${name}`) }
 
+let plugin: Promise<string> | undefined
 async function host(label: string, source: Source) {
   const tokenFile = path.join(root, `${label}.token`)
   await Bun.write(tokenFile, source.token)
   await chmod(tokenFile, 0o600)
-  const value = await startOpenCode(path.join(root, label), path.join(repository, "plugin"), {
+  plugin ??= packPlugin(root)
+  const value = await startOpenCode(path.join(root, label), await plugin, {
     url: runtime.url, tokenFile, ...(source.alias ? { sourceAlias: source.alias } : {}),
   }, runtime.signal, [{ package: path.join(repository, "dev", "retrieval-fixture"), options: { query: agentQuery, expectedText: evidence } }])
   hosts.push(value)

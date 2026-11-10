@@ -8,6 +8,7 @@ export interface Config {
   token: string
   sourceID: string
   cachePrefix: string
+  legacyCachePrefix: string
   serviceFile?: string
   opencodeUrl?: string
   opencodePassword?: string
@@ -65,7 +66,10 @@ export async function configure(options: Record<string, unknown>): Promise<Confi
     url: destination,
     token,
     sourceID,
-    cachePrefix: `v1/${createHash("sha256").update(`${destination}\0${sourceID}`).digest("hex")}/`,
+    // Source IDs are random UUIDs, so checkpoints need not depend on the URL; this
+    // lets an installation change url without recapturing everything.
+    cachePrefix: `v2/${sourceID}/`,
+    legacyCachePrefix: `v1/${createHash("sha256").update(`${destination}\0${sourceID}`).digest("hex")}/`,
     repositoryRemote,
     sourceAlias,
     serviceFile: options.serviceFile === undefined ? undefined : filename(options.serviceFile, "serviceFile"),

@@ -1,9 +1,26 @@
 import { closeSync, openSync } from "node:fs"
-import { mkdir, readdir } from "node:fs/promises"
+import { mkdir, readdir, rm, symlink } from "node:fs/promises"
 import path from "node:path"
 import { OpenCode } from "@opencode/client"
 import { Service } from "@opencode/client/service"
-import { waitFor } from "./command"
+import { command, waitFor } from "./command"
+
+const repository = path.resolve(import.meta.dir, "..")
+
+/** Packs the plugin as an installation receives it (only its package `files`) and
+ * returns the unpacked directory. Dependencies link to the workspace's pinned copies. */
+export async function packPlugin(root: string): Promise<string> {
+  const destination = path.join(root, "plugin-package")
+  await rm(destination, { recursive: true, force: true })
+  await mkdir(destination, { recursive: true })
+  await command(["bun", "pm", "pack", "--quiet", "--destination", destination], path.join(repository, "plugin"))
+  const [archive] = (await readdir(destination)).filter((name) => name.endsWith(".tgz"))
+  if (!archive) throw new Error("bun pm pack produced no archive")
+  await command(["tar", "-xzf", archive], destination)
+  const unpacked = path.join(destination, "package")
+  await symlink(path.join(repository, "plugin", "node_modules"), path.join(unpacked, "node_modules"))
+  return unpacked
+}
 
 export async function startOpenCode(root: string, plugin: string, options: Record<string, unknown>, signal: AbortSignal,
   extraPlugins: { package: string; options?: Record<string, unknown> }[] = []) {

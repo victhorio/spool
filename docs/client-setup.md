@@ -5,23 +5,33 @@ and the archive search/read tools; both use the same HTTPS address.
 
 ## Install and configure
 
-1. Clone or fast-forward this repository on the machine and run
-   `bun install --frozen-lockfile` from its root. OpenCode loads the local
-   TypeScript package directly; no Rust build or database is needed on a client.
-2. For a new independent OpenCode store, have the archive operator provision a
+OpenCode installs the plugin from GitHub, pinned to a full commit hash, into its
+own package cache. The machine needs Bun and Git credentials that can read this
+private repository. A checkout is needed only to run the installer.
+
+1. For a new independent OpenCode store, have the archive operator provision a
    source using [source add](ingestion.md#identity-and-credentials). Save its token
    in `~/.config/spool/source.token`, mode 0600, outside tracked configuration.
    For an existing installation, keep its token and checkpoints. Never copy
    another store's token or source name: each independent store needs its own
    credential and globally unique, stable name, even on the same machine.
-3. Merge this entry into `plugins` in `~/.config/opencode/opencode.json`, preserving
-   other configuration. Use the machine's absolute checkout path, not the `.ts`
-   entrypoint. Replace the ingestion URL with the operator-provided HTTPS URL.
+2. From an up-to-date checkout of a commit that is on GitHub, run:
+
+   ```sh
+   bun run install-plugin --url https://spool.example.com \
+     --token-file ~/.config/spool/source.token --source-alias work-laptop
+   ```
+
+   It writes one entry to `plugins` in the global `opencode.json`, preserving
+   other configuration, and replaces any earlier Spool entry, including one that
+   points at a checkout. Options already configured are kept unless a flag
+   overrides them; the retired `readerUrl` and `sweepIntervalMs` are dropped.
+   `--dry-run` prints the entry without writing it. The result looks like this:
 
 ```json
 {
   "plugins": [{
-    "package": "/absolute/path/to/spool/plugin",
+    "package": "github:victhorio/spool#<full commit hash>::path:plugin",
     "options": {
       "url": "https://spool.example.com",
       "tokenFile": "~/.config/spool/source.token",
@@ -30,6 +40,10 @@ and the archive search/read tools; both use the same HTTPS address.
   }]
 }
 ```
+
+To update, pull and run `bun run install-plugin` again. Pushing to GitHub alone
+changes nothing on a machine. The installer refuses uncommitted plugin changes
+and commits that are not on GitHub, since OpenCode could not install them.
 
 `sourceAlias` is optional and must match `^[a-z][a-z0-9-]{0,31}$`. Use the same
 name as the operator assigned, or choose an unused name for an unnamed source.
@@ -41,15 +55,19 @@ the configuration is corrected and all instances are reloaded. Omitting the
 option leaves any centrally assigned name unchanged; it does not clear it.
 Adding an alias preserves checkpoints and does not recapture existing sessions.
 
-The former `readerUrl` option is accepted and ignored; remove it when convenient.
-Retrieval requests send the source token to `url`.
+Checkpoints are keyed by source, not `url`, so changing `url` does not recapture
+sessions. Plugins installed from a checkout keyed them by both. When replacing
+one, run the installer without `--url` first, let OpenCode reload so the plugin
+moves the checkpoints, then run it again with `--url`; the installer refuses to
+do both at once. Going back to such a plugin afterwards recaptures every session.
 
-Pulling the checkout updates files, not already-loaded plugin instances. After
-changing code or options, reload all Spool instances for that source. Restarting
-the managed OpenCode service while idle is one way to do that; opening another
-TUI attached to an existing service is not a reload. Coordinate a restart rather
-than interrupting active sessions. Reload all loaded Locations together when
-changing options, or their shared collector will reject conflicting configuration.
+OpenCode reloads plugins when the global configuration changes, installing a new
+package in the background first; `opencode plugin list` shows `spool` once it is
+loaded. Restarting the managed OpenCode service while idle also reloads;
+opening another TUI attached to an existing service does not. Coordinate a
+restart rather than interrupting active sessions. All loaded Locations share
+one collector per source and reject a differing configuration, including a
+different `url`, until every Location has reloaded.
 
 ## Verify from that machine
 
@@ -87,13 +105,13 @@ OpenCode ID also works when globally unique. If `ambiguous_session` returns
 `candidates`, select the qualified reference for the intended source, not simply
 the first; `more: true` means additional candidates exist. Use find to narrow the
 choice when needed. Only successful actual calls verify agent access; plugin
-status, a Git pull or direct HTTP success does not.
+status, an installation or direct HTTP success does not.
 
 ## Troubleshooting
 
 | Symptom | Check |
 | --- | --- |
-| Tools and skill are absent | Reload all instances after updating the plugin. If registered but unavailable to one agent, check that agent's permissions. |
+| Tools and skill are absent | Check `opencode plugin list` and the OpenCode log for installation errors, such as missing GitHub access. If registered but unavailable to one agent, check that agent's permissions. |
 | `unauthorized` | The source token is missing, wrong or revoked. Check `tokenFile` and run the probe above. |
 | `reader_unavailable` | Run the probe from the affected machine and check the service's availability. |
 | Capture logs `source_alias_mismatch` or `source_alias_conflict`, then `disabled_until_reload` | Keep the already assigned alias for this source, or choose an unused alias for an unnamed source. Correct the options and reload all instances; retrying cannot rename a source or take another source's name. |

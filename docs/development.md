@@ -10,7 +10,9 @@ list/export and event APIs exercised by validation.
 
 Run `bun run local:up`. It builds the release service image, starts PostgreSQL 17
 and the service in containers, provisions a source, and starts real OpenCode
-with the local plugin. Ports are dynamically assigned and bound only to
+with the local plugin. Like the validation scripts, it packs the plugin first and
+loads the unpacked package, so it sees only the package's `files`, as an
+installation does; restart it after changing plugin code. Ports are dynamically assigned and bound only to
 loopback. The command prints the endpoints and state directory. Ctrl-C stops
 the processes and containers, retaining the sandbox's database volume.
 `bun run local:down` also stops that sandbox from another terminal.

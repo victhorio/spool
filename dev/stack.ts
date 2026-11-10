@@ -3,7 +3,7 @@ import { chmod, mkdir, readdir } from "node:fs/promises"
 import path from "node:path"
 import { Service } from "@opencode/client/service"
 import { command, waitFor } from "./command"
-import { startOpenCode } from "./opencode"
+import { packPlugin, startOpenCode } from "./opencode"
 
 export interface Source { source_id: string; token: string }
 
@@ -16,6 +16,7 @@ export class LocalStack {
   readonly signal = this.lifetime.signal
   private readonly hosts: Awaited<ReturnType<typeof startOpenCode>>[] = []
   private cleanup: Promise<void> | undefined
+  private plugin: Promise<string> | undefined
 
   constructor(readonly root: string) {
     this.project = `spool-${createHash("sha256").update(root).digest("hex").slice(0, 12)}`
@@ -86,7 +87,8 @@ export class LocalStack {
     const tokenFile = path.join(this.root, `${label}.token`)
     await Bun.write(tokenFile, source.token)
     await chmod(tokenFile, 0o600)
-    const host = await startOpenCode(path.join(this.root, `opencode-${label}`), path.join(repository, "plugin"), { url, tokenFile }, this.signal)
+    this.plugin ??= packPlugin(this.root)
+    const host = await startOpenCode(path.join(this.root, `opencode-${label}`), await this.plugin, { url, tokenFile }, this.signal)
     this.hosts.push(host)
     return host
   }

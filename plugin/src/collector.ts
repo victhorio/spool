@@ -204,8 +204,7 @@ export class Collector {
           this.activity.delete(session.id)
           continue
         }
-        this.operation = "checkpoint_read"
-        const saved = checkpoint(await ctx.storage.get(`${this.config.cachePrefix}${session.id}`))
+        const saved = await this.checkpoint(ctx, session.id)
         if (full || !revision || saved?.revision !== revision || saved.projectionVersion !== 2 ||
             saved.infoHash !== digest(session) || saved.remote !== this.config.repositoryRemote) {
           this.backfill.add(session.id)
@@ -217,11 +216,26 @@ export class Collector {
     this.log("reconciled", { full, queued })
   }
 
+  // Checkpoints used to be keyed by url and source; reconciliation moves them to the
+  // source-only key. Remove the fallback once every installation has reloaded.
+  private async checkpoint(ctx: Plugin.Context, id: string): Promise<Checkpoint | undefined> {
+    this.operation = "checkpoint_read"
+    const key = `${this.config.cachePrefix}${id}`
+    const current = await ctx.storage.get(key)
+    if (current !== undefined) return checkpoint(current)
+    const legacyKey = `${this.config.legacyCachePrefix}${id}`
+    const legacy = await ctx.storage.get(legacyKey)
+    if (legacy === undefined) return undefined
+    this.operation = "checkpoint_write"
+    await ctx.storage.set(key, legacy)
+    await ctx.storage.remove(legacyKey)
+    return checkpoint(legacy)
+  }
+
   private async capture(id: string): Promise<void> {
     const ctx = this.members.keys().next().value!
     const key = `${this.config.cachePrefix}${id}`
-    this.operation = "checkpoint_read"
-    const saved = checkpoint(await ctx.storage.get(key))
+    const saved = await this.checkpoint(ctx, id)
     const base = this.revisions.has(id) ? this.revisions.get(id)! : saved?.revision ?? null
     const known = saved?.revision === base && saved.projectionVersion === 2 ? saved.hashes : undefined
     const client = await this.connect()

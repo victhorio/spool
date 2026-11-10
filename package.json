@@ -5,6 +5,7 @@
   "workspaces": ["plugin", "web"],
   "scripts": {
     "typecheck": "tsc --noEmit",
+    "install-plugin": "bun scripts/install-plugin.ts",
     "web:build": "bun run --cwd web build",
     "web:validate": "bun dev/web-validate.ts",
     "retrieval:validate": "bun dev/retrieval-validate.ts",
