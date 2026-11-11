@@ -7,20 +7,28 @@ mod delivery;
 mod device;
 mod error;
 mod http;
+mod page;
 mod reference;
+mod request;
 mod retrieval;
 mod snapshot;
+mod sync;
 
 use std::time::Duration;
 
 use anyhow::Context;
 use sqlx::{
-    PgPool,
+    PgPool, Postgres, Transaction,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
 
 pub use access::Access;
 pub use http::{Reader, router};
+
+use error::ApiError;
+
+/// The most an agent tool result may hold, in bytes; the plugin refuses more.
+const PAGE_BYTES: usize = 24 * 1024;
 
 pub async fn connect(database_url: &str) -> anyhow::Result<PgPool> {
     connect_pool(database_url, false).await
@@ -46,6 +54,19 @@ async fn connect_pool(database_url: &str, read_only: bool) -> anyhow::Result<PgP
         .connect_with(options)
         .await
         .context("could not connect to PostgreSQL")
+}
+
+/// A read-only transaction over one snapshot, so a page and its session agree.
+async fn consistent_read(pool: &PgPool) -> Result<Transaction<'_, Postgres>, ApiError> {
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(ApiError::database("read.begin"))?;
+    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
+        .execute(&mut *tx)
+        .await
+        .map_err(ApiError::database("read.snapshot"))?;
+    Ok(tx)
 }
 
 pub async fn migrate(pool: &PgPool) -> anyhow::Result<()> {

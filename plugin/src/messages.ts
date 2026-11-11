@@ -1,11 +1,10 @@
 import { setTimeout as delay } from "node:timers/promises"
 import type { OpenCodeClient } from "@opencode/client"
-import type { Plugin } from "@opencode/plugin"
-import type { Config } from "./config"
-import { readerLink, validSession } from "./retrieval"
+import { type Archive, archiveFetch } from "./archive"
+import { errorCode, log } from "./log"
+import { ambiguous, readerLink, validSession } from "./reference"
+import { type Tool, toolError } from "./tools"
 
-type Archive = Pick<Config, "url" | "token">
-type Log = (event: string, fields?: Record<string, unknown>) => void
 interface Delivery { id: string; session: string; text: string; from: { session: string; source: string } | null }
 
 const toolName = "send_message"
@@ -22,7 +21,7 @@ export function prompt(message: Delivery): string {
  * Each poll is the machine's heartbeat, reports its running sessions and acknowledges
  * what the previous poll delivered.
  */
-export async function deliver(archive: Archive, connect: () => Promise<OpenCodeClient>, signal: AbortSignal, log: Log, errorCode: (error: unknown) => string): Promise<void> {
+export async function deliver(archive: Archive, connect: () => Promise<OpenCodeClient>, signal: AbortSignal): Promise<void> {
   // Prompted, to acknowledge in the next poll that reaches the archive.
   const delivered = new Set<string>()
   let failures = 0
@@ -31,11 +30,9 @@ export async function deliver(archive: Archive, connect: () => Promise<OpenCodeC
       const client = await connect()
       const running = Object.keys(await client.session.active({ signal: AbortSignal.any([signal, AbortSignal.timeout(10_000)]) }))
       const acknowledged = [...delivered]
-      const response = await fetch(`${archive.url}/v1/poll`, {
-        method: "POST", redirect: "error", credentials: "omit",
-        headers: { authorization: `Bearer ${archive.token}`, "content-type": "application/json" },
-        body: JSON.stringify({ running, delivered: acknowledged }),
-        signal: AbortSignal.any([signal, AbortSignal.timeout(60_000)]),
+      const response = await archiveFetch(archive, "/v1/poll", {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ running, delivered: acknowledged }), timeout: 60_000, signal,
       })
       if (response.status === 401) { log("delivery_disabled_until_reload"); return }
       if (!response.ok) throw new Error(`http_${response.status}`)
@@ -63,8 +60,6 @@ export async function deliver(archive: Archive, connect: () => Promise<OpenCodeC
   }
 }
 
-const errorResult = (error: Record<string, unknown>) => JSON.stringify({ error })
-
 /** Sends one message for the tool; the result is JSON text for the model. */
 export async function send(archive: Archive, input: unknown, from: string, signal?: AbortSignal): Promise<string> {
   const value = input as Record<string, unknown> | undefined
@@ -72,37 +67,32 @@ export async function send(archive: Archive, input: unknown, from: string, signa
   const text = value?.text
   if (!value || Object.keys(value).some((key) => key !== "session" && key !== "text") || !validSession(session) ||
       typeof text !== "string" || !text.trim() || text.includes("\0") || Buffer.byteLength(text) > 64 * 1024) {
-    return errorResult({ code: "malformed_request" })
+    return toolError("malformed_request")
   }
   try {
-    const response = await fetch(`${archive.url}/v1/messages`, {
-      method: "POST", redirect: "error", credentials: "omit",
-      headers: { authorization: `Bearer ${archive.token}`, "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({ session, text, from }),
-      signal: AbortSignal.any([AbortSignal.timeout(10_000), ...(signal ? [signal] : [])]),
+    const response = await archiveFetch(archive, "/v1/messages", {
+      method: "POST", headers: { "content-type": "application/json", accept: "application/json" },
+      body: JSON.stringify({ session, text, from }), timeout: 10_000, signal,
     })
-    const parsed = await response.json() as { status?: string; error?: { code?: string; candidates?: unknown; more?: unknown } }
+    const parsed = await response.json() as { status?: string; error?: { code?: string } }
     if (response.ok) return JSON.stringify({ sent: true, status: parsed.status })
     const code = parsed.error?.code
-    if (code === "ambiguous_session") return errorResult({ code, candidates: parsed.error!.candidates, more: parsed.error!.more })
-    return errorResult({ code: typeof code === "string" && passed.includes(code) ? code : "archive_unavailable" })
-  } catch { return errorResult({ code: "archive_unavailable" }) }
+    if (code === "ambiguous_session") return ambiguous(response.status, parsed.error!, "archive_unavailable")
+    return toolError(typeof code === "string" && passed.includes(code) ? code : "archive_unavailable")
+  } catch { return toolError("archive_unavailable") }
 }
 
-export async function registerMessages(ctx: Plugin.Context, archive: Archive): Promise<void> {
-  await ctx.tool.transform((tools) => {
-    tools.add({
-      name: toolName,
-      options: { namespace: "spool", codemode: false },
-      description: "Send a message to an agent in another session. It arrives as a prompt that says it came from you, steering the agent if it is running. The session's machine must be online: find_sessions reports each session's `status`, `running`, `idle` or `offline`. The result only confirms it was sent; read the session later to see what the agent did.",
-      input: {
-        type: "object", additionalProperties: false, required: ["session", "text"],
-        properties: {
-          session: { type: "string", minLength: 1, maxLength: 2048, description: "Session reference or Spool link, such as `ses_…` or `work-m5/ses_…`." },
-          text: { type: "string", minLength: 1, description: "The message, at most 64 KiB." },
-        },
+export function messageTools(archive: Archive): Tool[] {
+  return [{
+    name: toolName,
+    description: "Send a message to an agent in another session. It arrives as a prompt that says it came from you, steering the agent if it is running. The session's machine must be online: find_sessions reports each session's `status`, `running`, `idle` or `offline`. The result only confirms it was sent; read the session later to see what the agent did.",
+    input: {
+      type: "object", additionalProperties: false, required: ["session", "text"],
+      properties: {
+        session: { type: "string", minLength: 1, maxLength: 2048, description: "Session reference or Spool link, such as `ses_…` or `work-m5/ses_…`." },
+        text: { type: "string", minLength: 1, description: "The message, at most 64 KiB." },
       },
-      execute: async (input, context) => ({ content: await send(archive, input, context.sessionID, context.signal) }),
-    })
-  })
+    },
+    run: (input, context) => send(archive, input, context.sessionID, context.signal),
+  }]
 }

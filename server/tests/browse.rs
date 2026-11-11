@@ -399,19 +399,20 @@ async fn access_assertions_and_origin_guards() {
     assert_eq!(response.status(), StatusCode::OK);
     team.down.store(false, Ordering::SeqCst);
 
-    // Machine routes never consult Access.
+    // Machine routes never consult Access, and authenticate before anything else.
     for (method, path, status) in [
         ("GET", "/healthz", StatusCode::SERVICE_UNAVAILABLE),
         ("GET", "/v1/sync/sessions", StatusCode::UNAUTHORIZED),
         ("POST", "/v1/agent/find", StatusCode::UNAUTHORIZED),
         ("GET", "/v1/agent/find", StatusCode::UNAUTHORIZED),
-        ("GET", "/v1", StatusCode::NOT_FOUND),
-        ("GET", "/v1/unknown", StatusCode::NOT_FOUND),
         (
             "GET",
             "/v1/sync/sessions/x/snapshot",
-            StatusCode::METHOD_NOT_ALLOWED,
+            StatusCode::UNAUTHORIZED,
         ),
+        ("GET", "/v1", StatusCode::NOT_FOUND),
+        ("GET", "/v1/unknown", StatusCode::NOT_FOUND),
+        ("GET", "/v1/device/code", StatusCode::METHOD_NOT_ALLOWED),
     ] {
         let response = plain
             .request(method.parse().unwrap(), format!("{url}{path}"))
@@ -932,7 +933,23 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
         )
         .await;
     }
-    let forged = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"kind":"messages_v2","source_id":A,"session_id":"same","revision":1,"position":0})).unwrap());
+    // Messages before `position`: version 2, variant 1, A, "same", then zigzag
+    // varints for revision 1 and the position. None come before the first.
+    let before = |position: u8| {
+        URL_SAFE_NO_PAD.encode(
+            [
+                &[2, 1, 16][..],
+                A.as_bytes(),
+                &[4],
+                b"same",
+                &[2, position * 2],
+            ]
+            .concat(),
+        )
+    };
+    let first = get(client, &format!("{path}?cursor={}", before(1))).await;
+    assert_eq!(first["messages"][0]["id"], "m3");
+    let forged = before(0);
     error(
         client
             .get(&path)

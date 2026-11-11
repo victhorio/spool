@@ -3,7 +3,7 @@ use serde::Serialize;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-use crate::{auth, snapshot::valid_id};
+use crate::{auth, reference::valid_id};
 
 #[derive(Serialize)]
 pub struct Credential {

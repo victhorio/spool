@@ -9,8 +9,7 @@ messages, and earlier ones load on request above them. `#12` opens message 12, t
 the reader loads earlier pages until that message is shown, then scrolls to and highlights it. Each
 message's number, shown on hover, links to it. A reference that names several sources lists them
 to choose from; a longer reference than needed is replaced by the shortest one once loaded.
-Earlier `/#source={uuid}&session={id}` links still open. It does not change the
-archive. A session whose machine is online shows a box to
+It does not change the archive. A session whose machine is online shows a box to
 [message](messages.md) it, and running sessions are marked in the sidebar.
 Reasoning, tools, system context and compaction summaries are
 expandable. Attachments are labeled, not fetched from external storage. Archived

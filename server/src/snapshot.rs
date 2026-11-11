@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::error::ApiError;
+use crate::{error::ApiError, reference::valid_id, request};
 
 const MAX_ITEMS: usize = 100_000;
 const MAX_ARCHIVE: usize = 16 * 1024 * 1024;
@@ -64,10 +64,7 @@ fn check_size(body: &[u8]) -> Result<(), ApiError> {
         }
     }
 
-    let oversized = || ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large");
-    if body.len() > MAX_BODY {
-        return Err(oversized());
-    }
+    let oversized = ApiError::too_large;
     let mut deserializer = serde_json::Deserializer::from_slice(body);
     let size = deserializer
         .deserialize_map(ArchiveSize(body))
@@ -210,18 +207,10 @@ pub(crate) struct Snapshot {
     messages: HashMap<String, Message>,
 }
 
-pub(crate) fn valid_id(id: &str) -> bool {
-    !id.is_empty() && id.len() <= 512 && !id.contains('\0')
-}
-
 impl Snapshot {
     pub fn parse(body: &[u8], session_id: &str) -> Result<Self, ApiError> {
         check_size(body)?;
-        if body.trim_ascii_start().first() != Some(&b'{') {
-            return Err(ApiError::malformed());
-        }
-        let mut envelope: Envelope =
-            serde_json::from_slice(body).map_err(|_| ApiError::malformed())?;
+        let mut envelope: Envelope = request::object(body)?;
         if !valid_id(session_id)
             || envelope.format != "opencode.v2"
             || [&envelope.upstream_version, &envelope.collector_version]
@@ -233,13 +222,7 @@ impl Snapshot {
         let base = envelope
             .base_revision
             .as_deref()
-            .map(|value| {
-                value
-                    .parse::<i64>()
-                    .ok()
-                    .filter(|revision| *revision > 0)
-                    .ok_or_else(ApiError::malformed)
-            })
+            .map(request::revision)
             .transpose()?;
         let info = ObjectId::parse(&envelope.info)?;
         if info.id != session_id {
@@ -264,11 +247,7 @@ impl Snapshot {
             .retrieval
             .take()
             .map(|raw| {
-                if !raw.get().starts_with('{') {
-                    return Err(ApiError::malformed());
-                }
-                let retrieval: Retrieval =
-                    serde_json::from_str(raw.get()).map_err(|_| ApiError::malformed())?;
+                let retrieval: Retrieval = request::object(raw.get().as_bytes())?;
                 if retrieval.version != 1
                     || retrieval.title.len() > 4096
                     || retrieval.title.contains('\0')
@@ -337,6 +316,49 @@ struct MessageRow {
     payload_hash: Vec<u8>,
 }
 
+/// Retrieval projections as the parallel columns of an `unnest` batch, in
+/// table order; a message without one stores nulls.
+#[derive(Default)]
+struct Projections<'a> {
+    roles: Vec<Option<&'a str>>,
+    texts: Vec<Option<&'a str>>,
+    conversations: Vec<Option<&'a str>>,
+    tools: Vec<Option<&'a str>>,
+    conversation_spans: Vec<Option<String>>,
+    tool_spans: Vec<Option<String>>,
+}
+
+impl<'a> Projections<'a> {
+    fn push(&mut self, projection: Option<&'a Projection>) {
+        let spans =
+            |spans: &[[usize; 2]]| serde_json::to_string(spans).expect("serializable spans");
+        self.roles
+            .push(projection.map(|message| message.role.as_str()));
+        self.texts
+            .push(projection.map(|message| message.text.as_str()));
+        self.conversations
+            .push(projection.map(|message| message.conversation.as_str()));
+        self.tools
+            .push(projection.map(|message| message.tools.as_str()));
+        self.conversation_spans
+            .push(projection.map(|message| spans(&message.conversation_spans)));
+        self.tool_spans
+            .push(projection.map(|message| spans(&message.tool_spans)));
+    }
+
+    fn bind<'q>(&'q self, query: PgQuery<'q>) -> PgQuery<'q> {
+        query
+            .bind(&self.roles)
+            .bind(&self.texts)
+            .bind(&self.conversations)
+            .bind(&self.tools)
+            .bind(&self.conversation_spans)
+            .bind(&self.tool_spans)
+    }
+}
+
+type PgQuery<'q> = sqlx::query::Query<'q, sqlx::Postgres, sqlx::postgres::PgArguments>;
+
 pub(crate) struct Accepted {
     pub revision: i64,
     pub changed: bool,
@@ -353,7 +375,7 @@ pub(crate) async fn accept(
     let mut tx = pool
         .begin()
         .await
-        .map_err(|error| ApiError::database("snapshot.begin", error))?;
+        .map_err(ApiError::database("snapshot.begin"))?;
     let created = if snapshot.base.is_none() {
         sqlx::query(
             "INSERT INTO sessions \
@@ -369,7 +391,7 @@ pub(crate) async fn accept(
         .bind(&envelope.collector_version)
         .bind(envelope.captured_at)
         .execute(&mut *tx)
-        .await.map_err(|error| ApiError::database("snapshot.create", error))?
+        .await.map_err(ApiError::database("snapshot.create"))?
         .rows_affected() == 1
     } else {
         false
@@ -382,7 +404,7 @@ pub(crate) async fn accept(
     .bind(session)
     .fetch_optional(&mut *tx)
     .await
-    .map_err(|error| ApiError::database("snapshot.lock", error))?;
+    .map_err(ApiError::database("snapshot.lock"))?;
     let Some(current) = current else {
         return Err(ApiError::conflict(None));
     };
@@ -406,7 +428,7 @@ pub(crate) async fn accept(
     .bind(source)
     .bind(session)
     .fetch_all(&mut *tx)
-    .await.map_err(|error| ApiError::database("snapshot.messages", error))?;
+    .await.map_err(ApiError::database("snapshot.messages"))?;
     let mut existing: HashMap<_, _> = rows
         .iter()
         .map(|message| (message.message_id.as_str(), message))
@@ -421,12 +443,7 @@ pub(crate) async fn accept(
         .flat_map(|retrieval| &retrieval.messages)
         .map(|message| (message.id.as_str(), message))
         .collect();
-    let mut roles = Vec::new();
-    let mut texts = Vec::new();
-    let mut conversations = Vec::new();
-    let mut tools = Vec::new();
-    let mut conversation_spans = Vec::new();
-    let mut tool_spans = Vec::new();
+    let mut upserted = Projections::default();
     let mut moved_ids = Vec::new();
     let mut moved_positions = Vec::new();
     let mut changed = created
@@ -446,17 +463,7 @@ pub(crate) async fn accept(
             positions.push(position);
             payloads.push(message.payload.get());
             hashes.push(message.hash.as_slice());
-            let projection = projections.remove(id.as_str());
-            roles.push(projection.map(|message| message.role.as_str()));
-            texts.push(projection.map(|message| message.text.as_str()));
-            conversations.push(projection.map(|message| message.conversation.as_str()));
-            tools.push(projection.map(|message| message.tools.as_str()));
-            conversation_spans.push(projection.map(|message| {
-                serde_json::to_string(&message.conversation_spans).expect("spans are serializable")
-            }));
-            tool_spans.push(projection.map(|message| {
-                serde_json::to_string(&message.tool_spans).expect("spans are serializable")
-            }));
+            upserted.push(projections.remove(id.as_str()));
             changed = true;
         } else if old.is_some_and(|old| old.position != position) {
             moved_ids.push(id.as_str());
@@ -477,10 +484,10 @@ pub(crate) async fn accept(
         .bind(&removed)
         .execute(&mut *tx)
         .await
-        .map_err(|error| ApiError::database("snapshot.delete", error))?;
+        .map_err(ApiError::database("snapshot.delete"))?;
     }
     if !ids.is_empty() {
-        sqlx::query(
+        let query = sqlx::query(
             "INSERT INTO messages (source_id, session_id, message_id, position, payload, payload_hash, \
              retrieval_role, retrieval_text, conversation_text, tool_text, conversation_spans, tool_spans) \
              SELECT $1, $2, batch.id, batch.position, batch.payload::json, batch.hash, \
@@ -500,15 +507,12 @@ pub(crate) async fn accept(
         .bind(&ids)
         .bind(&positions)
         .bind(&payloads)
-        .bind(&hashes)
-        .bind(&roles)
-        .bind(&texts)
-        .bind(&conversations)
-        .bind(&tools)
-        .bind(&conversation_spans)
-        .bind(&tool_spans)
-        .execute(&mut *tx)
-        .await.map_err(|error| ApiError::database("snapshot.upsert", error))?;
+        .bind(&hashes);
+        upserted
+            .bind(query)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::database("snapshot.upsert"))?;
     }
     if !moved_ids.is_empty() {
         sqlx::query(
@@ -522,29 +526,17 @@ pub(crate) async fn accept(
         .bind(&moved_positions)
         .execute(&mut *tx)
         .await
-        .map_err(|error| ApiError::database("snapshot.reorder", error))?;
+        .map_err(ApiError::database("snapshot.reorder"))?;
     }
+    // Unchanged messages may still gain or change their projection.
     if !projections.is_empty() {
         let mut ids = Vec::new();
-        let mut roles = Vec::new();
-        let mut texts = Vec::new();
-        let mut conversations = Vec::new();
-        let mut tools = Vec::new();
-        let mut conversation_spans = Vec::new();
-        let mut tool_spans = Vec::new();
+        let mut projected = Projections::default();
         for message in projections.into_values() {
-            ids.push(&message.id);
-            roles.push(&message.role);
-            texts.push(&message.text);
-            conversations.push(&message.conversation);
-            tools.push(&message.tools);
-            conversation_spans.push(
-                serde_json::to_string(&message.conversation_spans).expect("spans are serializable"),
-            );
-            tool_spans
-                .push(serde_json::to_string(&message.tool_spans).expect("spans are serializable"));
+            ids.push(message.id.as_str());
+            projected.push(Some(message));
         }
-        sqlx::query(
+        let query = sqlx::query(
             "UPDATE messages SET retrieval_role = batch.role, retrieval_text = batch.text, \
              conversation_text = batch.conversation, tool_text = batch.tools, \
              conversation_spans = batch.conversation_spans::jsonb, tool_spans = batch.tool_spans::jsonb \
@@ -558,16 +550,12 @@ pub(crate) async fn accept(
         )
         .bind(source)
         .bind(session)
-        .bind(&ids)
-        .bind(&roles)
-        .bind(&texts)
-        .bind(&conversations)
-        .bind(&tools)
-        .bind(&conversation_spans)
-        .bind(&tool_spans)
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| ApiError::database("snapshot.project", error))?;
+        .bind(&ids);
+        projected
+            .bind(query)
+            .execute(&mut *tx)
+            .await
+            .map_err(ApiError::database("snapshot.project"))?;
     }
     if !created {
         sqlx::query(
@@ -585,7 +573,7 @@ pub(crate) async fn accept(
         .bind(&envelope.collector_version)
         .bind(envelope.captured_at)
         .execute(&mut *tx)
-        .await.map_err(|error| ApiError::database("snapshot.update", error))?;
+        .await.map_err(ApiError::database("snapshot.update"))?;
     }
     let retrieval = snapshot.retrieval.as_ref();
     sqlx::query(
@@ -603,10 +591,10 @@ pub(crate) async fn accept(
     .bind(retrieval.map(|retrieval| retrieval.activity as i64))
     .execute(&mut *tx)
     .await
-    .map_err(|error| ApiError::database("snapshot.metadata", error))?;
+    .map_err(ApiError::database("snapshot.metadata"))?;
     tx.commit()
         .await
-        .map_err(|error| ApiError::database("snapshot.commit", error))?;
+        .map_err(ApiError::database("snapshot.commit"))?;
     Ok(Accepted {
         revision,
         changed,

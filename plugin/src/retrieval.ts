@@ -1,10 +1,9 @@
-import type { Plugin } from "@opencode/plugin"
-import { type Config, validSourceAlias } from "./config"
-import { bundledSkill } from "./skills"
+import { type Archive, archiveFetch, boundedText } from "./archive"
+import { ambiguous, readerLink, validSession } from "./reference"
+import { type Tool, toolError } from "./tools"
 
 type Route = "find" | "search" | "read"
 const maximumBytes = 24 * 1024
-const errorResult = (code: string, current_revision?: string) => JSON.stringify({ error: { code, ...(current_revision ? { current_revision } : {}) } })
 const string = { type: "string", minLength: 1 }
 const session = { ...string, maxLength: 2048, description: "Session reference or Spool link, such as `ses_…`, `work-m5/ses_…` or `https://…/sessions/ses_…#12`. A link's `#12` is message 12." }
 const revision = { ...string, maxLength: 19, pattern: "^[0-9]+$" }
@@ -36,16 +35,6 @@ function validRevision(value: unknown): value is string {
   return typeof value === "string" && /^[0-9]{1,19}$/.test(value) && BigInt(value) > 0 && BigInt(value) <= 9223372036854775807n
 }
 
-export function validSession(value: unknown, qualifiedOnly = false): value is string {
-  if (typeof value !== "string" || !value || value.includes("\0")) return false
-  const slash = value.indexOf("/")
-  if (slash < 0) return !qualifiedOnly && Buffer.byteLength(value) <= 512
-  const source = value.slice(0, slash)
-  const id = value.slice(slash + 1)
-  return (validSourceAlias(source) || /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.exec(source)?.[0] === source) &&
-    !!id && Buffer.byteLength(id) <= 512
-}
-
 export function validInput(route: Route, value: unknown): value is Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false
   const input = value as Record<string, unknown>
@@ -70,18 +59,7 @@ export function validInput(route: Route, value: unknown): value is Record<string
   return !(route === "read" && typeof input.end === "number" && input.end < (typeof input.start === "number" ? input.start : 1))
 }
 
-type Archive = Pick<Config, "url" | "token">
 type Json = Record<string, any>
-
-/** The session reference and message index in a reader link, if `value` is one. */
-export function readerLink(archive: Archive, value: unknown): { session: string; index?: number } | undefined {
-  if (typeof value !== "string" || !value.startsWith(`${archive.url}/sessions/`)) return
-  try {
-    const url = new URL(value)
-    const index = /^#([1-9][0-9]*)$/.exec(url.hash)?.[1]
-    return { session: url.pathname.slice("/sessions/".length).split("/").map(decodeURIComponent).join("/"), ...(index ? { index: Number(index) } : {}) }
-  } catch { return }
-}
 
 /** A reader link given as `session` becomes its reference; for reads, its `#index` is the default message. */
 function fromLink(archive: Archive, route: Route, input: unknown): unknown {
@@ -93,62 +71,35 @@ function fromLink(archive: Archive, route: Route, input: unknown): unknown {
 
 export async function requestReader(archive: Archive, route: Route, given: unknown, signal?: AbortSignal): Promise<string> {
   const input = fromLink(archive, route, given)
-  if (!validInput(route, input)) return errorResult("malformed_request")
+  if (!validInput(route, input)) return toolError("malformed_request")
   try {
-    const response = await fetch(`${archive.url}/v1/agent/${route}`, {
-      method: "POST", body: JSON.stringify(input), redirect: "error", credentials: "omit",
+    const response = await archiveFetch(archive, `/v1/agent/${route}`, {
+      method: "POST", body: JSON.stringify(input), timeout: 5_000, signal,
       // The reader URL lets results link to the reader within the server's page budget.
-      headers: { "content-type": "application/json", accept: "application/json", authorization: `Bearer ${archive.token}`, "spool-reader-url": archive.url },
-      signal: AbortSignal.any([AbortSignal.timeout(5_000), ...(signal ? [signal] : [])]),
+      headers: { "content-type": "application/json", accept: "application/json", "spool-reader-url": archive.url },
     })
-    if (!response.body) return errorResult("reader_unavailable")
-    const reader = response.body.getReader()
-    const chunks: Uint8Array[] = []
-    let length = 0
-    try {
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
-        length += value.byteLength
-        if (length > maximumBytes) return errorResult("response_too_large")
-        chunks.push(value)
-      }
-    } finally { await reader.cancel().catch(() => {}) }
-    const raw = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks))
+    const raw = await boundedText(response, maximumBytes)
+    if (raw === undefined) return toolError("response_too_large")
     const parsed = JSON.parse(raw)
     const code = parsed?.error?.code
-    if (code === "ambiguous_session") {
-      const { candidates, more } = parsed.error
-      if (response.status !== 409 || !Array.isArray(candidates) || candidates.length < 1 || candidates.length > 10 ||
-          !candidates.every((candidate: unknown) => validSession(candidate, true)) || typeof more !== "boolean") return errorResult("reader_unavailable")
-      return JSON.stringify({ error: { code, candidates, more } })
-    }
+    if (code === "ambiguous_session") return ambiguous(response.status, parsed.error, "reader_unavailable")
     if (!response.ok) {
-      if (code === "session_changed" && validRevision(parsed?.error?.current_revision)) return errorResult(code, parsed.error.current_revision)
-      return errorResult(["session_changed", "not_indexed", "malformed_request", "not_found", "unauthorized"].includes(code) ? code : "reader_unavailable")
+      if (code === "session_changed" && validRevision(parsed?.error?.current_revision)) return toolError(code, { current_revision: parsed.error.current_revision })
+      return toolError(["session_changed", "not_indexed", "malformed_request", "not_found", "unauthorized"].includes(code) ? code : "reader_unavailable")
     }
     return raw
-  } catch { return errorResult("reader_unavailable") }
+  } catch { return toolError("reader_unavailable") }
 }
 
-export async function registerRetrieval(ctx: Plugin.Context, archive: Archive): Promise<void> {
-  const skill = await bundledSkill("searching-sessions")
-  await ctx.tool.transform((tools) => {
-    tools.namespace({ name: "spool", description: "Search coding-agent sessions, message sessions on machines that are online, and publish documents for the user to read." })
-    for (const route of ["find", "search", "read"] as const) {
-      const definition = definitions[route]
-      tools.add({
-        name: definition.name,
-        options: { namespace: "spool", codemode: false },
-        description: definition.description,
-        input: {
-          type: "object",
-          additionalProperties: false,
-          properties: { ...definition.properties, cursor: { ...string, maxLength: 8192, description: "`next_cursor` from a previous result, given without other arguments." } },
-        },
-        execute: async (input, context) => ({ content: await requestReader(archive, route, input, context.signal) }),
-      })
-    }
-  })
-  await ctx.skill.transform((skills) => { skills.add(skill) })
+export function retrievalTools(archive: Archive): Tool[] {
+  return (["find", "search", "read"] as const).map((route) => ({
+    name: definitions[route].name,
+    description: definitions[route].description,
+    input: {
+      type: "object",
+      additionalProperties: false,
+      properties: { ...definitions[route].properties, cursor: { ...string, maxLength: 8192, description: "`next_cursor` from a previous result, given without other arguments." } },
+    },
+    run: (input, context) => requestReader(archive, route, input, context.signal),
+  }))
 }

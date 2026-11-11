@@ -29,7 +29,7 @@ checkpoints: the installer reuses them.
 It writes one entry to `plugins` in the global `opencode.json`, preserving
 other configuration, and replaces any earlier Spool entry, including one that
 points at a checkout. Options already configured are kept unless a flag
-overrides them; the retired `readerUrl` and `sweepIntervalMs` are dropped.
+overrides them. The plugin refuses options it does not know.
 `--dry-run` prints the entry without writing it. The result looks like this:
 
 ```json
@@ -60,10 +60,7 @@ option leaves any centrally assigned name unchanged; it does not clear it.
 Adding an alias preserves checkpoints and does not recapture existing sessions.
 
 Checkpoints are keyed by source, not `url`, so changing `url` does not recapture
-sessions. Plugins installed from a checkout keyed them by both. When replacing
-one, run the installer without `--url` first, let OpenCode reload so the plugin
-moves the checkpoints, then run it again with `--url`; the installer refuses to
-do both at once. Going back to such a plugin afterwards recaptures every session.
+sessions.
 
 OpenCode reloads plugins when the global configuration changes, installing a new
 package in the background first; `opencode plugin list` shows `spool` once it is
@@ -106,7 +103,7 @@ Exercise `spool_find_sessions` with `{"limit":1}`. If the archive has a session,
 pass its exact returned `session` reference to `spool_read_messages` with
 `start: 1, end: 1`; then search a known phrase from that evidence with
 `spool_search_messages`. References use `work-laptop/ses_…` when named, otherwise
-`source-UUID/ses_…`; legacy UUID-qualified references remain valid. A bare native
+`source-UUID/ses_…`, and a UUID-qualified reference works for named sources too. A bare native
 OpenCode ID also works when globally unique. If `ambiguous_session` returns
 `candidates`, select the qualified reference for the intended source, not simply
 the first; `more: true` means additional candidates exist. Use find to narrow the
@@ -132,7 +129,6 @@ selection. See [repository identity](retrieval.md#repository-identity).
 Managed OpenCode service discovery is automatic and must resolve the plugin's own
 process. For a nondefault registration use `serviceFile`; for an unmanaged server
 set both `opencodeUrl` and `opencodePasswordFile`. Those endpoints must still
-identify the current host; remote ingestion requires HTTPS. The former
-`sweepIntervalMs` option is accepted but ignored: capture is
+identify the current host; remote ingestion requires HTTPS. Capture is
 event-driven, with explicit [repair](ingestion.md#capture-and-retention), not
 periodic full sweeps.

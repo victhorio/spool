@@ -1,143 +1,33 @@
-use std::{collections::BTreeMap, path::Path as FilePath};
+//! The reader's session list and transcripts.
 
-use anyhow::{Context, bail};
-use axum::{
-    Json, Router,
-    extract::{
-        Path, Query, Request, State,
-        rejection::{PathRejection, QueryRejection},
-    },
-    http::{HeaderValue, StatusCode},
-    middleware::{self, Next},
-    response::{IntoResponse, Response},
-    routing::get,
-};
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use std::collections::BTreeMap;
+
+use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
 use chrono::{DateTime, Utc};
 use futures_util::TryStreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
-use sqlx::{FromRow, PgPool, QueryBuilder};
-use tower_http::services::{ServeDir, ServeFile};
+use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
 use crate::{
-    access::{self, Access},
-    artifacts,
-    delivery::{self, Mailbox},
-    device,
+    consistent_read,
+    delivery::{self, Status},
     error::ApiError,
-    reference::{self, Reference},
-    snapshot::valid_id,
+    page,
+    reference::{self, LIVE_SESSIONS, Named, Reference, valid_id},
+    request::{Path, Query},
 };
 
-/// The web reader and its API. Every request requires a Cloudflare Access assertion.
-/// Archive reads use `read`, which should be a read-only pool; device approval
-/// and sending messages write.
-pub(crate) fn router(
-    write: PgPool,
-    read: PgPool,
-    mailbox: Mailbox,
-    access: Access,
-    assets: impl AsRef<FilePath>,
-) -> anyhow::Result<Router> {
-    let assets = assets.as_ref();
-    let index = assets.join("index.html");
-    let metadata = std::fs::metadata(&index).with_context(|| {
-        format!(
-            "web assets missing: {} is required; build the web frontend first or set ASSETS_DIR",
-            index.display()
-        )
-    })?;
-    if !metadata.is_file() {
-        bail!("web assets invalid: {} must be a file", index.display());
-    }
-    Ok(Router::new()
+/// Mounted only in the reader, behind Cloudflare Access; reads only.
+pub(crate) fn reader_routes() -> Router<PgPool> {
+    Router::new()
         .route("/api/sessions", get(sessions))
         .route("/api/sessions/{*reference}", get(session))
-        .merge(artifacts::reader_routes())
-        .with_state(read)
-        .merge(device::reader_routes().with_state(write))
-        .merge(delivery::reader_routes().with_state(mailbox))
-        .route_service("/", ServeFile::new(index.clone()))
-        .route_service("/sessions/{*reference}", ServeFile::new(index.clone()))
-        .route_service("/device", ServeFile::new(index.clone()))
-        .route_service("/artifacts", ServeFile::new(index.clone()))
-        .route_service("/artifacts/{id}", ServeFile::new(index.clone()))
-        .route_service("/index.html", ServeFile::new(index))
-        .nest_service("/assets", ServeDir::new(assets.join("assets")))
-        .route_service("/favicon.ico", ServeFile::new(assets.join("favicon.ico")))
-        .fallback(|| async { ApiError::new(StatusCode::NOT_FOUND, "not_found") })
-        .method_not_allowed_fallback(|| async {
-            ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
-        })
-        .layer(middleware::from_fn_with_state(access, access::require))
-        .layer(middleware::from_fn(privacy)))
-}
-
-async fn privacy(request: Request, next: Next) -> Response {
-    let mut response = if trusted_request(&request) {
-        next.run(request).await
-    } else {
-        ApiError::new(StatusCode::FORBIDDEN, "forbidden_origin").into_response()
-    };
-    // Artifact content sets its own framing and content policy.
-    let headers = response.headers_mut();
-    for (name, value) in [
-        ("cache-control", "no-store"),
-        ("referrer-policy", "no-referrer"),
-        ("x-content-type-options", "nosniff"),
-        ("x-frame-options", "DENY"),
-        ("cross-origin-resource-policy", "same-origin"),
-        ("strict-transport-security", "max-age=31536000"),
-        (
-            "content-security-policy",
-            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src * data: blob:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src 'self'",
-        ),
-    ] {
-        headers
-            .entry(name)
-            .or_insert(HeaderValue::from_static(value));
-    }
-    response
-}
-
-/// The API serves only the reader's own pages. TLS terminates before this
-/// service, so an Origin is compared with the Host by authority, not scheme.
-fn trusted_request(request: &Request) -> bool {
-    let path = request.uri().path();
-    if path != "/api" && !path.starts_with("/api/") {
-        return true;
-    }
-    let headers = request.headers();
-    if headers.get_all("sec-fetch-site").iter().any(|value| {
-        !value
-            .to_str()
-            .is_ok_and(|value| matches!(value, "same-origin" | "none"))
-    }) {
-        return false;
-    }
-    let mut origins = headers.get_all("origin").iter().peekable();
-    if origins.peek().is_none() {
-        return true;
-    }
-    let mut hosts = headers.get_all("host").iter();
-    let (Some(host), None) = (hosts.next(), hosts.next()) else {
-        return false;
-    };
-    origins.all(|origin| {
-        origin
-            .to_str()
-            .ok()
-            .and_then(|origin| origin.split_once("://"))
-            .is_some_and(|(scheme, authority)| {
-                matches!(scheme, "http" | "https") && authority.as_bytes() == host.as_bytes()
-            })
-    })
 }
 
 #[derive(Deserialize)]
-struct Page {
+struct TranscriptQuery {
     cursor: Option<String>,
     limit: Option<u16>,
 }
@@ -151,36 +41,19 @@ struct SessionQuery {
 }
 
 #[derive(Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum Cursor {
-    SessionsV2 {
+    Sessions {
         activity: i64,
         source_id: Uuid,
         session_id: String,
     },
     /// Messages before `position`: the reader opens a session at its end.
-    MessagesV2 {
+    Messages {
         source_id: Uuid,
         session_id: String,
         revision: i64,
         position: i32,
     },
-}
-
-impl Cursor {
-    fn encode(&self) -> String {
-        URL_SAFE_NO_PAD.encode(serde_json::to_vec(self).expect("cursor is serializable"))
-    }
-
-    fn decode(value: &str) -> Result<Self, ApiError> {
-        if value.len() > 8192 {
-            return Err(ApiError::malformed());
-        }
-        let bytes = URL_SAFE_NO_PAD
-            .decode(value)
-            .map_err(|_| ApiError::malformed())?;
-        serde_json::from_slice(&bytes).map_err(|_| ApiError::malformed())
-    }
 }
 
 #[derive(FromRow)]
@@ -193,7 +66,13 @@ struct SessionRow {
     revision: i64,
     info: String,
     received_at: DateTime<Utc>,
-    status: String,
+    status: Status,
+}
+
+impl Named for SessionRow {
+    fn name(&self) -> (Uuid, Option<&str>, &str) {
+        (self.source_id, self.alias.as_deref(), &self.session_id)
+    }
 }
 
 const SESSION_COLUMNS: &str = concat!(
@@ -201,7 +80,7 @@ const SESSION_COLUMNS: &str = concat!(
     reference::shared!("s"),
     " AS shared, s.revision, s.info::text AS info, s.received_at, ",
     delivery::status!(),
-    " AS status FROM sessions s JOIN sources ON sources.id = s.source_id WHERE s.deleted_at IS NULL"
+    " AS status"
 );
 
 #[derive(Serialize)]
@@ -213,7 +92,7 @@ struct Session {
     revision: String,
     info: Box<RawValue>,
     received_at: DateTime<Utc>,
-    status: String,
+    status: Status,
 }
 
 fn raw(value: String) -> Result<Box<RawValue>, ApiError> {
@@ -300,30 +179,13 @@ struct Sessions {
     next_cursor: Option<String>,
 }
 
-fn page_limit(page: Page, default: u16, max: u16) -> Result<(Page, u16), ApiError> {
-    let limit = page.limit.unwrap_or(default);
-    if !(1..=max).contains(&limit) {
-        return Err(ApiError::malformed());
-    }
-    Ok((page, limit))
-}
-
 async fn sessions(
     State(pool): State<PgPool>,
-    query: Result<Query<SessionQuery>, QueryRejection>,
+    Query(query): Query<SessionQuery>,
 ) -> Result<Json<Sessions>, ApiError> {
-    let Query(query) = query.map_err(|_| ApiError::malformed())?;
-    let (page, limit) = page_limit(
-        Page {
-            cursor: query.cursor,
-            limit: query.limit,
-        },
-        50,
-        500,
-    )?;
-    let after = page.cursor.as_deref().map(Cursor::decode).transpose()?;
-    let after = match after {
-        Some(Cursor::SessionsV2 {
+    let limit = page::limit(query.limit, 50, 500)?;
+    let after = match query.cursor.as_deref().map(page::decode).transpose()? {
+        Some(Cursor::Sessions {
             activity,
             source_id,
             session_id,
@@ -334,7 +196,8 @@ async fn sessions(
     let search = query.q.as_deref().unwrap_or("").trim().to_lowercase();
     // PostgreSQL JSON extraction rejects accepted escaped NUL even in unrelated
     // fields. Rank the raw metadata here, retaining only one page of candidates.
-    let sql = format!("{SESSION_COLUMNS} AND ($1::uuid IS NULL OR s.source_id = $1)");
+    let sql =
+        format!("{SESSION_COLUMNS}{LIVE_SESSIONS} AND ($1::uuid IS NULL OR s.source_id = $1)");
     let mut stream = sqlx::query_as::<_, SessionRow>(&sql)
         .bind(query.source)
         .fetch(&pool);
@@ -342,7 +205,7 @@ async fn sessions(
     while let Some(row) = stream
         .try_next()
         .await
-        .map_err(|error| ApiError::database("browse.sessions", error))?
+        .map_err(ApiError::database("browse.sessions"))?
     {
         let (activity, text) = row.overview();
         let key = (activity, row.source_id, row.session_id.clone());
@@ -356,19 +219,13 @@ async fn sessions(
     }
     drop(stream);
     let mut rows: Vec<_> = recent.into_iter().rev().collect();
-    let next_cursor = if rows.len() > usize::from(limit) {
-        rows.pop();
-        rows.last().map(|((activity, source, session), _)| {
-            Cursor::SessionsV2 {
-                activity: *activity,
-                source_id: *source,
-                session_id: session.clone(),
-            }
-            .encode()
+    let next_cursor = page::last(&mut rows, limit).map(|((activity, source, session), _)| {
+        page::encode(&Cursor::Sessions {
+            activity: *activity,
+            source_id: *source,
+            session_id: session.clone(),
         })
-    } else {
-        None
-    };
+    });
     let sources = sqlx::query_as(
         "SELECT id AS source_id, label AS source_label FROM sources \
          WHERE EXISTS (SELECT 1 FROM sessions WHERE source_id = sources.id AND deleted_at IS NULL) \
@@ -376,7 +233,7 @@ async fn sessions(
     )
     .fetch_all(&pool)
     .await
-    .map_err(|error| ApiError::database("browse.sources", error))?;
+    .map_err(ApiError::database("browse.sources"))?;
     Ok(Json(Sessions {
         sessions: rows
             .into_iter()
@@ -405,16 +262,13 @@ struct MessageRow {
 
 async fn session(
     State(pool): State<PgPool>,
-    path: Result<Path<String>, PathRejection>,
-    query: Result<Query<Page>, QueryRejection>,
+    Path(reference): Path<String>,
+    Query(query): Query<TranscriptQuery>,
 ) -> Result<Json<Transcript>, ApiError> {
-    let Path(reference) = path.map_err(|_| ApiError::malformed())?;
     let reference = Reference::parse(&reference)?;
-    let Query(page) = query.map_err(|_| ApiError::malformed())?;
-    let (page, limit) = page_limit(page, 100, 200)?;
-    let cursor = page.cursor.as_deref().map(Cursor::decode).transpose()?;
-    let before = match cursor {
-        Some(Cursor::MessagesV2 {
+    let limit = page::limit(query.limit, 100, 200)?;
+    let before = match query.cursor.as_deref().map(page::decode).transpose()? {
+        Some(Cursor::Messages {
             source_id,
             session_id,
             revision,
@@ -423,25 +277,8 @@ async fn session(
         None => None,
         _ => return Err(ApiError::malformed()),
     };
-    let mut tx = pool
-        .begin()
-        .await
-        .map_err(|error| ApiError::database("browse.begin", error))?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        .execute(&mut *tx)
-        .await
-        .map_err(|error| ApiError::database("browse.snapshot", error))?;
-    let mut sql = QueryBuilder::new(SESSION_COLUMNS);
-    reference.filter(&mut sql);
-    sql.push(" ORDER BY s.source_id LIMIT 11");
-    let rows: Vec<SessionRow> = sql
-        .build_query_as()
-        .fetch_all(&mut *tx)
-        .await
-        .map_err(|error| ApiError::database("browse.session", error))?;
-    let row = reference::one(rows, |row| {
-        (row.source_id, row.alias.as_deref(), row.session_id.as_str())
-    })?;
+    let mut tx = consistent_read(&pool).await?;
+    let row: SessionRow = reference.resolve(SESSION_COLUMNS, &mut *tx).await?;
     let position = match before {
         Some((source, session, revision, position))
             if source == row.source_id && session == row.session_id =>
@@ -465,24 +302,18 @@ async fn session(
     .bind(i64::from(limit) + 1)
     .fetch_all(&mut *tx)
     .await
-    .map_err(|error| ApiError::database("browse.messages", error))?;
+    .map_err(ApiError::database("browse.messages"))?;
     tx.commit()
         .await
-        .map_err(|error| ApiError::database("browse.commit", error))?;
-    let earlier_cursor = if rows.len() > usize::from(limit) {
-        rows.pop();
-        rows.last().map(|message| {
-            Cursor::MessagesV2 {
-                source_id: source,
-                session_id: session,
-                revision: row.revision,
-                position: message.position,
-            }
-            .encode()
+        .map_err(ApiError::database("browse.commit"))?;
+    let earlier_cursor = page::last(&mut rows, limit).map(|message| {
+        page::encode(&Cursor::Messages {
+            source_id: source,
+            session_id: session,
+            revision: row.revision,
+            position: message.position,
         })
-    } else {
-        None
-    };
+    });
     rows.reverse();
     let first_index = rows.first().map_or(1, |message| message.position + 1);
     Ok(Json(Transcript {

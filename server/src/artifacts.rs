@@ -3,17 +3,13 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    Json, Router,
-    body::{Bytes, to_bytes},
-    extract::{
-        Path, Query, Request, State,
-        rejection::{PathRejection, QueryRejection},
-    },
+    Extension, Json, Router,
+    body::Bytes,
+    extract::{Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::get,
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use chrono::{DateTime, Utc};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
@@ -22,7 +18,13 @@ use sqlx::{FromRow, PgConnection, PgPool, Postgres, QueryBuilder};
 use tokio::sync::Semaphore;
 use uuid::Uuid;
 
-use crate::{auth, error::ApiError, reference, retrieval::pattern, snapshot::valid_id};
+use crate::{
+    auth::Source,
+    error::ApiError,
+    page,
+    reference::{self, valid_id},
+    request::{self, Path, Query},
+};
 
 pub(crate) const MAX_SIZE: usize = 32 << 20;
 /// The artifacts one source created may total at most this many bytes.
@@ -70,26 +72,18 @@ pub(crate) fn reader_routes() -> Router<PgPool> {
         .route("/artifacts/{id}/content", get(content))
 }
 
-fn database(operation: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
-    move |error| ApiError::database(operation, error)
-}
-
-fn not_found() -> ApiError {
-    ApiError::new(StatusCode::NOT_FOUND, "not_found")
-}
-
 fn valid_artifact_id(id: &str) -> bool {
     id.len() == 16
         && id.starts_with("art_")
         && id.bytes().skip(4).all(|byte| ID_ALPHABET.contains(&byte))
 }
 
-fn artifact_id(path: Result<Path<String>, PathRejection>) -> Result<String, ApiError> {
-    let Path(id) = path.map_err(|_| ApiError::malformed())?;
+/// No artifact has an ID of another form.
+fn artifact_id(id: String) -> Result<String, ApiError> {
     if valid_artifact_id(&id) {
         Ok(id)
     } else {
-        Err(not_found())
+        Err(ApiError::not_found())
     }
 }
 
@@ -99,14 +93,6 @@ fn title(value: &str) -> Result<String, ApiError> {
         return Err(ApiError::malformed());
     }
     Ok(value.to_owned())
-}
-
-fn revision(value: &str) -> Result<i64, ApiError> {
-    value
-        .parse::<i64>()
-        .ok()
-        .filter(|revision| *revision > 0)
-        .ok_or_else(ApiError::malformed)
 }
 
 #[derive(FromRow)]
@@ -163,8 +149,8 @@ async fn row(connection: &mut PgConnection, id: &str) -> Result<Row, ApiError> {
         .bind(id)
         .fetch_optional(connection)
         .await
-        .map_err(database("artifact.row"))?
-        .ok_or_else(not_found)
+        .map_err(ApiError::database("artifact.row"))?
+        .ok_or_else(ApiError::not_found)
 }
 
 enum Content {
@@ -236,15 +222,11 @@ fn media_type(headers: &HeaderMap) -> Result<&'static str, ApiError> {
     Ok(media_type)
 }
 
-/// Reads a body after authentication. Large bodies take one of a few permits, so
-/// memory stays bounded; small ones never wait behind a slow large upload.
+/// Reads a body. Large bodies take one of a few permits, so memory stays
+/// bounded; small ones never wait behind a slow large upload.
 async fn upload(machine: &Machine, request: Request) -> Result<Bytes, ApiError> {
-    let small = request
-        .headers()
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .is_some_and(|length| length <= SMALL_BODY);
+    let small =
+        request::content_length(request.headers()).is_some_and(|length| length <= SMALL_BODY);
     let _permit = if small {
         None
     } else {
@@ -255,51 +237,7 @@ async fn upload(machine: &Machine, request: Request) -> Result<Bytes, ApiError> 
                 .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "busy"))?,
         )
     };
-    read_body(request).await
-}
-
-async fn read_body(request: Request) -> Result<Bytes, ApiError> {
-    let too_large = || ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large");
-    let headers = request.headers();
-    if headers
-        .get_all(header::CONTENT_ENCODING)
-        .iter()
-        .any(|value| {
-            !value
-                .to_str()
-                .is_ok_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
-        })
-    {
-        return Err(ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_content_encoding",
-        ));
-    }
-    if headers
-        .get(header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .is_some_and(|length| length > MAX_SIZE as u64)
-    {
-        return Err(too_large());
-    }
-    tokio::time::timeout(
-        Duration::from_secs(120),
-        to_bytes(request.into_body(), MAX_SIZE),
-    )
-    .await
-    .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "request_timeout"))?
-    .map_err(|error| {
-        use std::error::Error;
-        if error
-            .source()
-            .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
-        {
-            too_large()
-        } else {
-            ApiError::malformed()
-        }
-    })
+    request::body(request, MAX_SIZE, Duration::from_secs(120)).await
 }
 
 /// Rejects a change that would take the creating source past its quota.
@@ -315,7 +253,7 @@ async fn check_quota(
     .bind(source)
     .fetch_one(connection)
     .await
-    .map_err(database("artifact.quota"))?;
+    .map_err(ApiError::database("artifact.quota"))?;
     if used - removed + added as i64 > QUOTA {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -344,11 +282,10 @@ struct CreateQuery {
 
 async fn create(
     State(machine): State<Machine>,
-    query: Result<Query<CreateQuery>, QueryRejection>,
+    Extension(Source(source)): Extension<Source>,
+    Query(query): Query<CreateQuery>,
     request: Request,
 ) -> Result<Response, ApiError> {
-    let source = auth::authenticate(&machine.write, request.headers()).await?;
-    let Query(query) = query.map_err(|_| ApiError::malformed())?;
     let title = title(&query.title)?;
     if query
         .session
@@ -363,7 +300,7 @@ async fn create(
         .write
         .begin()
         .await
-        .map_err(database("artifact.create"))?;
+        .map_err(ApiError::database("artifact.create"))?;
     check_quota(&mut tx, source, 0, content.size()).await?;
     // 32^12 identifiers: a collision is rare, and repeated collisions are not expected.
     for _ in 0..3 {
@@ -388,11 +325,13 @@ async fn create(
         let inserted = bind_content(query, &content)
             .execute(&mut *tx)
             .await
-            .map_err(database("artifact.create"))?
+            .map_err(ApiError::database("artifact.create"))?
             .rows_affected();
         if inserted == 1 {
             let row = row(&mut tx, &id).await?;
-            tx.commit().await.map_err(database("artifact.create"))?;
+            tx.commit()
+                .await
+                .map_err(ApiError::database("artifact.create"))?;
             return Ok((StatusCode::CREATED, Json(json!({"artifact": row.json()}))).into_response());
         }
     }
@@ -417,8 +356,8 @@ async fn current(
             .bind(id)
             .fetch_optional(&mut *connection)
             .await
-            .map_err(database("artifact.lock"))?
-            .ok_or_else(not_found)?;
+            .map_err(ApiError::database("artifact.lock"))?
+            .ok_or_else(ApiError::not_found)?;
     if current.revision != expected {
         return Err(ApiError::conflict(Some(current.revision)));
     }
@@ -434,14 +373,12 @@ struct ReplaceQuery {
 
 async fn replace(
     State(machine): State<Machine>,
-    id: Result<Path<String>, PathRejection>,
-    query: Result<Query<ReplaceQuery>, QueryRejection>,
+    Path(id): Path<String>,
+    Query(query): Query<ReplaceQuery>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    auth::authenticate(&machine.write, request.headers()).await?;
     let id = artifact_id(id)?;
-    let Query(query) = query.map_err(|_| ApiError::malformed())?;
-    let expected = revision(&query.revision)?;
+    let expected = request::revision(&query.revision)?;
     let title = query.title.as_deref().map(title).transpose()?;
     let media_type = media_type(request.headers())?;
     let content = Content::parse(media_type, upload(&machine, request).await?)?;
@@ -449,7 +386,7 @@ async fn replace(
         .write
         .begin()
         .await
-        .map_err(database("artifact.replace"))?;
+        .map_err(ApiError::database("artifact.replace"))?;
     let current = current(&mut tx, &id, expected).await?;
     check_quota(
         &mut tx,
@@ -470,9 +407,11 @@ async fn replace(
     bind_content(query, &content)
         .execute(&mut *tx)
         .await
-        .map_err(database("artifact.replace"))?;
+        .map_err(ApiError::database("artifact.replace"))?;
     let row = row(&mut tx, &id).await?;
-    tx.commit().await.map_err(database("artifact.replace"))?;
+    tx.commit()
+        .await
+        .map_err(ApiError::database("artifact.replace"))?;
     Ok(Json(json!({"artifact": row.json()})))
 }
 
@@ -509,26 +448,13 @@ fn apply(mut text: String, edits: &[Edit]) -> Result<String, ApiError> {
 
 async fn change(
     State(machine): State<Machine>,
-    id: Result<Path<String>, PathRejection>,
+    Path(id): Path<String>,
     request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    auth::authenticate(&machine.write, request.headers()).await?;
     let id = artifact_id(id)?;
-    let json = request
-        .headers()
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.split(';').next())
-        .is_some_and(|value| value.trim().eq_ignore_ascii_case("application/json"));
-    if !json {
-        return Err(ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_content_type",
-        ));
-    }
-    let body = upload(&machine, request).await?;
-    let change: Change = serde_json::from_slice(&body).map_err(|_| ApiError::malformed())?;
-    let expected = revision(&change.revision)?;
+    request::require_json(request.headers())?;
+    let change: Change = request::object(&upload(&machine, request).await?)?;
+    let expected = request::revision(&change.revision)?;
     let title = change.title.as_deref().map(title).transpose()?;
     let edits = change.edits.unwrap_or_default();
     if (title.is_none() && edits.is_empty())
@@ -542,7 +468,7 @@ async fn change(
         .write
         .begin()
         .await
-        .map_err(database("artifact.change"))?;
+        .map_err(ApiError::database("artifact.change"))?;
     let current = current(&mut tx, &id, expected).await?;
     if edits.is_empty() {
         sqlx::query(
@@ -553,22 +479,19 @@ async fn change(
         .bind(title)
         .execute(&mut *tx)
         .await
-        .map_err(database("artifact.change"))?;
+        .map_err(ApiError::database("artifact.change"))?;
     } else {
         let text: Option<String> =
             sqlx::query_scalar("SELECT text_content FROM artifacts WHERE id = $1")
                 .bind(&id)
                 .fetch_one(&mut *tx)
                 .await
-                .map_err(database("artifact.change"))?;
+                .map_err(ApiError::database("artifact.change"))?;
         let text =
             text.ok_or_else(|| ApiError::new(StatusCode::UNPROCESSABLE_ENTITY, "not_text"))?;
         let text = apply(text, &edits)?;
         if text.len() > MAX_SIZE {
-            return Err(ApiError::new(
-                StatusCode::PAYLOAD_TOO_LARGE,
-                "payload_too_large",
-            ));
+            return Err(ApiError::too_large());
         }
         check_quota(&mut tx, current.source_id, current.size.into(), text.len()).await?;
         sqlx::query(
@@ -581,10 +504,12 @@ async fn change(
         .bind(text)
         .execute(&mut *tx)
         .await
-        .map_err(database("artifact.change"))?;
+        .map_err(ApiError::database("artifact.change"))?;
     }
     let row = row(&mut tx, &id).await?;
-    tx.commit().await.map_err(database("artifact.change"))?;
+    tx.commit()
+        .await
+        .map_err(ApiError::database("artifact.change"))?;
     Ok(Json(json!({"artifact": row.json()})))
 }
 
@@ -603,13 +528,10 @@ struct Chunk {
 
 async fn read_text(
     State(machine): State<Machine>,
-    headers: HeaderMap,
-    id: Result<Path<String>, PathRejection>,
-    query: Result<Query<ReadQuery>, QueryRejection>,
+    Path(id): Path<String>,
+    Query(query): Query<ReadQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    auth::authenticate(&machine.write, &headers).await?;
     let id = artifact_id(id)?;
-    let Query(query) = query.map_err(|_| ApiError::malformed())?;
     let offset = query.offset.unwrap_or(0);
     if !(0..=MAX_SIZE as i64).contains(&offset) {
         return Err(ApiError::malformed());
@@ -623,8 +545,8 @@ async fn read_text(
     .bind(CHUNK as i32 + 1)
     .fetch_optional(&machine.read)
     .await
-    .map_err(database("artifact.read"))?
-    .ok_or_else(not_found)?;
+    .map_err(ApiError::database("artifact.read"))?
+    .ok_or_else(ApiError::not_found)?;
     let (text, next) = match found.chunk {
         None => (None, None),
         Some(chunk) => {
@@ -680,15 +602,13 @@ async fn list(pool: &PgPool, request: ListQuery, maximum: u16) -> Result<Value, 
             query: None,
             limit: None,
         } => {
-            let cursor: Cursor = (cursor.len() <= 2048)
-                .then(|| URL_SAFE_NO_PAD.decode(cursor).ok())
-                .flatten()
-                .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-                .filter(|cursor: &Cursor| valid_artifact_id(&cursor.id))
-                .ok_or_else(ApiError::malformed)?;
+            let cursor: Cursor = page::decode(&cursor)?;
+            if !valid_artifact_id(&cursor.id) {
+                return Err(ApiError::malformed());
+            }
             (
                 cursor.query,
-                cursor.limit,
+                page::limit(Some(cursor.limit), 20, maximum)?,
                 Some((cursor.updated_at, cursor.id)),
             )
         }
@@ -696,31 +616,21 @@ async fn list(pool: &PgPool, request: ListQuery, maximum: u16) -> Result<Value, 
             cursor: None,
             query,
             limit,
-        } => (query, limit.unwrap_or(20), None),
+        } => (query, page::limit(limit, 20, maximum)?, None),
         _ => return Err(ApiError::malformed()),
     };
-    if !(1..=maximum).contains(&limit) {
-        return Err(ApiError::malformed());
-    }
-    let terms: Vec<&str> = query
+    let terms = query
         .as_deref()
-        .unwrap_or_default()
-        .split_whitespace()
-        .collect();
-    if query
-        .as_deref()
-        .is_some_and(|query| query.len() > 512 || query.contains('\0'))
-        || terms.len() > 16
-    {
-        return Err(ApiError::malformed());
-    }
+        .map(request::terms)
+        .transpose()?
+        .unwrap_or_default();
     let mut sql = QueryBuilder::<Postgres>::new(COLUMNS);
     sql.push(FROM).push(" WHERE true");
     for term in &terms {
         sql.push(" AND ")
             .push(SEARCHED)
             .push(" ILIKE ")
-            .push_bind(pattern(term));
+            .push_bind(request::pattern(term));
     }
     if let Some((updated_at, id)) = &after {
         sql.push(" AND (a.updated_at, a.id) < (")
@@ -735,21 +645,15 @@ async fn list(pool: &PgPool, request: ListQuery, maximum: u16) -> Result<Value, 
         .build_query_as()
         .fetch_all(pool)
         .await
-        .map_err(database("artifact.list"))?;
-    let next_cursor = if rows.len() > usize::from(limit) {
-        rows.pop();
-        rows.last().map(|last| {
-            let cursor = Cursor {
-                query: query.clone(),
-                limit,
-                updated_at: last.updated_at,
-                id: last.id.clone(),
-            };
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&cursor).expect("cursor is serializable"))
+        .map_err(ApiError::database("artifact.list"))?;
+    let next_cursor = page::last(&mut rows, limit).map(|last| {
+        page::encode(&Cursor {
+            query: query.clone(),
+            limit,
+            updated_at: last.updated_at,
+            id: last.id.clone(),
         })
-    } else {
-        None
-    };
+    });
     Ok(json!({
         "artifacts": rows.iter().map(Row::json).collect::<Vec<_>>(),
         "next_cursor": next_cursor,
@@ -758,11 +662,8 @@ async fn list(pool: &PgPool, request: ListQuery, maximum: u16) -> Result<Value, 
 
 async fn find(
     State(machine): State<Machine>,
-    headers: HeaderMap,
-    query: Result<Query<ListQuery>, QueryRejection>,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    auth::authenticate(&machine.write, &headers).await?;
-    let Query(query) = query.map_err(|_| ApiError::malformed())?;
     Ok(Json(list(&machine.read, query, 50).await?))
 }
 
@@ -776,9 +677,8 @@ struct ReaderListQuery {
 
 async fn reader_list(
     State(pool): State<PgPool>,
-    query: Result<Query<ReaderListQuery>, QueryRejection>,
+    Query(ReaderListQuery { q, limit, cursor }): Query<ReaderListQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let Query(ReaderListQuery { q, limit, cursor }) = query.map_err(|_| ApiError::malformed())?;
     let query = q.filter(|q| !q.trim().is_empty());
     Ok(Json(
         list(
@@ -796,10 +696,13 @@ async fn reader_list(
 
 async fn reader_show(
     State(pool): State<PgPool>,
-    id: Result<Path<String>, PathRejection>,
+    Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let id = artifact_id(id)?;
-    let mut connection = pool.acquire().await.map_err(database("artifact.show"))?;
+    let mut connection = pool
+        .acquire()
+        .await
+        .map_err(ApiError::database("artifact.show"))?;
     Ok(Json(
         json!({"artifact": row(&mut connection, &id).await?.json()}),
     ))
@@ -813,10 +716,7 @@ struct Body {
 }
 
 /// The raw content, isolated in an opaque origin.
-async fn content(
-    State(pool): State<PgPool>,
-    id: Result<Path<String>, PathRejection>,
-) -> Result<Response, ApiError> {
+async fn content(State(pool): State<PgPool>, Path(id): Path<String>) -> Result<Response, ApiError> {
     let id = artifact_id(id)?;
     let body: Body = sqlx::query_as(
         "SELECT media_type, text_content, binary_content FROM artifacts WHERE id = $1",
@@ -824,8 +724,8 @@ async fn content(
     .bind(&id)
     .fetch_optional(&pool)
     .await
-    .map_err(database("artifact.content"))?
-    .ok_or_else(not_found)?;
+    .map_err(ApiError::database("artifact.content"))?
+    .ok_or_else(ApiError::not_found)?;
     let content_type = match body.media_type.as_str() {
         "text/html" => "text/html; charset=utf-8",
         "image/svg+xml" => "image/svg+xml; charset=utf-8",
@@ -839,7 +739,7 @@ async fn content(
     let bytes: Vec<u8> = match (body.text_content, body.binary_content) {
         (Some(text), _) => text.into_bytes(),
         (None, Some(bytes)) => bytes,
-        (None, None) => return Err(not_found()),
+        (None, None) => return Err(ApiError::not_found()),
     };
     Ok((
         [

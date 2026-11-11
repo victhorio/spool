@@ -1,11 +1,9 @@
 import { open } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
-import type { Plugin } from "@opencode/plugin"
-import type { Config } from "./config"
-import { bundledSkill } from "./skills"
+import { type Archive, archiveFetch, boundedText } from "./archive"
+import { type Tool, toolError } from "./tools"
 
-type Archive = Pick<Config, "url" | "token">
 type Input = Record<string, unknown>
 
 const maximumSize = 32 * 1024 * 1024
@@ -70,7 +68,6 @@ export const definitions = {
 } as const
 export type Operation = keyof typeof definitions
 
-const errorResult = (code: string, extra: Input = {}) => JSON.stringify({ error: { code, ...extra } })
 
 function check(operation: Operation, input: unknown): Input | undefined {
   if (!input || typeof input !== "object" || Array.isArray(input)) return
@@ -132,20 +129,14 @@ function present(archive: Archive, artifact: Input): Input {
 }
 
 async function call(archive: Archive, route: string, init: RequestInit, timeout: number, signal?: AbortSignal): Promise<Input> {
-  let response: Response
-  try {
-    response = await fetch(`${archive.url}/v1/artifacts${route}`, {
-      ...init, redirect: "error", credentials: "omit",
-      headers: { accept: "application/json", authorization: `Bearer ${archive.token}`, ...init.headers },
-      signal: AbortSignal.any([AbortSignal.timeout(timeout), ...(signal ? [signal] : [])]),
-    })
-  } catch { throw new Refusal("archive_unavailable") }
-  const length = Number(response.headers.get("content-length") ?? 0)
-  const raw = length > maximumResponse ? undefined : await response.text().catch(() => undefined)
-  let parsed: Input | undefined
-  try { parsed = raw && raw.length <= maximumResponse ? JSON.parse(raw) : undefined } catch {}
+  const [ok, parsed] = await archiveFetch(archive, `/v1/artifacts${route}`, {
+    ...init, timeout, signal, headers: { accept: "application/json", ...init.headers },
+  }).then(async (response) => {
+    const raw = await boundedText(response, maximumResponse)
+    return [response.ok, raw === undefined ? undefined : JSON.parse(raw)] as const
+  }).catch(() => [false, undefined] as const)
   if (!parsed || typeof parsed !== "object") throw new Refusal("archive_unavailable")
-  if (!response.ok) {
+  if (!ok) {
     const error = parsed.error as Input | undefined
     const code = typeof error?.code === "string" && passed.includes(error.code) ? error.code : "archive_unavailable"
     const detail: Input = {}
@@ -153,18 +144,18 @@ async function call(archive: Archive, route: string, init: RequestInit, timeout:
     if (code.startsWith("edit_") && typeof error?.edit === "number") detail.edit = error.edit
     throw new Refusal(code, detail)
   }
-  return parsed
+  return parsed as Input
 }
 
 /** Runs one artifact tool; the result is JSON text for the model. */
 export async function runArtifact(archive: Archive, operation: Operation, raw: unknown, sessionID?: string, signal?: AbortSignal): Promise<string> {
   const input = check(operation, raw)
-  if (!input) return errorResult("malformed_request")
+  if (!input) return toolError("malformed_request")
   try {
     const id = input.id as string
     let result: Input
     if (operation === "create" || (operation === "update" && ("content" in input || "path" in input))) {
-      if (!("content" in input || "path" in input)) return errorResult("malformed_request", { reason: "give content or path" })
+      if (!("content" in input || "path" in input)) return toolError("malformed_request", { reason: "give content or path" })
       const { bytes, mediaType } = await body(input)
       const query = new URLSearchParams()
       if (operation === "create") {
@@ -195,24 +186,16 @@ export async function runArtifact(archive: Archive, operation: Operation, raw: u
     }
     return JSON.stringify({ artifact: present(archive, result.artifact as Input) })
   } catch (error) {
-    if (error instanceof Refusal) return errorResult(error.code, error.detail)
-    return errorResult("archive_unavailable")
+    if (error instanceof Refusal) return toolError(error.code, error.detail)
+    return toolError("archive_unavailable")
   }
 }
 
-export async function registerArtifacts(ctx: Plugin.Context, archive: Archive): Promise<void> {
-  const skill = await bundledSkill("publishing-artifacts")
-  await ctx.tool.transform((tools) => {
-    for (const operation of Object.keys(definitions) as Operation[]) {
-      const definition = definitions[operation]
-      tools.add({
-        name: definition.name,
-        options: { namespace: "spool", codemode: false },
-        description: definition.description,
-        input: { type: "object", additionalProperties: false, properties: definition.properties, required: [...definition.required] },
-        execute: async (input, context) => ({ content: await runArtifact(archive, operation, input, context.sessionID, context.signal) }),
-      })
-    }
-  })
-  await ctx.skill.transform((skills) => { skills.add(skill) })
+export function artifactTools(archive: Archive): Tool[] {
+  return (Object.keys(definitions) as Operation[]).map((operation) => ({
+    name: definitions[operation].name,
+    description: definitions[operation].description,
+    input: { type: "object", additionalProperties: false, properties: definitions[operation].properties, required: [...definitions[operation].required] },
+    run: (input, context) => runArtifact(archive, operation, input, context.sessionID, context.signal),
+  }))
 }

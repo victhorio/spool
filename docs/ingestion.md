@@ -78,14 +78,21 @@ they do not replace UUID credentials or change session identity. See
 
 ## HTTP
 
+Machine endpoints other than device login check the source token before reading
+anything else, so a request without a valid one gets 401 `unauthorized` whatever
+its method or body. JSON request bodies on every `/v1` endpoint must be objects
+sent as `application/json` (otherwise 415 `unsupported_content_type`), without
+compression (415 `unsupported_content_encoding`), and arrive within five seconds
+(400 `request_timeout`), except snapshot and artifact bodies, which have their
+own limits.
+
 - `GET /healthz`: empty 200 when PostgreSQL is reachable, otherwise 503.
 - `PUT /v1/sync/source`: authenticated assignment of `{ "alias": "work-m5" }`
   to the token's source. Names match `^[a-z][a-z0-9-]{0,31}$`. Returns 200 with
   `{ "alias": "work-m5" }`, including on an identical repeat. A different
   assigned name returns 409 `source_alias_mismatch`; a name reserved by another
   source returns 409 `source_alias_conflict`. No renaming or clearing operation.
-  JSON objects only, no unknown fields, 1024-byte body limit and five-second
-  body deadline. Omitting the plugin setting leaves the stored name untouched.
+  No unknown fields, and a 1024-byte body limit. Omitting the plugin setting leaves the stored name untouched.
 - `GET /v1/sync/sessions?limit=200&cursor=…`: source-scoped inventory, ordered
   by session ID. Limit 1–500. Returns
   `{"sessions":[{"session_id":"ses_…","revision":"7","deleted":false}],"next_cursor":null}`.

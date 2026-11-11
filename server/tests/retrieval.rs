@@ -710,8 +710,8 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
     )
     .await;
     let qualified = format!("work-m5/{id}");
-    let legacy_reference = format!("{}/{id}", a.source_id);
-    for reference in [&id, &qualified, &legacy_reference] {
+    let uuid_reference = format!("{}/{id}", a.source_id);
+    for reference in [&id, &qualified, &uuid_reference] {
         let read = h.call("read", json!({"session":reference,"start":2})).await;
         assert_eq!(read["session"], id, "unique IDs need no qualifier");
         assert_eq!(read["url"], format!("{READER}/sessions/{id}"));
@@ -739,31 +739,17 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
     let reading = h
         .call("read", json!({"session":id,"start":1,"end":3}))
         .await;
-    let legacy = |value: Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(&value).unwrap());
-    let old_search = legacy(json!({"kind":"Search","query":{
-        "session":legacy_reference,"query":"compactneedle","revision":null,"include_tools":false,"limit":1
-    },"revision":1,"before":2}));
-    let old_read = legacy(
-        json!({"kind":"Read","session":legacy_reference,"revision":1,"start":1,"end":3,"offset":0}),
-    );
     let search_cursor = searched["next_cursor"].as_str().unwrap();
     let read_cursor = searched["matches"][0]["read_cursor"].as_str().unwrap();
-    assert!(search_cursor.len() * 2 < old_search.len());
-    assert!(read_cursor.len() * 2 < old_read.len());
     assert!(
         read_cursor.len() <= 80,
         "normal evidence jump should fit in 80 characters: {}",
         read_cursor.len()
     );
-    assert_eq!(h.call("read", json!({"cursor":old_read})).await, reading);
-    assert_eq!(
-        h.call("search", json!({"cursor":old_search})).await,
-        h.call("search", json!({"cursor":search_cursor})).await
-    );
     let v2_search = "AgEQAAAAAAAAAAAAAAAAAAAAAR5zZXNfY29tcGFjdF91bmlxdWUwMDAwMDAwMDAwMDANY29tcGFjdG5lZWRsZQIAAQEE";
     assert_eq!(
         h.call("search", json!({"cursor":v2_search})).await,
-        h.call("search", json!({"cursor":old_search})).await
+        h.call("search", json!({"cursor":search_cursor})).await
     );
     let v2_read = "AgIQAAAAAAAAAAAAAAAAAAAAAR5zZXNfY29tcGFjdF91bmlxdWUwMDAwMDAwMDAwMDACBAYA";
     assert_eq!(
@@ -845,30 +831,9 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
             first["match"]["index"]
         )
     );
-    let first_source = if first_reference.starts_with("work-m5/") {
-        a.source_id
-    } else {
-        b.source_id
-    };
-    let old_find = legacy(
-        json!({"kind":"Find","query":{"query":"compactneedle","repository":null,"include_tools":false,"limit":1},
-        "after":{"score":1,"activity":1000,"source":first_source,"session":id}}),
-    );
     let find_cursor = found["next_cursor"].as_str().unwrap();
-    assert!(find_cursor.len() * 2 < old_find.len());
-    assert_eq!(
-        h.call("find", json!({"cursor":find_cursor})).await,
-        h.call("find", json!({"cursor":old_find})).await
-    );
-    eprintln!(
-        "cursor characters: find {} -> {}, search {} -> {}, evidence read {} -> {}",
-        old_find.len(),
-        find_cursor.len(),
-        old_search.len(),
-        search_cursor.len(),
-        old_read.len(),
-        read_cursor.len()
-    );
+    let next = h.call("find", json!({"cursor":find_cursor})).await;
+    assert_ne!(next["sessions"][0]["session"], first["session"]);
     for operation in ["find", "search", "read"] {
         let mut bytes = URL_SAFE_NO_PAD
             .decode(match operation {
@@ -892,6 +857,32 @@ async fn aliases_and_compact_cursors(h: &Harness, a: &admin::Credential, b: &adm
             .await;
         }
     }
+    // A read cursor: version 2, variant 2, the source, the session, then zigzag
+    // varints for revision 1, messages 1 to 1 and offset 0.
+    let read_from = |session: &str| {
+        let session = session.as_bytes();
+        URL_SAFE_NO_PAD.encode(
+            [
+                &[2, 2, 16][..],
+                a.source_id.as_bytes(),
+                &[session.len() as u8],
+                session,
+                &[2, 2, 2, 0],
+            ]
+            .concat(),
+        )
+    };
+    assert_eq!(
+        h.call("read", json!({"cursor":read_from(&id)})).await["messages"][0]["index"],
+        1
+    );
+    h.error(
+        "read",
+        json!({"cursor":read_from("")}),
+        StatusCode::BAD_REQUEST,
+        "malformed_request",
+    )
+    .await;
     for reader in [
         "ftp://spool.example",
         "https://spool.example/",

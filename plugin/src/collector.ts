@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto"
 import { setTimeout as delay } from "node:timers/promises"
-import { ClientError, OpenCode, isSessionNotFoundError, type OpenCodeClient } from "@opencode/client"
+import { OpenCode, isSessionNotFoundError, type OpenCodeClient } from "@opencode/client"
 import { Service } from "@opencode/client/service"
 import type { Plugin } from "@opencode/plugin"
+import { archiveFetch } from "./archive"
 import type { Config } from "./config"
+import { SyncError, errorCode, log } from "./log"
 import { deliver } from "./messages"
 import { projectRetrieval } from "./projection"
 import { resolveRepository } from "./repository"
@@ -20,31 +22,8 @@ interface Checkpoint {
 }
 interface Inventory { sessions: { session_id: string; revision: string; deleted: boolean }[]; next_cursor: string | null }
 
-class SyncError extends Error {
-  constructor(readonly code: string, readonly retryable = true, readonly revision?: string | null) { super(code) }
-}
-
-function errorCode(error: unknown): string {
-  if (error instanceof SyncError) return error.code
-  if (error instanceof ClientError) {
-    switch (error.reason) {
-      case "Transport": case "UnexpectedStatus": case "UnsupportedContentType": case "MalformedResponse": case "SseEventTooLarge":
-        return `sdk_${error.reason}`
-    }
-  }
-  if (error && typeof error === "object" && "_tag" in error) {
-    switch (error._tag) {
-      case "UnauthorizedError": case "InvalidRequestError": case "ServiceUnavailableError": case "LocationNotFoundError": case "InvalidCursorError": case "UnknownError":
-        return `sdk_${error._tag}`
-    }
-  }
-  if (error instanceof Error) {
-    if (error.name === "AbortError") return "aborted"
-    if (error.name === "TimeoutError") return "timeout"
-    if (error instanceof TypeError) return "type_error"
-  }
-  return "unexpected_error"
-}
+/** Conflicts the archive reports by code; others are logged by status. */
+const conflicts = ["revision_conflict", "source_alias_conflict", "source_alias_mismatch"]
 
 function digest(value: unknown): string { return createHash("sha256").update(JSON.stringify(value)).digest("hex") }
 
@@ -87,7 +66,7 @@ export class Collector {
     this.wake?.()
     this.running ??= Promise.all([
       this.run(),
-      deliver(this.config, () => this.connect(), this.lifetime.signal, (event, fields) => this.log(event, fields), errorCode),
+      deliver(this.config, () => this.connect(), this.lifetime.signal),
     ]).then(() => {})
     return async () => {
       events.abort()
@@ -99,10 +78,6 @@ export class Collector {
       await Promise.all([this.running, member.task])
       return true
     }
-  }
-
-  private log(event: string, fields: Record<string, unknown> = {}): void {
-    console.info(JSON.stringify({ component: "spool", event, ...fields }))
   }
 
   repair(): void {
@@ -130,7 +105,7 @@ export class Collector {
           } else this.mark(id)
         }
       } catch (error) {
-        if (!signal.aborted) this.log("event_stream_interrupted", { code: errorCode(error) })
+        if (!signal.aborted) log("event_stream_interrupted", { code: errorCode(error) })
       }
       if (!signal.aborted) {
         await delay(1_000, undefined, { signal }).catch(() => {})
@@ -161,28 +136,23 @@ export class Collector {
     const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) })
     const info = await client.server.info({ signal: this.signal() })
     if (info.pid !== process.pid) throw new SyncError("opencode_host_mismatch", false)
-    this.log("connected", { source_id: this.config.sourceID })
+    log("connected", { source_id: this.config.sourceID })
     return client
   }
 
   private async request<T>(route: string, init?: RequestInit): Promise<T> {
-    const response = await fetch(`${this.config.url}/v1/sync/${route}`, {
-      ...init,
-      redirect: "error",
-      headers: { authorization: `Bearer ${this.config.token}`, "content-type": "application/json" },
-      signal: this.signal(),
+    const response = await archiveFetch(this.config, `/v1/sync/${route}`, {
+      ...init, headers: { "content-type": "application/json" }, timeout: 30_000, signal: this.lifetime.signal,
     })
-    const result = await response.json().catch(() => ({})) as { error?: { code?: string; current_revision?: string | null } }
-    if (route === "source" && response.status === 409) {
-      const code = result?.error?.code
-      throw new SyncError(code === "source_alias_conflict" || code === "source_alias_mismatch" ? code : "http_409", false)
-    }
-    if (!response.ok) throw new SyncError(
-      response.status === 409 ? "revision_conflict" : response.status === 410 ? "purged" : `http_${response.status}`,
-      response.status === 409 || response.status === 429 || response.status >= 500,
+    const result = await response.json().catch(() => ({})) as { error?: { code?: unknown; current_revision?: string | null } }
+    if (response.ok) return result as T
+    const code = result?.error?.code
+    const conflict = response.status === 409 && typeof code === "string" && conflicts.includes(code) ? code : undefined
+    throw new SyncError(
+      conflict ?? (response.status === 410 ? "purged" : `http_${response.status}`),
+      conflict === "revision_conflict" || response.status === 429 || response.status >= 500,
       result?.error?.current_revision,
     )
-    return result as T
   }
 
   private async reconcile(full: boolean): Promise<void> {
@@ -223,23 +193,12 @@ export class Collector {
       }
       localCursor = page.cursor.next ?? undefined
     } while (localCursor && !this.lifetime.signal.aborted)
-    this.log("reconciled", { full, queued })
+    log("reconciled", { full, queued })
   }
 
-  // Checkpoints used to be keyed by url and source; reconciliation moves them to the
-  // source-only key. Remove the fallback once every installation has reloaded.
   private async checkpoint(ctx: Plugin.Context, id: string): Promise<Checkpoint | undefined> {
     this.operation = "checkpoint_read"
-    const key = `${this.config.cachePrefix}${id}`
-    const current = await ctx.storage.get(key)
-    if (current !== undefined) return checkpoint(current)
-    const legacyKey = `${this.config.legacyCachePrefix}${id}`
-    const legacy = await ctx.storage.get(legacyKey)
-    if (legacy === undefined) return undefined
-    this.operation = "checkpoint_write"
-    await ctx.storage.set(key, legacy)
-    await ctx.storage.remove(legacyKey)
-    return checkpoint(legacy)
+    return checkpoint(await ctx.storage.get(`${this.config.cachePrefix}${id}`))
   }
 
   private async capture(id: string): Promise<void> {
@@ -291,7 +250,7 @@ export class Collector {
     this.revisions.set(id, result.revision)
     this.operation = "checkpoint_write"
     await ctx.storage.set(key, { revision: result.revision, hashes, projectionVersion: 2, infoHash, snapshotHash, ...capturedIdentity })
-    this.log("captured", { session_id: id, revision: result.revision, messages: transcript.messages.length, uploaded_messages: upserts.length })
+    log("captured", { session_id: id, revision: result.revision, messages: transcript.messages.length, uploaded_messages: upserts.length })
   }
 
   private async wait(milliseconds?: number): Promise<void> {
@@ -355,10 +314,10 @@ export class Collector {
           this.purged.add(current)
           continue
         } else {
-          this.log("sync_failed", { session_id: current, operation: this.operation, code: errorCode(error) })
+          log("sync_failed", { session_id: current, operation: this.operation, code: errorCode(error) })
           if (error instanceof SyncError && !error.retryable) {
             if (!current || ["http_401", "http_403", "opencode_host_mismatch"].includes(error.code)) {
-              this.log("disabled_until_reload")
+              log("disabled_until_reload")
               break
             }
             continue

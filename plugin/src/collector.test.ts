@@ -37,8 +37,7 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
     info: { id: "ses_synthetic", title: "Fixture", time: { updated: 1700000000000 }, location: { directory } },
     messages: [{ id: "msg_synthetic", type: "user", text: "fixture\0text" }],
   } as unknown as SessionTransferData
-  // The current checkpoint format also starts under the legacy key, which must migrate.
-  const checkpoints = new Map<string, unknown>([[projectionVersion === 2 ? "legacy/ses_synthetic" : "fixture/ses_synthetic", {
+  const checkpoints = new Map<string, unknown>([["fixture/ses_synthetic", {
     revision: "1", hashes: { msg_synthetic: createHash("sha256").update(JSON.stringify(transcript.messages[0])).digest("hex") },
     ...(projectionVersion ? { projectionVersion } : {}),
   }]])
@@ -72,7 +71,7 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
       conflict = false
       conflicted = true
       revision = null
-      return Response.json({ error: { current_revision: null } }, { status: 409 })
+      return Response.json({ error: { code: "revision_conflict", current_revision: null } }, { status: 409 })
     }
     revision = String(Number(revision ?? 0) + 1)
     if (loseAcknowledgement && body.retrieval.repository === "new.example/Actual/Origin") {
@@ -82,7 +81,7 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
     return Response.json({ revision, changed: true })
   } })
   const config: Config = {
-    url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", legacyCachePrefix: "legacy/",
+    url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/",
     opencodeUrl: server.url.origin, repositoryRemote: "origin",
   }
   const events: string[] = []
@@ -277,7 +276,7 @@ test.each([429, 503])("source registration retries HTTP %s once and stays regist
       default: return new Response(null, { status: 404 })
     }
   } })
-  const config: Config = { url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", legacyCachePrefix: "legacy/", sourceAlias: "laptop", opencodeUrl: server.url.origin }
+  const config: Config = { url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", sourceAlias: "laptop", opencodeUrl: server.url.origin }
   const ctx = {
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
       await new Promise<void>((resolve) => { signal.addEventListener("abort", () => resolve(), { once: true }) })
@@ -318,7 +317,7 @@ test.each(["source_alias_conflict", "source_alias_mismatch", "unknown_conflict",
     return Response.json(code === null ? null : { error: { code, detail: "SECRET_ERROR_BODY" } }, { status: 409 })
   } })
   const logs = spyOn(console, "info").mockImplementation(() => {})
-  const config: Config = { url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", legacyCachePrefix: "legacy/", sourceAlias: "laptop", opencodeUrl: server.url.origin }
+  const config: Config = { url: server.url.origin, token: "synthetic", sourceID: "synthetic", cachePrefix: "fixture/", sourceAlias: "laptop", opencodeUrl: server.url.origin }
   const ctx = {
     event: { subscribe: async function* ({ signal }: { signal: AbortSignal }) {
       await new Promise<void>((resolve) => { signal.addEventListener("abort", () => resolve(), { once: true }) })

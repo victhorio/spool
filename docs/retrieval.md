@@ -44,7 +44,7 @@ entry, reload requirements and verification.
 The tools call the plugin's `url` with its source token: any valid, unrevoked
 source token may read the whole archive, not just its own source. The plugin
 does not follow redirects. Requests have a five-second timeout and a 24 KiB
-response limit. The former `readerUrl` option is accepted and ignored.
+response limit.
 
 Registration does not override agent permissions. General can use tools allowed
 by its configuration; Explore's restricted defaults are not broadened. The
@@ -160,8 +160,8 @@ Cursors encode versioned compact binary state as unpadded base64url: UUID bytes,
 native IDs, variable-length numbers and the filters needed to resume. They are
 stateless, with no server-side cursor records or expiry timers. Long queries and
 repository keys necessarily make their discovery cursors longer. Clients pass
-tokens unchanged and need not decode their representation. Previously issued
-JSON cursors remain accepted; all new tokens use the compact format.
+tokens unchanged and need not decode their representation. Every Spool cursor,
+including the reader's and the inventory's, uses this encoding.
 
 ## Coverage and rollout
 

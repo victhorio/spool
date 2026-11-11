@@ -1,4 +1,3 @@
-import { createHash } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import path from "node:path"
@@ -8,7 +7,6 @@ export interface Config {
   token: string
   sourceID: string
   cachePrefix: string
-  legacyCachePrefix: string
   serviceFile?: string
   opencodeUrl?: string
   opencodePassword?: string
@@ -39,7 +37,7 @@ function url(value: unknown, name: string): string {
 }
 
 export async function configure(options: Record<string, unknown>): Promise<Config> {
-  const allowed = new Set(["url", "tokenFile", "sweepIntervalMs", "serviceFile", "opencodeUrl", "opencodePasswordFile", "readerUrl", "repositoryRemote", "sourceAlias"])
+  const allowed = new Set(["url", "tokenFile", "serviceFile", "opencodeUrl", "opencodePasswordFile", "repositoryRemote", "sourceAlias"])
   for (const key of Object.keys(options)) if (!allowed.has(key)) throw new Error(`Unknown Spool option: ${key}`)
   const sourceAlias = options.sourceAlias
   if (sourceAlias !== undefined && !validSourceAlias(sourceAlias)) {
@@ -53,12 +51,6 @@ export async function configure(options: Record<string, unknown>): Promise<Confi
   const token = (await readFile(filename(options.tokenFile, "tokenFile"), "utf8")).trim()
   const match = /^spool_v1\.([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.([A-Za-z0-9_-]{43})$/.exec(token)
   if (!match) throw new Error("Spool tokenFile does not contain a valid source token")
-  // sweepIntervalMs and readerUrl are accepted for existing installations: full-content
-  // sweeps no longer run, and retrieval now uses url with the source token.
-  const sweepIntervalMs = options.sweepIntervalMs
-  if (sweepIntervalMs !== undefined && (typeof sweepIntervalMs !== "number" || !Number.isSafeInteger(sweepIntervalMs) || sweepIntervalMs < 1_000 || sweepIntervalMs > 86_400_000)) {
-    throw new Error("Spool sweepIntervalMs must be an integer between 1000 and 86400000")
-  }
   if (options.serviceFile !== undefined && options.opencodeUrl !== undefined) throw new Error("Choose either serviceFile or opencodeUrl")
   if ((options.opencodeUrl === undefined) !== (options.opencodePasswordFile === undefined)) throw new Error("opencodeUrl and opencodePasswordFile must be supplied together")
   const sourceID = match[1]!
@@ -69,7 +61,6 @@ export async function configure(options: Record<string, unknown>): Promise<Confi
     // Source IDs are random UUIDs, so checkpoints need not depend on the URL; this
     // lets an installation change url without recapturing everything.
     cachePrefix: `v2/${sourceID}/`,
-    legacyCachePrefix: `v1/${createHash("sha256").update(`${destination}\0${sourceID}`).digest("hex")}/`,
     repositoryRemote,
     sourceAlias,
     serviceFile: options.serviceFile === undefined ? undefined : filename(options.serviceFile, "serviceFile"),

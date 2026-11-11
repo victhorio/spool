@@ -3,10 +3,7 @@
 
 use axum::{
     Json, Router,
-    extract::{
-        DefaultBodyLimit, Path, State,
-        rejection::{JsonRejection, PathRejection},
-    },
+    extract::{Request, State},
     http::{StatusCode, header},
     routing::{get, post},
 };
@@ -19,28 +16,25 @@ use sha2::{Digest, Sha256};
 use sqlx::{FromRow, PgPool};
 use uuid::Uuid;
 
-use crate::{auth, error::ApiError};
+use crate::{
+    auth,
+    error::ApiError,
+    reference::valid_alias,
+    request::{self, Path},
+};
 
 /// How long a code waits for approval, and an approval waits for collection.
 const LIFETIME_SECONDS: i32 = 600;
 const POLL_SECONDS: u64 = 5;
 const MAX_PENDING: i64 = 5;
 const ALPHABET: &[u8] = b"BCDFGHJKLMNPQRSTVWXZ";
-
-pub(crate) fn valid_alias(alias: &str) -> bool {
-    (1..=32).contains(&alias.len())
-        && alias.as_bytes()[0].is_ascii_lowercase()
-        && alias
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
+const MAX_BODY: usize = 1024;
 
 /// Unauthenticated: the device code is the machine's credential until collection.
 pub(crate) fn machine_routes() -> Router<PgPool> {
     Router::new()
         .route("/v1/device/code", post(request_code))
         .route("/v1/device/token", post(collect_token))
-        .layer(DefaultBodyLimit::max(1024))
 }
 
 /// Mounted only in the reader, behind Cloudflare Access.
@@ -49,10 +43,6 @@ pub(crate) fn reader_routes() -> Router<PgPool> {
         .route("/api/device/{code}", get(show))
         .route("/api/device/{code}/approve", post(approve))
         .route("/api/device/{code}/deny", post(deny))
-}
-
-fn database(operation: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
-    move |error| ApiError::database(operation, error)
 }
 
 /// Device codes and tokens must not be cached by anything between here and the machine.
@@ -72,25 +62,25 @@ struct CodeRequest {
     alias: String,
 }
 
-async fn request_code(
-    State(pool): State<PgPool>,
-    body: Result<Json<CodeRequest>, JsonRejection>,
-) -> Result<Private, ApiError> {
-    let Json(CodeRequest { alias }) = body.map_err(|_| ApiError::malformed())?;
+async fn request_code(State(pool): State<PgPool>, request: Request) -> Result<Private, ApiError> {
+    let CodeRequest { alias } = request::json(request, MAX_BODY).await?;
     if !valid_alias(&alias) {
         return Err(ApiError::malformed());
     }
     let secret: [u8; 32] = rand::random();
-    let mut tx = pool.begin().await.map_err(database("device.code"))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(ApiError::database("device.code"))?;
     // Serializes the pending-code limit.
     sqlx::query("SELECT pg_advisory_xact_lock(hashtext('spool.device_logins'))")
         .execute(&mut *tx)
         .await
-        .map_err(database("device.code"))?;
+        .map_err(ApiError::database("device.code"))?;
     sqlx::query("DELETE FROM device_logins WHERE created_at < now() - interval '1 day'")
         .execute(&mut *tx)
         .await
-        .map_err(database("device.code"))?;
+        .map_err(ApiError::database("device.code"))?;
     let (taken, waiting, pending): (bool, bool, i64) = sqlx::query_as(
         "SELECT EXISTS (SELECT 1 FROM sources WHERE alias = $1), \
          EXISTS (SELECT 1 FROM device_logins WHERE alias = $1 AND source_id IS NULL \
@@ -100,7 +90,7 @@ async fn request_code(
     .bind(&alias)
     .fetch_one(&mut *tx)
     .await
-    .map_err(database("device.code"))?;
+    .map_err(ApiError::database("device.code"))?;
     if taken {
         return Err(ApiError::new(StatusCode::CONFLICT, "source_alias_conflict"));
     }
@@ -132,10 +122,12 @@ async fn request_code(
         .bind(LIFETIME_SECONDS)
         .execute(&mut *tx)
         .await
-        .map_err(database("device.code"))?
+        .map_err(ApiError::database("device.code"))?
         .rows_affected();
         if inserted == 1 {
-            tx.commit().await.map_err(database("device.code"))?;
+            tx.commit()
+                .await
+                .map_err(ApiError::database("device.code"))?;
             return Ok(private(json!({
                 "device_code": URL_SAFE_NO_PAD.encode(secret),
                 "user_code": display(&user_code),
@@ -161,18 +153,18 @@ struct Pending {
     source_id: Option<Uuid>,
 }
 
-async fn collect_token(
-    State(pool): State<PgPool>,
-    body: Result<Json<TokenRequest>, JsonRejection>,
-) -> Result<Private, ApiError> {
-    let Json(TokenRequest { device_code }) = body.map_err(|_| ApiError::malformed())?;
+async fn collect_token(State(pool): State<PgPool>, request: Request) -> Result<Private, ApiError> {
+    let TokenRequest { device_code } = request::json(request, MAX_BODY).await?;
     let secret = URL_SAFE_NO_PAD
         .decode(device_code)
         .ok()
         .filter(|secret| secret.len() == 32)
         .ok_or_else(ApiError::malformed)?;
     let hash = Sha256::digest(&secret);
-    let mut tx = pool.begin().await.map_err(database("device.token"))?;
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(ApiError::database("device.token"))?;
     let login: Option<Pending> = sqlx::query_as(
         "SELECT alias, expires_at <= now() AS expired, approved, source_id \
          FROM device_logins WHERE device_code_hash = $1 FOR UPDATE",
@@ -180,7 +172,7 @@ async fn collect_token(
     .bind(hash.as_slice())
     .fetch_optional(&mut *tx)
     .await
-    .map_err(database("device.token"))?;
+    .map_err(ApiError::database("device.token"))?;
     let alias = match login {
         None
         | Some(Pending {
@@ -205,7 +197,7 @@ async fn collect_token(
     .bind(token_hash)
     .execute(&mut *tx)
     .await
-    .map_err(database("device.token"))?
+    .map_err(ApiError::database("device.token"))?
     .rows_affected();
     if created == 0 {
         return Err(ApiError::new(StatusCode::CONFLICT, "source_alias_conflict"));
@@ -215,8 +207,10 @@ async fn collect_token(
         .bind(source_id)
         .execute(&mut *tx)
         .await
-        .map_err(database("device.token"))?;
-    tx.commit().await.map_err(database("device.token"))?;
+        .map_err(ApiError::database("device.token"))?;
+    tx.commit()
+        .await
+        .map_err(ApiError::database("device.token"))?;
     Ok(private(
         json!({ "source_id": source_id, "alias": alias, "token": token }),
     ))
@@ -278,15 +272,14 @@ async fn find(pool: &PgPool, code: &str) -> Result<Login, ApiError> {
         .bind(code)
         .fetch_optional(pool)
         .await
-        .map_err(database("device.show"))?
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found"))
+        .map_err(ApiError::database("device.show"))?
+        .ok_or_else(ApiError::not_found)
 }
 
 async fn show(
     State(pool): State<PgPool>,
-    code: Result<Path<String>, PathRejection>,
+    Path(code): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let Path(code) = code.map_err(|_| ApiError::malformed())?;
     Ok(find(&pool, &normalize(&code)?).await?.json())
 }
 
@@ -307,7 +300,7 @@ async fn decide(pool: &PgPool, code: &str, approved: bool) -> Result<Json<Value>
     .bind(LIFETIME_SECONDS)
     .fetch_optional(pool)
     .await
-    .map_err(database("device.decide"))?;
+    .map_err(ApiError::database("device.decide"))?;
     match decided {
         Some(login) => Ok(login.json()),
         None => {
@@ -319,16 +312,14 @@ async fn decide(pool: &PgPool, code: &str, approved: bool) -> Result<Json<Value>
 
 async fn approve(
     State(pool): State<PgPool>,
-    code: Result<Path<String>, PathRejection>,
+    Path(code): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let Path(code) = code.map_err(|_| ApiError::malformed())?;
     decide(&pool, &code, true).await
 }
 
 async fn deny(
     State(pool): State<PgPool>,
-    code: Result<Path<String>, PathRejection>,
+    Path(code): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let Path(code) = code.map_err(|_| ApiError::malformed())?;
     decide(&pool, &code, false).await
 }

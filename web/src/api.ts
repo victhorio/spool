@@ -30,25 +30,15 @@ export interface Transcript extends Session {
   earlier_cursor: string | null
 }
 
+/** A failed reader API request, with the error code the archive returned. */
 export class ArchiveError extends Error {
-  /** Qualified references when a bare session ID is archived by several sources. */
-  readonly candidates?: string[]
-
   constructor(
     readonly status: number,
-    error?: { code?: unknown; candidates?: unknown },
+    readonly code?: string,
+    /** Qualified references when a bare session ID is archived by several sources. */
+    readonly candidates?: string[],
   ) {
-    const ambiguous = error?.code === "ambiguous_session" && Array.isArray(error.candidates)
-    super(
-      ambiguous
-        ? "More than one source archived a session with this ID. Choose one:"
-        : status === 409
-          ? "This session changed. Reload it to read the latest version."
-          : status === 404
-            ? "This session is no longer in the archive."
-            : "Couldn’t load the archive. Please try again.",
-    )
-    if (ambiguous) this.candidates = (error.candidates as unknown[]).filter((item) => typeof item === "string")
+    super(code ?? `HTTP ${status}`)
   }
 }
 
@@ -72,49 +62,43 @@ export interface ArtifactPage {
   next_cursor: string | null
 }
 
-async function get(path: string, signal?: AbortSignal): Promise<Response> {
-  const response = await fetch(path, { signal, cache: "no-store", redirect: "manual" })
-  // An expired Cloudflare Access session redirects to its login; only a navigation can follow it.
+/**
+ * Calls the reader's own API. An expired Cloudflare Access session redirects
+ * to its login, which only a navigation can follow, so the page reloads.
+ */
+export async function request(path: string, init: RequestInit = {}): Promise<Response> {
+  const response = await fetch(path, { ...init, cache: "no-store", redirect: "manual" })
   if (response.type === "opaqueredirect") {
     window.location.reload()
     return new Promise<Response>(() => {})
   }
   if (!response.ok) {
-    const body = response.status === 409 ? await response.json().catch(() => undefined) : undefined
-    throw new ArchiveError(response.status, body?.error)
+    const error = (await response.json().catch(() => undefined))?.error
+    const code = typeof error?.code === "string" ? error.code : undefined
+    const candidates =
+      code === "ambiguous_session" && Array.isArray(error.candidates)
+        ? (error.candidates as unknown[]).filter((item) => typeof item === "string")
+        : undefined
+    throw new ArchiveError(response.status, code, candidates)
   }
   return response
 }
 
 /** Sends a message to a session on a machine that is online, as a prompt from the owner. */
 export async function sendMessage(session: string, text: string): Promise<void> {
-  const response = await fetch("/api/messages", {
+  await request("/api/messages", {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ session, text }),
-    cache: "no-store",
-    redirect: "manual",
   })
-  if (response.type === "opaqueredirect") {
-    window.location.reload()
-    return new Promise<void>(() => {})
-  }
-  if (!response.ok) {
-    const body = await response.json().catch(() => undefined)
-    throw new Error(
-      body?.error?.code === "session_offline"
-        ? "This session’s machine is offline."
-        : "Couldn’t send the message. Please try again.",
-    )
-  }
 }
 
 export async function read<T>(path: string, signal?: AbortSignal): Promise<T> {
-  return (await get(path, signal)).json() as Promise<T>
+  return (await request(path, { signal })).json() as Promise<T>
 }
 
 export async function readText(path: string, signal?: AbortSignal): Promise<string> {
-  return (await get(path, signal)).text()
+  return (await request(path, { signal })).text()
 }
 
 const encodeReference = (reference: string) =>

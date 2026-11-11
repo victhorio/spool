@@ -43,7 +43,7 @@ test("browse, filter independent stores, deep-link and return with browser histo
   ).toBeVisible()
 })
 
-test("links name sessions by ID, open a linked message and accept older link forms", async ({
+test("links name sessions by ID, open a linked message and resolve shared IDs", async ({
   page,
 }) => {
   // A qualified link to a unique ID is shortened once loaded.
@@ -69,13 +69,6 @@ test("links name sessions by ID, open a linked message and accept older link for
   await expect(
     page.getByText("This conversation belongs to the laptop source.", { exact: true }),
   ).toBeVisible()
-
-  // Earlier links named the source by UUID in the fragment.
-  await page.goto(
-    `/#${new URLSearchParams({ source: sources.laptop!.source_id, session: "ses_paged" })}`,
-  )
-  await expect(page).toHaveURL("/sessions/ses_paged")
-  await expect(page.getByRole("heading", { name: /^A long conversation/ })).toBeVisible()
 })
 
 test("read Markdown, reasoning, tool inputs/results and compaction with the keyboard", async ({

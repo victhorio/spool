@@ -5,25 +5,25 @@
 use std::{sync::Arc, time::Duration};
 
 use axum::{
-    Json, Router,
-    extract::{DefaultBodyLimit, State, rejection::JsonRejection},
-    http::{HeaderMap, StatusCode},
+    Extension, Json, Router,
+    extract::{Request, State},
+    http::StatusCode,
     routing::post,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use sqlx::{FromRow, PgPool, QueryBuilder};
+use sqlx::{FromRow, PgPool};
 use tokio::{sync::Notify, time::Instant};
 use uuid::Uuid;
 
 use crate::{
-    auth,
+    auth::Source,
     error::ApiError,
-    reference::{self, Reference},
-    snapshot::valid_id,
+    reference::{Named, Reference, valid_id},
+    request,
 };
 
-/// SQL for the status of session `s` on its source `sources`: `offline` unless
+/// SQL for [`Status`] of session `s` on its source `sources`: `offline` unless
 /// the machine polled within the last minute, then `running` or `idle`.
 macro_rules! status {
     () => {
@@ -33,6 +33,16 @@ macro_rules! status {
     };
 }
 pub(crate) use status;
+
+/// Whether a session's machine is online, and if so whether it runs the session.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, sqlx::Type)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+pub(crate) enum Status {
+    Running,
+    Idle,
+    Offline,
+}
 
 /// How long a poll waits for a message. Machines poll again right away, so
 /// this stays well inside the one-minute window that keeps them online.
@@ -63,19 +73,12 @@ pub(crate) fn machine_routes(mailbox: Mailbox) -> Router {
     Router::new()
         .route("/v1/poll", post(poll))
         .route("/v1/messages", post(send_from_agent))
-        .layer(DefaultBodyLimit::max(MAX_BODY))
         .with_state(mailbox)
 }
 
 /// Mounted only in the reader, behind Cloudflare Access.
 pub(crate) fn reader_routes() -> Router<Mailbox> {
-    Router::new()
-        .route("/api/messages", post(send_from_owner))
-        .layer(DefaultBodyLimit::max(MAX_BODY))
-}
-
-fn database(operation: &'static str) -> impl FnOnce(sqlx::Error) -> ApiError {
-    move |error| ApiError::database(operation, error)
+    Router::new().route("/api/messages", post(send_from_owner))
 }
 
 #[derive(Deserialize)]
@@ -98,11 +101,10 @@ struct Pending {
 /// machine that comes back later does not act on stale instructions.
 async fn poll(
     State(mailbox): State<Mailbox>,
-    headers: HeaderMap,
-    body: Result<Json<Poll>, JsonRejection>,
+    Extension(Source(source)): Extension<Source>,
+    request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let source = auth::authenticate(&mailbox.pool, &headers).await?;
-    let Json(poll) = body.map_err(|_| ApiError::malformed())?;
+    let poll: Poll = request::json(request, MAX_BODY).await?;
     if poll.running.len() > 100
         || poll.delivered.len() > 100
         || !poll.running.iter().all(|id| valid_id(id))
@@ -119,7 +121,7 @@ async fn poll(
     .bind(&poll.running)
     .execute(&mailbox.pool)
     .await
-    .map_err(database("delivery.poll"))?;
+    .map_err(ApiError::database("delivery.poll"))?;
     let deadline = Instant::now() + WAIT;
     loop {
         // Listen before reading, so a message sent in between still wakes this poll.
@@ -137,7 +139,7 @@ async fn poll(
         .bind(BATCH)
         .fetch_all(&mailbox.pool)
         .await
-        .map_err(database("delivery.pending"))?;
+        .map_err(ApiError::database("delivery.pending"))?;
         if !pending.is_empty() || tokio::time::timeout_at(deadline, sent).await.is_err() {
             let messages: Vec<_> = pending
                 .into_iter()
@@ -173,19 +175,18 @@ struct AgentMessage {
 
 async fn send_from_owner(
     State(mailbox): State<Mailbox>,
-    body: Result<Json<OwnerMessage>, JsonRejection>,
+    request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let Json(message) = body.map_err(|_| ApiError::malformed())?;
+    let message: OwnerMessage = request::json(request, MAX_BODY).await?;
     send(&mailbox, &message.session, message.text, None).await
 }
 
 async fn send_from_agent(
     State(mailbox): State<Mailbox>,
-    headers: HeaderMap,
-    body: Result<Json<AgentMessage>, JsonRejection>,
+    Extension(Source(source)): Extension<Source>,
+    request: Request,
 ) -> Result<Json<Value>, ApiError> {
-    let source = auth::authenticate(&mailbox.pool, &headers).await?;
-    let Json(message) = body.map_err(|_| ApiError::malformed())?;
+    let message: AgentMessage = request::json(request, MAX_BODY).await?;
     if !valid_id(&message.from) {
         return Err(ApiError::malformed());
     }
@@ -203,7 +204,13 @@ struct Target {
     source_id: Uuid,
     alias: Option<String>,
     session_id: String,
-    status: String,
+    status: Status,
+}
+
+impl Named for Target {
+    fn name(&self) -> (Uuid, Option<&str>, &str) {
+        (self.source_id, self.alias.as_deref(), &self.session_id)
+    }
 }
 
 async fn send(
@@ -215,28 +222,17 @@ async fn send(
     if text.trim().is_empty() || text.len() > MAX_TEXT || text.contains('\0') {
         return Err(ApiError::malformed());
     }
-    let reference = Reference::parse(session)?;
-    let mut sql = QueryBuilder::new(concat!(
-        "SELECT s.source_id, sources.alias, s.session_id, ",
-        status!(),
-        " AS status FROM sessions s JOIN sources ON sources.id = s.source_id \
-         WHERE s.deleted_at IS NULL"
-    ));
-    reference.filter(&mut sql);
-    sql.push(" ORDER BY s.source_id LIMIT 11");
-    let targets: Vec<Target> = sql
-        .build_query_as()
-        .fetch_all(&mailbox.pool)
-        .await
-        .map_err(database("delivery.target"))?;
-    let target = reference::one(targets, |target| {
-        (
-            target.source_id,
-            target.alias.as_deref(),
-            target.session_id.as_str(),
+    let target: Target = Reference::parse(session)?
+        .resolve(
+            concat!(
+                "SELECT s.source_id, sources.alias, s.session_id, ",
+                status!(),
+                " AS status"
+            ),
+            &mailbox.pool,
         )
-    })?;
-    if target.status == "offline" {
+        .await?;
+    if target.status == Status::Offline {
         return Err(ApiError::new(StatusCode::CONFLICT, "session_offline"));
     }
     let id = Uuid::new_v4();
@@ -253,7 +249,7 @@ async fn send(
     .bind(sender_session)
     .execute(&mailbox.pool)
     .await
-    .map_err(database("delivery.send"))?;
+    .map_err(ApiError::database("delivery.send"))?;
     mailbox.sent.notify_waiters();
     Ok(Json(json!({ "id": id, "status": target.status })))
 }

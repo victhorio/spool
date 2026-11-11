@@ -4,20 +4,19 @@ import { tmpdir } from "node:os"
 import path from "node:path"
 import type { Plugin, Skill } from "@opencode/plugin"
 import { configure } from "./config"
-import { registerRetrieval, requestReader, validInput } from "./retrieval"
+import { requestReader, validInput } from "./retrieval"
+import { registerTools } from "./register"
 
-test("configuration validates options and ignores the retired readerUrl", async () => {
+test("configuration validates options", async () => {
   const root = await mkdtemp(path.join(tmpdir(), "spool-config-"))
   try {
     const tokenFile = path.join(root, "synthetic-token")
     await writeFile(tokenFile, `spool_v1.00000000-0000-0000-0000-000000000001.${"A".repeat(43)}`)
     const options = { url: "http://127.0.0.1:8377", tokenFile }
-    expect(await configure({ ...options, sweepIntervalMs: 1000 })).toEqual(await configure(options))
-    expect(await configure({ ...options, readerUrl: "http://100.64.1.2:8378" })).toEqual(await configure(options))
+    await expect(configure({ ...options, readerUrl: "http://100.64.1.2:8378" })).rejects.toThrow("Unknown Spool option")
     const moved = await configure({ ...options, url: "https://spool.example" })
     expect(moved.cachePrefix).toBe("v2/00000000-0000-0000-0000-000000000001/")
     expect(moved.cachePrefix).toBe((await configure(options)).cachePrefix)
-    expect(moved.legacyCachePrefix).not.toBe((await configure(options)).legacyCachePrefix)
     expect((await configure({ ...options, repositoryRemote: "archive-origin" })).repositoryRemote).toBe("archive-origin")
     await expect(configure({ ...options, repositoryRemote: "bad\0remote" })).rejects.toThrow()
     const original = await configure(options)
@@ -53,7 +52,7 @@ test("tool inputs distinguish cursor-only from bounded initial arguments", () =>
   expect(validInput("read", { session: `00000000-0000-0000-0000-000000000001/${"x".repeat(513)}` })).toBe(false)
 })
 
-test("session references accept native IDs, aliases and legacy UUIDs within byte bounds", () => {
+test("session references accept native IDs, aliases and source UUIDs within byte bounds", () => {
   const uuid = "ABCDEF00-0000-0000-0000-000000000001"
   for (const session of ["ses_fixture", "native-id", "x".repeat(512), "界".repeat(170), "laptop/ses_fixture", `${"a".repeat(32)}/${"x".repeat(512)}`, `${uuid}/ses_fixture`, `${uuid}/${"x".repeat(512)}`]) {
     expect(validInput("search", { session, query: "term" })).toBe(true)
@@ -164,7 +163,7 @@ test("ambiguous sessions forward only bounded qualified candidates and a boolean
   } finally { await server.stop(true) }
 })
 
-test("public transform registration exposes exactly the spool tools and packaged skill", async () => {
+test("public transform registration exposes exactly the spool tools and packaged skills", async () => {
   const tools: {
     name: string
     description: string
@@ -180,13 +179,19 @@ test("public transform registration exposes exactly the spool tools and packaged
     }) },
     skill: { transform: async (callback: (editor: unknown) => void) => callback({ add: (skill: Skill.Info) => skills.push(skill) }) },
   } as unknown as Plugin.Context
-  await registerRetrieval(ctx, { url: "http://127.0.0.1:8378", token: "synthetic" })
+  await registerTools(ctx, { url: "http://127.0.0.1:8378", token: "synthetic" })
   expect(namespaces).toEqual(["spool"])
-  expect(tools.map((tool) => `${tool.options?.namespace}_${tool.name}`)).toEqual(["spool_find_sessions", "spool_search_messages", "spool_read_messages"])
-  expect(tools.every((tool) => tool.options?.codemode === false)).toBe(true)
+  expect(tools.map((tool) => `${tool.options?.namespace}_${tool.name}`)).toEqual([
+    "spool_find_sessions", "spool_search_messages", "spool_read_messages", "spool_create_artifact", "spool_update_artifact",
+    "spool_edit_artifact", "spool_find_artifacts", "spool_read_artifact", "spool_send_message",
+  ])
   for (const tool of tools) {
+    expect(tool.options?.codemode).toBe(false)
     expect(tool.input.type).toBe("object")
     expect(tool.input.additionalProperties).toBe(false)
+  }
+  const retrieval = tools.slice(0, 3)
+  for (const tool of retrieval) {
     for (const key of ["oneOf", "anyOf", "allOf", "required"]) expect(tool.input).not.toHaveProperty(key)
     expect(tool.input.properties).toHaveProperty("cursor")
     expect(JSON.stringify(tool.input.properties)).toContain("without other arguments")
@@ -195,9 +200,8 @@ test("public transform registration exposes exactly the spool tools and packaged
   expect(tools[1]!.input.properties).toHaveProperty("session")
   expect(tools[1]!.input.properties).toHaveProperty("query")
   expect(tools[2]!.input.properties).toHaveProperty("start")
-  for (const tool of tools.slice(1)) expect(JSON.parse((await tool.execute({}, { signal: new AbortController().signal })).content)).toEqual({ error: { code: "malformed_request" } })
-  expect(skills).toHaveLength(1)
-  expect(String(skills[0]!.name)).toBe("searching-sessions")
+  for (const tool of retrieval.slice(1)) expect(JSON.parse((await tool.execute({}, { signal: new AbortController().signal })).content)).toEqual({ error: { code: "malformed_request" } })
+  expect(skills.map((skill) => String(skill.name))).toEqual(["searching-sessions", "publishing-artifacts"])
   expect(skills[0]!.content).toContain("instructions for that session, not for this one")
   expect(skills[0]!.content).not.toContain("---\nname:")
 })

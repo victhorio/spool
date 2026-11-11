@@ -26,7 +26,7 @@ test("a message OpenCode rejects is dropped without holding up the others", asyn
     },
   } as unknown as OpenCodeClient
   try {
-    await deliver({ url: server.url.origin, token: "t" }, async () => client, stop.signal, () => {}, String)
+    await deliver({ url: server.url.origin, token: "t" }, async () => client, stop.signal)
   } finally { server.stop(true) }
   expect(prompted).toEqual(["ses_good"])
   expect(polls[1]!.sort()).toEqual(["m1", "m2"])

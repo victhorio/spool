@@ -1,5 +1,6 @@
 import { useState, type FormEvent } from "react"
-import { SpoolMark } from "./App"
+import { ArchiveError, request } from "./api"
+import { SpoolMark } from "./shell"
 
 interface Login {
   user_code: string
@@ -21,14 +22,13 @@ const outcomes: Record<Exclude<Login["status"], "pending">, string> = {
   expired: "This code expired. Run the installer on the machine again for a new one.",
 }
 
+/** The login, or the HTTP status it failed with; 0 if Spool could not be reached. */
 async function call(path: string, method: "GET" | "POST"): Promise<Login | number> {
-  const response = await fetch(path, { method, cache: "no-store", redirect: "manual" })
-  // An expired Cloudflare Access session redirects to its login; only a navigation can follow it.
-  if (response.type === "opaqueredirect") {
-    window.location.reload()
-    return new Promise(() => {})
+  try {
+    return (await (await request(path, { method })).json()) as Login
+  } catch (error) {
+    return error instanceof ArchiveError ? error.status : 0
   }
-  return response.ok ? ((await response.json()) as Login) : response.status
 }
 
 function problem(status: number): string {
@@ -52,16 +52,16 @@ export function Device() {
 
   async function look(value: string) {
     setState({ kind: "loading" })
-    const result = await call(`/api/device/${encodeURIComponent(value.trim())}`, "GET").catch(() => 0)
+    const result = await call(`/api/device/${encodeURIComponent(value.trim())}`, "GET")
     setState(typeof result === "number" ? { kind: "entry", message: problem(result) } : { kind: "login", login: result })
   }
 
   async function decide(login: Login, decision: "approve" | "deny") {
     setState({ kind: "login", login, busy: true })
-    const result = await call(`/api/device/${encodeURIComponent(login.user_code)}/${decision}`, "POST").catch(() => 0)
+    const result = await call(`/api/device/${encodeURIComponent(login.user_code)}/${decision}`, "POST")
     if (typeof result !== "number") return setState({ kind: "login", login: result })
     // The code may have expired or been decided elsewhere; show its current state.
-    const current = await call(`/api/device/${encodeURIComponent(login.user_code)}`, "GET").catch(() => 0)
+    const current = await call(`/api/device/${encodeURIComponent(login.user_code)}`, "GET")
     setState(typeof current === "number"
       ? { kind: "login", login, message: problem(result) }
       : { kind: "login", login: current, message: current.status === "pending" ? problem(result) : undefined })

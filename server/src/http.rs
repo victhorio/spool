@@ -1,34 +1,23 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::path::PathBuf;
 
+use anyhow::{Context, bail};
 use axum::{
-    Json, Router,
-    body::to_bytes,
-    extract::{
-        Path, Query, Request, State,
-        rejection::{PathRejection, QueryRejection},
-    },
-    http::{HeaderMap, StatusCode},
-    middleware,
+    Router,
+    extract::{Request, State},
+    http::{HeaderValue, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{any, get, post, put},
+    routing::{any, get},
 };
-use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde::Deserialize;
-use serde_json::json;
-use sqlx::{FromRow, PgPool};
-use tokio::sync::Semaphore;
-use uuid::Uuid;
+use sqlx::PgPool;
+use tower_http::services::{ServeDir, ServeFile};
 
 use crate::{
-    access::Access, artifacts, auth, browse, delivery, device, error::ApiError, retrieval,
-    snapshot, snapshot::MAX_BODY,
+    access::{self, Access},
+    artifacts, auth, browse, delivery, device,
+    error::ApiError,
+    retrieval, sync,
 };
-
-#[derive(Clone)]
-struct App {
-    pool: PgPool,
-    uploads: Arc<Semaphore>,
-}
 
 /// The web reader, protected by Cloudflare Access.
 pub struct Reader {
@@ -36,47 +25,72 @@ pub struct Reader {
     pub assets: PathBuf,
 }
 
-/// Machines use `/v1/*` with source tokens. Without a `reader`, nothing else is served.
-/// `read` serves archive reads and should be a read-only pool.
+/// Machines use `/v1/*`, with source tokens except to log in. Without a
+/// `reader`, nothing else is served. `read` serves archive reads and should be
+/// a read-only pool.
 pub fn router(pool: PgPool, read: PgPool, reader: Option<Reader>) -> anyhow::Result<Router> {
-    let not_found = || async { ApiError::new(StatusCode::NOT_FOUND, "not_found") };
     let mailbox = delivery::Mailbox::new(pool.clone());
-    let agent = retrieval::routes()
-        .with_state(read.clone())
-        .route_layer(middleware::from_fn_with_state(pool.clone(), auth::require));
+    let machine = Router::new()
+        .merge(sync::machine_routes(pool.clone()))
+        .merge(retrieval::machine_routes().with_state(read.clone()))
+        .merge(artifacts::machine_routes(pool.clone(), read.clone()))
+        .merge(delivery::machine_routes(mailbox.clone()))
+        .method_not_allowed_fallback(method_not_allowed)
+        .route_layer(middleware::from_fn_with_state(pool.clone(), auth::require))
+        .merge(device::machine_routes().with_state(pool.clone()));
     let app = Router::new()
         .route("/healthz", get(health))
-        .route("/v1/sync/source", put(assign_source_alias))
-        .route("/v1/sync/sessions", get(inventory))
-        .route("/v1/sync/sessions/{id}/snapshot", post(upload))
+        .with_state(pool.clone())
+        .merge(machine)
         .route("/v1", any(not_found))
         .route("/v1/{*rest}", any(not_found))
-        .method_not_allowed_fallback(|| async {
-            ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
-        })
-        .with_state(App {
-            pool: pool.clone(),
-            uploads: Arc::new(Semaphore::new(2)),
-        })
-        .merge(agent)
-        .merge(device::machine_routes().with_state(pool.clone()))
-        .merge(artifacts::machine_routes(pool.clone(), read.clone()))
-        .merge(delivery::machine_routes(mailbox.clone()));
-    Ok(match reader {
-        Some(reader) => app.fallback_service(browse::router(
-            pool,
-            read,
-            mailbox,
-            reader.access,
-            reader.assets,
-        )?),
-        None => app.fallback(not_found),
-    })
+        .method_not_allowed_fallback(method_not_allowed);
+    let Some(Reader { access, assets }) = reader else {
+        return Ok(app.fallback(not_found));
+    };
+    let index = assets.join("index.html");
+    let metadata = std::fs::metadata(&index).with_context(|| {
+        format!(
+            "web assets missing: {} is required; build the web frontend first or set ASSETS_DIR",
+            index.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        bail!("web assets invalid: {} must be a file", index.display());
+    }
+    // Archive reads use the read-only pool; device approval and sending messages write.
+    let reader = Router::new()
+        .merge(browse::reader_routes())
+        .merge(artifacts::reader_routes())
+        .with_state(read)
+        .merge(device::reader_routes().with_state(pool))
+        .merge(delivery::reader_routes().with_state(mailbox))
+        .route_service("/", ServeFile::new(index.clone()))
+        .route_service("/sessions/{*reference}", ServeFile::new(index.clone()))
+        .route_service("/device", ServeFile::new(index.clone()))
+        .route_service("/artifacts", ServeFile::new(index.clone()))
+        .route_service("/artifacts/{id}", ServeFile::new(index.clone()))
+        .route_service("/index.html", ServeFile::new(index))
+        .nest_service("/assets", ServeDir::new(assets.join("assets")))
+        .route_service("/favicon.ico", ServeFile::new(assets.join("favicon.ico")))
+        .fallback(not_found)
+        .method_not_allowed_fallback(method_not_allowed)
+        .layer(middleware::from_fn_with_state(access, access::require))
+        .layer(middleware::from_fn(privacy));
+    Ok(app.fallback_service(reader))
 }
 
-async fn health(State(app): State<App>) -> StatusCode {
+async fn not_found() -> ApiError {
+    ApiError::not_found()
+}
+
+async fn method_not_allowed() -> ApiError {
+    ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed")
+}
+
+async fn health(State(pool): State<PgPool>) -> StatusCode {
     match sqlx::query_scalar::<_, i32>("SELECT 1")
-        .fetch_one(&app.pool)
+        .fetch_one(&pool)
         .await
     {
         Ok(_) => StatusCode::OK,
@@ -84,254 +98,63 @@ async fn health(State(app): State<App>) -> StatusCode {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SourceAlias {
-    alias: String,
-}
-
-async fn assign_source_alias(
-    State(app): State<App>,
-    request: Request,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let headers = request.headers();
-    let source = auth::authenticate(&app.pool, headers).await?;
-    if !headers
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default()
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .eq_ignore_ascii_case("application/json")
-    {
-        return Err(ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_content_type",
-        ));
-    }
-    if headers.get_all("content-encoding").iter().any(|value| {
-        !value
-            .to_str()
-            .is_ok_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
-    }) {
-        return Err(ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_content_encoding",
-        ));
-    }
-    let body = tokio::time::timeout(Duration::from_secs(5), to_bytes(request.into_body(), 1024))
-        .await
-        .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "request_timeout"))?
-        .map_err(|error| {
-            use std::error::Error;
-            if error
-                .source()
-                .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
-            {
-                ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
-            } else {
-                ApiError::malformed()
-            }
-        })?;
-    if body.iter().find(|byte| !byte.is_ascii_whitespace()) != Some(&b'{') {
-        return Err(ApiError::malformed());
-    }
-    let SourceAlias { alias } = serde_json::from_slice(&body).map_err(|_| ApiError::malformed())?;
-    if !device::valid_alias(&alias) {
-        return Err(ApiError::malformed());
-    }
-    let assigned = sqlx::query("UPDATE sources SET alias = $2 WHERE id = $1 AND alias IS NULL")
-        .bind(source)
-        .bind(&alias)
-        .execute(&app.pool)
-        .await
-        .map_err(|error| {
-            if error.as_database_error().is_some_and(|error| {
-                error.is_unique_violation() && error.constraint() == Some("sources_alias_key")
-            }) {
-                ApiError::new(StatusCode::CONFLICT, "source_alias_conflict")
-            } else {
-                ApiError::database("source.alias.assign", error)
-            }
-        })?;
-    if assigned.rows_affected() == 0 {
-        let existing: String = sqlx::query_scalar("SELECT alias FROM sources WHERE id = $1")
-            .bind(source)
-            .fetch_one(&app.pool)
-            .await
-            .map_err(|error| ApiError::database("source.alias.lookup", error))?;
-        if existing != alias {
-            return Err(ApiError::new(StatusCode::CONFLICT, "source_alias_mismatch"));
-        }
-    }
-    Ok(Json(json!({"alias": alias})))
-}
-
-#[derive(Default, Deserialize)]
-struct InventoryQuery {
-    cursor: Option<String>,
-    limit: Option<u16>,
-}
-
-#[derive(FromRow)]
-struct InventoryRow {
-    session_id: String,
-    revision: i64,
-    deleted: bool,
-}
-
-fn cursor(source: Uuid, after: &str) -> String {
-    let mut bytes = Vec::with_capacity(17 + after.len());
-    bytes.push(1);
-    bytes.extend_from_slice(source.as_bytes());
-    bytes.extend_from_slice(after.as_bytes());
-    URL_SAFE_NO_PAD.encode(bytes)
-}
-
-fn read_cursor(source: Uuid, cursor: &str) -> Result<String, ApiError> {
-    if cursor.len() > 1024 {
-        return Err(ApiError::malformed());
-    }
-    let bytes = URL_SAFE_NO_PAD
-        .decode(cursor)
-        .map_err(|_| ApiError::malformed())?;
-    if bytes.len() < 18 || bytes[0] != 1 || &bytes[1..17] != source.as_bytes() {
-        return Err(ApiError::malformed());
-    }
-    let after = String::from_utf8(bytes[17..].to_vec()).map_err(|_| ApiError::malformed())?;
-    if !snapshot::valid_id(&after) {
-        return Err(ApiError::malformed());
-    }
-    Ok(after)
-}
-
-async fn inventory(
-    State(app): State<App>,
-    headers: HeaderMap,
-    query: Result<Query<InventoryQuery>, QueryRejection>,
-) -> Result<Json<serde_json::Value>, ApiError> {
-    let source = auth::authenticate(&app.pool, &headers).await?;
-    let Query(query) = query.map_err(|_| ApiError::malformed())?;
-    let limit = query.limit.unwrap_or(200);
-    if !(1..=500).contains(&limit) {
-        return Err(ApiError::malformed());
-    }
-    let after = query
-        .cursor
-        .as_deref()
-        .map(|value| read_cursor(source, value))
-        .transpose()?
-        .unwrap_or_default();
-    let mut rows: Vec<InventoryRow> = sqlx::query_as(
-        "SELECT session_id, revision, deleted_at IS NOT NULL AS deleted FROM sessions \
-         WHERE source_id = $1 AND session_id > $2 ORDER BY session_id LIMIT $3",
-    )
-    .bind(source)
-    .bind(after)
-    .bind(i64::from(limit) + 1)
-    .fetch_all(&app.pool)
-    .await
-    .map_err(|error| ApiError::database("inventory.fetch", error))?;
-    let next_cursor = if rows.len() > usize::from(limit) {
-        rows.pop();
-        rows.last().map(|row| cursor(source, &row.session_id))
+async fn privacy(request: Request, next: Next) -> Response {
+    let mut response = if trusted_request(&request) {
+        next.run(request).await
     } else {
-        None
+        ApiError::new(StatusCode::FORBIDDEN, "forbidden_origin").into_response()
     };
-    let sessions: Vec<_> = rows
-        .into_iter()
-        .map(|row| {
-            json!({"session_id": row.session_id, "revision": row.revision.to_string(), "deleted": row.deleted})
-        })
-        .collect();
-    Ok(Json(
-        json!({"sessions": sessions, "next_cursor": next_cursor}),
-    ))
+    // Artifact content sets its own framing and content policy.
+    let headers = response.headers_mut();
+    for (name, value) in [
+        ("cache-control", "no-store"),
+        ("referrer-policy", "no-referrer"),
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("cross-origin-resource-policy", "same-origin"),
+        ("strict-transport-security", "max-age=31536000"),
+        (
+            "content-security-policy",
+            "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src * data: blob:; font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'; frame-src 'self'",
+        ),
+    ] {
+        headers
+            .entry(name)
+            .or_insert(HeaderValue::from_static(value));
+    }
+    response
 }
 
-async fn upload(
-    State(app): State<App>,
-    id: Result<Path<String>, PathRejection>,
-    request: Request,
-) -> Result<Response, ApiError> {
-    let headers = request.headers();
-    let source = auth::authenticate(&app.pool, headers).await?;
-    let Path(id) = id.map_err(|_| ApiError::malformed())?;
-    let permit = app
-        .uploads
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "busy"))?;
-    let content_type = headers
-        .get("content-type")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or_default();
-    if !content_type
-        .split(';')
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .eq_ignore_ascii_case("application/json")
-    {
-        return Err(ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_content_type",
-        ));
+/// The API serves only the reader's own pages. TLS terminates before this
+/// service, so an Origin is compared with the Host by authority, not scheme.
+fn trusted_request(request: &Request) -> bool {
+    let path = request.uri().path();
+    if path != "/api" && !path.starts_with("/api/") {
+        return true;
     }
-    if headers.get_all("content-encoding").iter().any(|value| {
+    let headers = request.headers();
+    if headers.get_all("sec-fetch-site").iter().any(|value| {
         !value
             .to_str()
-            .is_ok_and(|encoding| encoding.trim().eq_ignore_ascii_case("identity"))
+            .is_ok_and(|value| matches!(value, "same-origin" | "none"))
     }) {
-        return Err(ApiError::new(
-            StatusCode::UNSUPPORTED_MEDIA_TYPE,
-            "unsupported_content_encoding",
-        ));
+        return false;
     }
-    if headers
-        .get("content-length")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse::<u64>().ok())
-        .is_some_and(|length| length > MAX_BODY as u64)
-    {
-        return Err(ApiError::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "payload_too_large",
-        ));
+    let mut origins = headers.get_all("origin").iter().peekable();
+    if origins.peek().is_none() {
+        return true;
     }
-    let body = tokio::time::timeout(
-        Duration::from_secs(30),
-        to_bytes(request.into_body(), MAX_BODY),
-    )
-    .await
-    .map_err(|_| ApiError::new(StatusCode::BAD_REQUEST, "request_timeout"))?
-    .map_err(|error| {
-        use std::error::Error;
-        if error
-            .source()
-            .is_some_and(|source| source.is::<http_body_util::LengthLimitError>())
-        {
-            ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
-        } else {
-            ApiError::malformed()
-        }
-    })?;
-    let session_id = id.clone();
-    let (_permit, prepared) = tokio::task::spawn_blocking(move || {
-        (permit, snapshot::Snapshot::parse(&body, &session_id))
+    let mut hosts = headers.get_all("host").iter();
+    let (Some(host), None) = (hosts.next(), hosts.next()) else {
+        return false;
+    };
+    origins.all(|origin| {
+        origin
+            .to_str()
+            .ok()
+            .and_then(|origin| origin.split_once("://"))
+            .is_some_and(|(scheme, authority)| {
+                matches!(scheme, "http" | "https") && authority.as_bytes() == host.as_bytes()
+            })
     })
-    .await
-    .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "unavailable"))?;
-    let accepted = snapshot::accept(&app.pool, source, &id, prepared?).await?;
-    Ok((
-        if accepted.created {
-            StatusCode::CREATED
-        } else {
-            StatusCode::OK
-        },
-        Json(json!({"revision": accepted.revision.to_string(), "changed": accepted.changed})),
-    )
-        .into_response())
 }

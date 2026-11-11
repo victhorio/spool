@@ -2,11 +2,24 @@
 //! native session ID, qualified as `alias/ID` (or `source-UUID/ID`) only when
 //! another source archives the same ID.
 
-use axum::http::StatusCode;
-use sqlx::{Postgres, QueryBuilder};
+use sqlx::{FromRow, PgExecutor, Postgres, QueryBuilder, postgres::PgRow};
 use uuid::Uuid;
 
-use crate::{error::ApiError, snapshot::valid_id};
+use crate::error::ApiError;
+
+/// A native session ID, as OpenCode assigns it.
+pub(crate) fn valid_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 512 && !id.contains('\0')
+}
+
+/// A source alias, such as `work-m5`; the database enforces the same rule.
+pub(crate) fn valid_alias(alias: &str) -> bool {
+    (1..=32).contains(&alias.len())
+        && alias.as_bytes()[0].is_ascii_lowercase()
+        && alias
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
 
 pub(crate) struct Reference<'a> {
     qualifier: Option<Qualifier<'a>>,
@@ -16,6 +29,16 @@ pub(crate) struct Reference<'a> {
 enum Qualifier<'a> {
     Source(Uuid),
     Alias(&'a str),
+}
+
+/// Archived sessions that were not purged, as `s`, with their source as `sources`.
+pub(crate) const LIVE_SESSIONS: &str =
+    " FROM sessions s JOIN sources ON sources.id = s.source_id WHERE s.deleted_at IS NULL";
+
+/// A row for one session, which says which session it is.
+pub(crate) trait Named {
+    /// The session's source, the source's alias, and the session's native ID.
+    fn name(&self) -> (Uuid, Option<&str>, &str);
 }
 
 impl<'a> Reference<'a> {
@@ -32,28 +55,61 @@ impl<'a> Reference<'a> {
             Some(source) if source.len() == 36 => Some(Qualifier::Source(
                 source.parse().map_err(|_| ApiError::malformed())?,
             )),
-            Some(alias)
-                if alias.len() <= 32
-                    && alias.starts_with(|c: char| c.is_ascii_lowercase())
-                    && alias
-                        .bytes()
-                        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-') =>
-            {
-                Some(Qualifier::Alias(alias))
-            }
+            Some(alias) if valid_alias(alias) => Some(Qualifier::Alias(alias)),
             Some(_) => return Err(ApiError::malformed()),
         };
         Ok(Self { qualifier, id })
     }
 
-    /// Restricts a query over `sessions s JOIN sources` to the referenced sessions.
-    pub fn filter(&self, sql: &mut QueryBuilder<'a, Postgres>) {
-        sql.push(" AND s.session_id = ").push_bind(self.id);
+    /// The session `id` from `source`, such as one a cursor names.
+    pub fn exact(source: Uuid, id: &'a str) -> Result<Self, ApiError> {
+        if !valid_id(id) {
+            return Err(ApiError::malformed());
+        }
+        Ok(Self {
+            qualifier: Some(Qualifier::Source(source)),
+            id,
+        })
+    }
+
+    /// The one live session this reference names, as `columns` selects it from
+    /// [`LIVE_SESSIONS`]. Several matches return their qualified references.
+    pub async fn resolve<T>(
+        &self,
+        columns: &str,
+        executor: impl PgExecutor<'_>,
+    ) -> Result<T, ApiError>
+    where
+        T: for<'r> FromRow<'r, PgRow> + Named + Send + Unpin,
+    {
+        let mut sql = QueryBuilder::<Postgres>::new(columns);
+        sql.push(LIVE_SESSIONS)
+            .push(" AND s.session_id = ")
+            .push_bind(self.id);
         match self.qualifier {
             Some(Qualifier::Source(source)) => sql.push(" AND s.source_id = ").push_bind(source),
             Some(Qualifier::Alias(alias)) => sql.push(" AND sources.alias = ").push_bind(alias),
-            None => sql,
+            None => &mut sql,
         };
+        // One row more than the candidates listed shows whether there are more.
+        sql.push(" ORDER BY s.source_id LIMIT 11");
+        let mut rows: Vec<T> = sql
+            .build_query_as()
+            .fetch_all(executor)
+            .await
+            .map_err(ApiError::database("session.resolve"))?;
+        if rows.len() > 1 {
+            let candidates = rows
+                .iter()
+                .take(10)
+                .map(|row| {
+                    let (source, alias, session) = row.name();
+                    format(source, alias, session, true)
+                })
+                .collect();
+            return Err(ApiError::ambiguous_session(candidates, rows.len() > 10));
+        }
+        rows.pop().ok_or_else(ApiError::not_found)
     }
 }
 
@@ -96,25 +152,4 @@ pub(crate) fn format(source: Uuid, alias: Option<&str>, session: &str, shared: b
         (true, Some(alias)) => format!("{alias}/{session}"),
         (true, None) => format!("{source}/{session}"),
     }
-}
-
-/// The one session a reference names, from at most 11 matching rows ordered by
-/// source; several matches return their qualified references instead.
-pub(crate) fn one<T>(
-    mut rows: Vec<T>,
-    identity: impl Fn(&T) -> (Uuid, Option<&str>, &str),
-) -> Result<T, ApiError> {
-    if rows.len() > 1 {
-        let candidates = rows
-            .iter()
-            .take(10)
-            .map(|row| {
-                let (source, alias, session) = identity(row);
-                format(source, alias, session, true)
-            })
-            .collect();
-        return Err(ApiError::ambiguous_session(candidates, rows.len() > 10));
-    }
-    rows.pop()
-        .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "not_found"))
 }

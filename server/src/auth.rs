@@ -21,7 +21,27 @@ pub(crate) fn issue(source: Uuid) -> (String, Vec<u8>) {
     )
 }
 
-pub(crate) async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> Result<Uuid, ApiError> {
+/// The machine a request came from, set by [`require`].
+#[derive(Clone, Copy)]
+pub(crate) struct Source(pub Uuid);
+
+/// Machine routes require a source token before anything else is read. Any
+/// valid token may read the whole archive.
+pub(crate) async fn require(
+    State(pool): State<PgPool>,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    match authenticate(&pool, request.headers()).await {
+        Ok(source) => {
+            request.extensions_mut().insert(Source(source));
+            next.run(request).await
+        }
+        Err(error) => error.into_response(),
+    }
+}
+
+async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> Result<Uuid, ApiError> {
     let unauthorized = || ApiError::new(StatusCode::UNAUTHORIZED, "unauthorized");
     let mut authorization = headers.get_all("authorization").iter();
     let value = authorization
@@ -56,7 +76,7 @@ pub(crate) async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> Result<U
             .bind(source)
             .fetch_optional(pool)
             .await
-            .map_err(|error| ApiError::database("auth.lookup", error))?;
+            .map_err(ApiError::database("auth.lookup"))?;
     let actual = Sha256::digest(&secret);
     if !expected
         .as_deref()
@@ -68,14 +88,6 @@ pub(crate) async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> Result<U
         .bind(source)
         .execute(pool)
         .await
-        .map_err(|error| ApiError::database("auth.touch", error))?;
+        .map_err(ApiError::database("auth.touch"))?;
     Ok(source)
-}
-
-/// Any valid source token may read the whole archive.
-pub(crate) async fn require(State(pool): State<PgPool>, request: Request, next: Next) -> Response {
-    match authenticate(&pool, request.headers()).await {
-        Ok(_) => next.run(request).await,
-        Err(error) => error.into_response(),
-    }
 }

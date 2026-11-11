@@ -72,18 +72,11 @@ const previous: Entry[] = []
 for (const entry of plugins) if (await spool(entry)) previous.push(entry)
 const configured = previous.find((item) => typeof item === "object")
 const kept: Record<string, unknown> = typeof configured === "object" ? { ...configured.options } : {}
-delete kept.readerUrl // Retired: retrieval uses url.
-delete kept.sweepIntervalMs // Retired: capture is event-driven.
 const options: Record<string, unknown> = {
   ...kept,
   ...(flags.url ? { url: flags.url } : {}),
   ...(flags["token-file"] ? { tokenFile: flags["token-file"] } : {}),
   ...(flags["source-alias"] ? { sourceAlias: flags["source-alias"] } : {}),
-}
-// Plugins installed from a checkout key checkpoints by url; the new plugin moves them
-// only if it first loads with the same url. Changing both at once recaptures everything.
-if (flags.url && typeof kept.url === "string" && flags.url !== kept.url && !previous.some(gitSpec)) {
-  fail("this installation predates checkpoint migration: install without --url, let OpenCode reload, then rerun with --url")
 }
 if (typeof options.url !== "string") fail("no Spool url configured; pass --url")
 const url = URL.parse(options.url)
