@@ -2,7 +2,7 @@ import { expect, test, type Page } from "@playwright/test"
 import path from "node:path"
 import { deviceLogin } from "../../scripts/device-login"
 
-const artifacts = path.resolve(import.meta.dirname, "../../.amp/in/artifacts")
+const artifacts = path.resolve(import.meta.dirname, "../../.local/web-artifacts")
 const server = process.env.SPOOL_WEB_URL!
 
 // The installer's own login loop, polling quickly; the owner types the code it shows.

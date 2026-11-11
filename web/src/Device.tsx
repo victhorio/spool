@@ -67,7 +67,6 @@ export function Device() {
       : { kind: "login", login: current, message: current.status === "pending" ? problem(result) : undefined })
   }
 
-  // Looks up a code from the link once.
   function submit(event: FormEvent) {
     event.preventDefault()
     if (code.trim()) void look(code)

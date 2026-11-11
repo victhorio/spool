@@ -6,7 +6,7 @@ if (!process.env.SPOOL_WEB_URL || !process.env.SPOOL_WEB_FIXTURES || !process.en
 export default defineConfig({
   testDir: "./tests",
   testMatch: "*.spec.ts",
-  outputDir: "../.amp/in/artifacts/web-test-results",
+  outputDir: "../.local/web-artifacts/test-results",
   fullyParallel: false,
   workers: 1,
   retries: 0,

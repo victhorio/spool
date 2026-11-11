@@ -1734,7 +1734,7 @@ async fn artifacts(client: &Client, url: &str, pool: &PgPool) {
         "malformed_request",
     );
 
-    // The reader lists and shows artifacts; content is served isolated.
+    // The reader lists and shows artifacts; only the reader may frame their content.
     let listed = get(client, &format!("{url}/api/artifacts?q=basalt")).await;
     assert_eq!(ids(&listed), [plan_id.as_str()]);
     let shown = get(client, &format!("{url}/api/artifacts/{plan_id}")).await;

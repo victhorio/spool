@@ -2,7 +2,7 @@ import { expect, test, type APIRequestContext } from "@playwright/test"
 import path from "node:path"
 
 const sources: Record<string, { source_id: string; token: string }> = JSON.parse(process.env.SPOOL_WEB_FIXTURES!)
-const screenshots = path.resolve(import.meta.dirname, "../../.amp/in/artifacts")
+const screenshots = path.resolve(import.meta.dirname, "../../.local/web-artifacts")
 const origin = new URL(process.env.SPOOL_WEB_URL!).origin
 // 1×1 transparent PNG.
 const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==", "base64")

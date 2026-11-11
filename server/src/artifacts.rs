@@ -715,7 +715,7 @@ struct Body {
     binary_content: Option<Vec<u8>>,
 }
 
-/// The raw content, isolated in an opaque origin.
+/// The raw content, as its media type, for the reader to show or embed.
 async fn content(State(pool): State<PgPool>, Path(id): Path<String>) -> Result<Response, ApiError> {
     let id = artifact_id(id)?;
     let body: Body = sqlx::query_as(

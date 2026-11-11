@@ -267,7 +267,7 @@ async fn source_alias_assignment(h: &Harness) {
         "assignment must only affect the authenticated source"
     );
 
-    // Authentication touches last_seen_at; a repeat must not also write the alias column.
+    // Repeating an assigned alias must not write the alias column again.
     sqlx::raw_sql(
         "CREATE FUNCTION reject_alias_rewrite() RETURNS trigger LANGUAGE plpgsql AS $$ \
          BEGIN RAISE EXCEPTION 'alias must not be rewritten'; END; $$; \

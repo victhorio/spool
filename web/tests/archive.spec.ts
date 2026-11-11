@@ -5,7 +5,7 @@ import { envelope, fixtures } from "./fixtures"
 const sources: Record<string, { source_id: string; token: string }> = JSON.parse(
   process.env.SPOOL_WEB_FIXTURES!,
 )
-const artifacts = path.resolve(import.meta.dirname, "../../.amp/in/artifacts")
+const artifacts = path.resolve(import.meta.dirname, "../../.local/web-artifacts")
 const selection = (source: string, session: string) =>
   `/sessions/${sources[source]!.source_id}/${session}`
 

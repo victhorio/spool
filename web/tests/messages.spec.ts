@@ -5,7 +5,7 @@ const sources: Record<string, { source_id: string; token: string }> = JSON.parse
   process.env.SPOOL_WEB_FIXTURES!,
 )
 const server = process.env.SPOOL_WEB_URL!
-const artifacts = path.resolve(import.meta.dirname, "../../.amp/in/artifacts")
+const artifacts = path.resolve(import.meta.dirname, "../../.local/web-artifacts")
 
 interface Delivery {
   id: string

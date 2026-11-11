@@ -1,8 +1,19 @@
-# Public deployment
+# Deployment
 
-Production is one Railway service, `spool`, built from `server/Dockerfile`, with
-the Railway PostgreSQL service. It is served at `https://spool.example.com`
-through Cloudflare. The service runs migrations at startup.
+Production is one Railway service, `spool`, with Railway PostgreSQL, served at
+`https://spool.example.com` through Cloudflare. Railway builds
+`server/Dockerfile` from GitHub `main` on every push. The service applies
+migrations at startup, then serves on `PORT` (default 8080); Railway checks
+`/healthz` at the origin, where it needs no credentials. It needs
+`DATABASE_URL`, and `ACCESS_ISSUER` and `ACCESS_AUD` for the reader; without
+those two it serves only the machine API.
+
+Message polls wait in the server process, so it must run as a single instance.
+Operator commands run the same binary with direct database access.
+
+Spool keeps sessions after they are deleted locally, so it may hold their only
+copy. Railway backs up the PostgreSQL volume daily, kept 6 days, and weekly,
+kept 27 days. Purged content therefore stays in backups for up to 27 days.
 
 ## Cloudflare and Railway
 
@@ -14,8 +25,6 @@ through Cloudflare. The service runs migrations at startup.
 - The service has no generated `*.up.railway.app` domain. Railway's edge still
   serves `spool.example.com` to anyone who connects to it directly, bypassing
   Cloudflare, which is why the server verifies Access assertions itself.
-- Railway's health check calls `/healthz` at the origin, where it needs no
-  credentials. Through Cloudflare it is behind Access like other non-`/v1` paths.
 
 ## Cloudflare Access
 
@@ -28,13 +37,9 @@ method (an OAuth app whose callback is
 | Spool | `spool.example.com` | Allow the owner's email; GitHub only; 30-day session |
 | Spool machine API | `spool.example.com/v1` | Bypass for everyone; Spool tokens protect it |
 
-Set these variables on the Railway service:
-
-- `ACCESS_ISSUER=https://example.cloudflareaccess.com`
-- `ACCESS_AUD` = the Spool application's AUD tag (Access → Applications → Spool →
-  Overview). The machine API application's tag is not used.
-
-Without both variables, the service runs ingestion and the agent API only.
+On the Railway service, `ACCESS_ISSUER` is `https://example.cloudflareaccess.com`
+and `ACCESS_AUD` is the Spool application's AUD tag (Access → Applications →
+Spool → Overview), not the machine API application's.
 
 ## Verify after deploying
 
