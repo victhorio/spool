@@ -15,7 +15,8 @@ body {
 }
 button,
 input,
-select {
+select,
+textarea {
   font: inherit;
   color: inherit;
 }
@@ -165,6 +166,7 @@ kbd {
 .session-row {
   display: flex;
   align-items: center;
+  gap: 8px;
   width: 100%;
   min-height: 32px;
   padding: 6px 9px;
@@ -644,6 +646,65 @@ pre code {
   height: 1px;
   width: 35px;
   background: var(--line);
+}
+.running-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-left: auto;
+  border-radius: 50%;
+  background: var(--accent);
+}
+.session-status {
+  color: var(--accent);
+  font-weight: 500;
+}
+.composer {
+  position: sticky;
+  bottom: 0;
+  margin-top: 28px;
+  padding: 12px 0 4px;
+  background: #f8faf6;
+}
+.composer textarea {
+  display: block;
+  width: 100%;
+  resize: vertical;
+  min-height: 64px;
+  max-height: 40vh;
+  border: 1px solid #d5ddcf;
+  border-radius: 9px;
+  background: #fff;
+  padding: 10px 12px;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.composer textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.composer-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 8px;
+}
+.composer-note {
+  flex: 1;
+  margin: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+.composer-note.problem {
+  color: #9a3b2f;
+}
+.composer button {
+  font-size: 12px;
+  font-weight: 500;
+  color: #fff;
+  background: var(--accent);
+  padding: 8px 16px;
+  border-radius: 7px;
 }
 .sidebar-backdrop {
   display: none;

@@ -3,6 +3,7 @@ pub mod admin;
 mod artifacts;
 mod auth;
 mod browse;
+mod delivery;
 mod device;
 mod error;
 mod http;

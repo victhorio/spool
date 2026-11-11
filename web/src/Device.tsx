@@ -111,7 +111,8 @@ export function Device() {
             {state.login.status === "pending" ? (
               <>
                 <p className="device-note">
-                  It will upload this machine’s sessions and its agents can read the whole archive.
+                  It will upload this machine’s sessions, and its agents can read the whole archive and message sessions on
+                  your other machines.
                 </p>
                 <div className="device-actions">
                   <button className="device-approve" disabled={state.busy} onClick={() => void decide(state.login, "approve")}>

@@ -14,7 +14,7 @@ const integer = (maximum?: number, defaultValue?: number) => ({ type: "integer",
 const definitions = {
   find: {
     name: "find_sessions",
-    description: "Find archived sessions across all machines and repositories. Returns each session's reference, link, title and a matching snippet.",
+    description: "Find archived sessions across all machines and repositories. Returns each session's reference, link, title, `status` (`running`, `idle` or `offline`, for its machine) and a matching snippet.",
     properties: { query, repository: { ...string, description: "Limit to one repository, as a normalized host/path such as `github.com/owner/repo`." }, include_tools: boolean, limit: integer(50, 10) },
     required: [],
   },
@@ -36,7 +36,7 @@ function validRevision(value: unknown): value is string {
   return typeof value === "string" && /^[0-9]{1,19}$/.test(value) && BigInt(value) > 0 && BigInt(value) <= 9223372036854775807n
 }
 
-function validSession(value: unknown, qualifiedOnly = false): value is string {
+export function validSession(value: unknown, qualifiedOnly = false): value is string {
   if (typeof value !== "string" || !value || value.includes("\0")) return false
   const slash = value.indexOf("/")
   if (slash < 0) return !qualifiedOnly && Buffer.byteLength(value) <= 512
@@ -73,16 +73,22 @@ export function validInput(route: Route, value: unknown): value is Record<string
 type Archive = Pick<Config, "url" | "token">
 type Json = Record<string, any>
 
+/** The session reference and message index in a reader link, if `value` is one. */
+export function readerLink(archive: Archive, value: unknown): { session: string; index?: number } | undefined {
+  if (typeof value !== "string" || !value.startsWith(`${archive.url}/sessions/`)) return
+  try {
+    const url = new URL(value)
+    const index = /^#([1-9][0-9]*)$/.exec(url.hash)?.[1]
+    return { session: url.pathname.slice("/sessions/".length).split("/").map(decodeURIComponent).join("/"), ...(index ? { index: Number(index) } : {}) }
+  } catch { return }
+}
+
 /** A reader link given as `session` becomes its reference; for reads, its `#index` is the default message. */
 function fromLink(archive: Archive, route: Route, input: unknown): unknown {
   const value = input as Json
-  if (typeof value?.session !== "string" || !value.session.startsWith(`${archive.url}/sessions/`)) return input
-  try {
-    const url = new URL(value.session)
-    const session = url.pathname.slice("/sessions/".length).split("/").map(decodeURIComponent).join("/")
-    const index = /^#([1-9][0-9]*)$/.exec(url.hash)?.[1]
-    return { ...value, session, ...(route === "read" && index && !("start" in value) && !("end" in value) ? { start: Number(index) } : {}) }
-  } catch { return input }
+  const link = readerLink(archive, value?.session)
+  if (!link) return input
+  return { ...value, session: link.session, ...(route === "read" && link.index && !("start" in value) && !("end" in value) ? { start: link.index } : {}) }
 }
 
 export async function requestReader(archive: Archive, route: Route, given: unknown, signal?: AbortSignal): Promise<string> {
@@ -128,7 +134,7 @@ export async function requestReader(archive: Archive, route: Route, given: unkno
 export async function registerRetrieval(ctx: Plugin.Context, archive: Archive): Promise<void> {
   const skill = await bundledSkill("searching-sessions")
   await ctx.tool.transform((tools) => {
-    tools.namespace({ name: "spool", description: "Search past coding-agent sessions, and publish documents for the user to read." })
+    tools.namespace({ name: "spool", description: "Search coding-agent sessions, message sessions on machines that are online, and publish documents for the user to read." })
     for (const route of ["find", "search", "read"] as const) {
       const definition = definitions[route]
       tools.add({

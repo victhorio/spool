@@ -726,9 +726,10 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
     for row in rows {
         assert_eq!(
             row.as_object().unwrap().len(),
-            7,
+            8,
             "only contract fields; no token_hash or message payloads"
         );
+        assert_eq!(row["status"], "offline", "these sources never poll");
         let session_id = row["session_id"].as_str().unwrap();
         assert_eq!(
             row["session"],
@@ -787,7 +788,7 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
     assert!(text.contains(RAW_INFO));
     assert!(text.contains(RAW_MESSAGE));
     let first: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(first.as_object().unwrap().len(), 9);
+    assert_eq!(first.as_object().unwrap().len(), 10);
     assert_eq!(first["session"], format!("{A}/same"));
     assert_eq!(first["info"]["unknown"]["text"], "x\0y");
     assert_eq!(first["messages"][0]["parts"][0]["text"], "a\0b");

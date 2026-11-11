@@ -10,7 +10,7 @@ import { agentQuery, evidence, longText, needle, seed, location, type Host } fro
 import { RetrievalRuntime } from "./retrieval-fixture/runtime"
 
 interface Source { source_id: string; token: string; alias?: string }
-interface FoundSession { session: string; repository: string | null; revision: string; captured_at: string; message_count: number; match: { index: number; excerpt: string; read_cursor: string } | null }
+interface FoundSession { session: string; repository: string | null; revision: string; captured_at: string; message_count: number; status: string; match: { index: number; excerpt: string; read_cursor: string } | null }
 interface Found { sessions: FoundSession[]; coverage: { total_sessions: number; indexed_sessions: number; unassigned_repository_sessions: number }; next_cursor: string | null }
 interface Searched { session: string; revision: string; matches: { index: number; excerpt: string; read_cursor: string }[]; next_cursor: string | null }
 interface Read { session: string; url: string; revision: string; messages: { index: number; id: string; role: string; text: string; offset_bytes: number; total_bytes: number; url: string }[]; next_cursor: string | null }
@@ -230,7 +230,7 @@ try {
   const agentsBefore = await first.client.agent.list({ location: location(first) })
   const general = JSON.parse((await agent(first, "general")).text)
   const explore = JSON.parse((await agent(first, "explore")).text)
-  for (const name of [...Object.values(names), ...artifactNames]) {
+  for (const name of [...Object.values(names), ...artifactNames, "spool_send_message"]) {
     assert.ok(general.tools.includes(name), `${name} missing from General`)
     assert.ok(!explore.tools.includes(name), `${name} unexpectedly granted to Explore`)
   }
@@ -262,6 +262,34 @@ try {
   const listedArtifacts = await execute<{ artifacts: { id: string }[] }>(second, "spool_find_artifacts", { query: "QUARTZ cache" })
   assert.deepEqual(listedArtifacts.artifacts.map((item) => item.id), [published.artifact.id])
   pass("real plugin publishes a file as an artifact with its session, edits it on the server, rejects a stale revision, and another source updates, reads and finds it")
+
+  // A session on the first machine, using the fixture model so delivery runs a real agent loop without a live model.
+  const target = await first.client.session.create({ title: "Synthetic message target", agent: "general",
+    model: { providerID: "spool-retrieval-fixture", id: "availability" }, location: location(first) })
+  await first.client.session.prompt({ sessionID: target.id, text: "Start the synthetic message target." })
+  await first.client.experimental.session.wait({ sessionID: target.id })
+  await converged(first, primary, target.id)
+  const online = await waitFor("both machines polling", async () => {
+    const found = await tool<Found>(second, "find", { query: "Synthetic message target" })
+    return found.sessions[0]?.status === "idle" ? found.sessions[0] : undefined
+  }, 30_000, runtime.signal)
+  assert.equal(online.session, target.id)
+  const sent = await execute<{ sent: boolean; status: string }>(second, "spool_send_message", { session: online.session, text: "Summarize the archive for me." })
+  assert.deepEqual(sent, { sent: true, status: "idle" })
+  const expectedPrompt = `<spool>This message was sent to you from an agent in ${sharedID} in ${secondary.alias} through spool_send_message.</spool>\n\nSummarize the archive for me.`
+  const answered = await waitFor("message delivered and answered", async () => {
+    const result = await first.client.experimental.session.export({ sessionID: target.id })
+    const index = result.messages.findIndex((message) => message.type === "user" && message.text === expectedPrompt)
+    const reply = index >= 0 ? result.messages.slice(index + 1).find((message) => message.type === "assistant") : undefined
+    return reply?.type === "assistant" && reply.finish === "stop" ? result : undefined
+  }, 30_000, runtime.signal)
+  assert.equal(answered.messages.filter((message) => message.type === "user").length, 2, "the message must be prompted once")
+  await waitFor("delivery acknowledged", async () => await runtime.sql("SELECT count(*) FROM deliveries") === "0" ? true : undefined, 30_000, runtime.signal)
+  const unknown = await execute<{ error: { code: string } }>(second, "spool_send_message", { session: "ses_absent", text: "Hello" })
+  assert.equal(unknown.error.code, "not_found")
+  const ambiguousSend = await execute<{ error: { code: string; candidates: string[] } }>(second, "spool_send_message", { session: sharedID, text: "Hello" })
+  assert.deepEqual(ambiguousSend.error.candidates.sort(), [reference, secondReference].sort())
+  pass("an agent on one machine messages an idle session on another: delivered once as a prompt naming its sender, answered by a real agent loop and acknowledged")
 
   await first.client.debug.location.evict({ location: { directory: worktree } })
   await git(main, "worktree", "remove", "--force", worktree)
@@ -299,6 +327,8 @@ try {
   assert.ok(response.ok, `Legacy fixture upload failed: ${response.status} ${await response.text()}`)
   await error("read", { session: `${legacy.source_id}/${legacyID}` }, "not_indexed")
   await error("search", { session: `${legacy.source_id}/${legacyID}`, query: needle }, "not_indexed")
+  const offline = await execute<{ error: { code: string } }>(first, "spool_send_message", { session: `${legacy.source_id}/${legacyID}`, text: "Hello" })
+  assert.equal(offline.error.code, "session_offline", "a machine that does not poll is offline")
   const coverage = (await tool<Found>(first, "find", {})).coverage
   assert.equal(coverage.total_sessions - coverage.indexed_sessions, 1)
   pass("legacy raw archives report not_indexed and incomplete coverage without fabricating evidence")

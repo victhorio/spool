@@ -20,8 +20,8 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::{
-    access::Access, artifacts, auth, browse, device, error::ApiError, retrieval, snapshot,
-    snapshot::MAX_BODY,
+    access::Access, artifacts, auth, browse, delivery, device, error::ApiError, retrieval,
+    snapshot, snapshot::MAX_BODY,
 };
 
 #[derive(Clone)]
@@ -40,6 +40,7 @@ pub struct Reader {
 /// `read` serves archive reads and should be a read-only pool.
 pub fn router(pool: PgPool, read: PgPool, reader: Option<Reader>) -> anyhow::Result<Router> {
     let not_found = || async { ApiError::new(StatusCode::NOT_FOUND, "not_found") };
+    let mailbox = delivery::Mailbox::new(pool.clone());
     let agent = retrieval::routes()
         .with_state(read.clone())
         .route_layer(middleware::from_fn_with_state(pool.clone(), auth::require));
@@ -59,11 +60,16 @@ pub fn router(pool: PgPool, read: PgPool, reader: Option<Reader>) -> anyhow::Res
         })
         .merge(agent)
         .merge(device::machine_routes().with_state(pool.clone()))
-        .merge(artifacts::machine_routes(pool.clone(), read.clone()));
+        .merge(artifacts::machine_routes(pool.clone(), read.clone()))
+        .merge(delivery::machine_routes(mailbox.clone()));
     Ok(match reader {
-        Some(reader) => {
-            app.fallback_service(browse::router(pool, read, reader.access, reader.assets)?)
-        }
+        Some(reader) => app.fallback_service(browse::router(
+            pool,
+            read,
+            mailbox,
+            reader.access,
+            reader.assets,
+        )?),
         None => app.fallback(not_found),
     })
 }

@@ -4,6 +4,7 @@ import { ClientError, OpenCode, isSessionNotFoundError, type OpenCodeClient } fr
 import { Service } from "@opencode/client/service"
 import type { Plugin } from "@opencode/plugin"
 import type { Config } from "./config"
+import { deliver } from "./messages"
 import { projectRetrieval } from "./projection"
 import { resolveRepository } from "./repository"
 
@@ -62,7 +63,7 @@ export class Collector {
   private readonly activity = new Map<string, number>()
   private readonly revisions = new Map<string, string | null>()
   private readonly purged = new Set<string>()
-  private client?: OpenCodeClient
+  private client?: Promise<OpenCodeClient>
   private running?: Promise<void>
   private wake?: () => void
   private reconcileRequested = true
@@ -84,7 +85,10 @@ export class Collector {
     this.members.set(ctx, { events, task: this.subscribe(ctx, events.signal) })
     this.reconcileRequested = true
     this.wake?.()
-    this.running ??= this.run()
+    this.running ??= Promise.all([
+      this.run(),
+      deliver(this.config, () => this.connect(), this.lifetime.signal, (event, fields) => this.log(event, fields), errorCode),
+    ]).then(() => {})
     return async () => {
       events.abort()
       const member = this.members.get(ctx)!
@@ -141,9 +145,15 @@ export class Collector {
     return AbortSignal.any([this.lifetime.signal, AbortSignal.timeout(30_000)])
   }
 
-  private async connect(): Promise<OpenCodeClient> {
-    if (this.client) return this.client
-    this.operation = "opencode_connect"
+  /** Capture and delivery share one connection, opened once even when both ask at the same time. */
+  private connect(): Promise<OpenCodeClient> {
+    return this.client ??= this.open().catch((error) => {
+      this.client = undefined
+      throw error
+    })
+  }
+
+  private async open(): Promise<OpenCodeClient> {
     const endpoint = this.config.opencodeUrl
       ? { url: this.config.opencodeUrl, auth: { type: "basic" as const, username: "opencode", password: this.config.opencodePassword! } }
       : await Service.discover({ file: this.config.serviceFile })
@@ -151,7 +161,6 @@ export class Collector {
     const client = OpenCode.make({ baseUrl: endpoint.url, headers: Service.headers(endpoint) })
     const info = await client.server.info({ signal: this.signal() })
     if (info.pid !== process.pid) throw new SyncError("opencode_host_mismatch", false)
-    this.client = client
     this.log("connected", { source_id: this.config.sourceID })
     return client
   }
@@ -177,6 +186,7 @@ export class Collector {
   }
 
   private async reconcile(full: boolean): Promise<void> {
+    this.operation = "opencode_connect"
     const client = await this.connect()
     const remote = new Map<string, { revision: string; deleted: boolean }>()
     let cursor: string | null = null
@@ -238,6 +248,7 @@ export class Collector {
     const saved = await this.checkpoint(ctx, id)
     const base = this.revisions.has(id) ? this.revisions.get(id)! : saved?.revision ?? null
     const known = saved?.revision === base && saved.projectionVersion === 2 ? saved.hashes : undefined
+    this.operation = "opencode_connect"
     const client = await this.connect()
     this.operation = "session_export"
     const transcript = await client.experimental.session.export({ sessionID: id }, { signal: this.signal() })

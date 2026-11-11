@@ -13,6 +13,8 @@ export interface Session {
   revision: string
   info: Document
   received_at: string
+  /** Whether its machine is online, and if so whether the session is running there. */
+  status: "running" | "idle" | "offline"
 }
 
 export interface SessionPage {
@@ -80,6 +82,29 @@ async function get(path: string, signal?: AbortSignal): Promise<Response> {
     throw new ArchiveError(response.status, body?.error)
   }
   return response
+}
+
+/** Sends a message to a session on a machine that is online, as a prompt from the owner. */
+export async function sendMessage(session: string, text: string): Promise<void> {
+  const response = await fetch("/api/messages", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ session, text }),
+    cache: "no-store",
+    redirect: "manual",
+  })
+  if (response.type === "opaqueredirect") {
+    window.location.reload()
+    return new Promise<void>(() => {})
+  }
+  if (!response.ok) {
+    const body = await response.json().catch(() => undefined)
+    throw new Error(
+      body?.error?.code === "session_offline"
+        ? "This session’s machine is offline."
+        : "Couldn’t send the message. Please try again.",
+    )
+  }
 }
 
 export async function read<T>(path: string, signal?: AbortSignal): Promise<T> {

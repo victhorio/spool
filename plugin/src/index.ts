@@ -2,6 +2,7 @@ import { Plugin } from "@opencode/plugin"
 import { Collector } from "./collector"
 import { registerArtifacts } from "./artifacts"
 import { configure } from "./config"
+import { registerMessages } from "./messages"
 import { registerRetrieval } from "./retrieval"
 
 // OpenCode re-evaluates local modules per Location; the registry must outlive imports.
@@ -23,6 +24,7 @@ export default Plugin.define({
     }
     await registerRetrieval(ctx, config)
     await registerArtifacts(ctx, config)
+    await registerMessages(ctx, config)
     const active = collector
     await ctx.command.transform((editor) => editor.add({
       name: "spool-repair",

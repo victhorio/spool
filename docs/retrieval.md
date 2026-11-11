@@ -1,7 +1,7 @@
 # Agent retrieval
 
 The plugin always registers three read-only OpenCode tools for archived sessions;
-its [artifact](artifacts.md) tools are separate. They search the central archive across machines; they do not call a model or
+its [artifact](artifacts.md) and [message](messages.md) tools are separate. They search the central archive across machines; they do not call a model or
 create their own reader agent. The bundled `searching-sessions` skill explains
 navigation, optional delegation, evidence and archive limitations.
 
@@ -112,8 +112,9 @@ binary data are not searched. Trigram indexes support text search without
 extracting fields from opaque archival JSON in PostgreSQL.
 
 Find returns `{sessions, coverage, next_cursor}`. Each session contains
-`session`, `url`, `title`, `repository`, `revision`, `captured_at`, `message_count`, and
-`match` (null or `{index, url, excerpt, read_cursor}`). One passage is returned per
+`session`, `url`, `title`, `repository`, `revision`, `captured_at`, `message_count`,
+[`status`](messages.md#online-and-running) and `match` (null or
+`{index, url, excerpt, read_cursor}`). One passage is returned per
 session. Title/ID matches precede content-only matches; ties and unqueried
 listings are recent-first. Default limit is 10, maximum 50. Titles are bounded
 to 512 characters in results; the original metadata remains in the archive.

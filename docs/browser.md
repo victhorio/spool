@@ -8,8 +8,10 @@ as the agent tools, such as `/sessions/ses_…`. `#12` opens message 12, the too
 the reader loads pages until that message is shown, then scrolls to and highlights it. Each
 message's number, shown on hover, links to it. A reference that names several sources lists them
 to choose from; a longer reference than needed is replaced by the shortest one once loaded.
-Earlier `/#source={uuid}&session={id}` links still open. It does not send prompts or
-change the archive. Reasoning, tools, system context and compaction summaries are
+Earlier `/#source={uuid}&session={id}` links still open. It does not change the
+archive. A session whose machine is online shows a box to
+[message](messages.md) it, and running sessions are marked in the sidebar.
+Reasoning, tools, system context and compaction summaries are
 expandable. Attachments are labeled, not fetched from external storage. Archived
 HTML is inert, remote images are not loaded, and Markdown is sanitized.
 
@@ -56,9 +58,9 @@ Never expose PostgreSQL outside loopback for this.
 ## Device approval
 
 `/device` approves or denies a machine's [device login](ingestion.md#device-login).
-It is the only reader page that writes, using the service's normal database pool
-rather than the read-only one. Its API is subject to the same Access and
-same-origin checks as the rest of `/api/*`.
+It and sending messages are the only reader writes, using the service's normal
+database pool rather than the read-only one. Their APIs are subject to the same
+Access and same-origin checks as the rest of `/api/*`.
 
 ## Read API
 
@@ -67,8 +69,9 @@ escaped NUL. Responses contain no source credential fields. Purged sessions are
 omitted/return 404; revoked sources' already archived sessions remain readable.
 
 - `GET /api/sessions?limit=50&cursor=…&q=…&source={source_uuid}` returns
-  `{sessions: [{source_id, source_label, session_id, session, revision, info, received_at}], sources: [{source_id, source_label}], next_cursor}`.
-  `session` is the session's reference.
+  `{sessions: [{source_id, source_label, session_id, session, revision, info, received_at, status}], sources: [{source_id, source_label}], next_cursor}`.
+  `session` is the session's reference, and `status` is `running`, `idle` or
+  `offline` (see [messages](messages.md#online-and-running)).
   The limit is 1–500. Inventory is ordered by exported update time in milliseconds,
   falling back to receipt time for missing/invalid dates; source UUID/session ID
   break ties descending. The optional `q` is a case-insensitive literal substring
@@ -83,7 +86,7 @@ omitted/return 404; revoked sources' already archived sessions remain readable.
   downloading the whole inventory into the browser, but still scans source
   metadata per request; there is no indexed search projection in this version.
 - `GET /api/sessions/{reference}?limit=100&cursor=…` returns
-  `{source_id, source_label, session_id, session, revision, info, received_at, messages, next_cursor}`.
+  `{source_id, source_label, session_id, session, revision, info, received_at, status, messages, next_cursor}`.
   A reference that matches several sources returns 409 `ambiguous_session` with
   `candidates`, as for the agent tools. The limit is 1–200. Messages follow archived order. Each page reads metadata and
   messages in one repeatable-read transaction. Cursors bind source, session,

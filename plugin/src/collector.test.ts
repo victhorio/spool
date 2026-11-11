@@ -17,6 +17,15 @@ interface Upload {
   retrieval: Retrieval
 }
 
+/** Answers the delivery loop: nothing is running, and polls wait until the collector stops. */
+function delivery(request: Request): Promise<Response> | undefined {
+  const pathname = new URL(request.url).pathname
+  if (pathname === "/api/session/active") return Promise.resolve(Response.json({ data: {} }))
+  if (pathname === "/v1/poll") return new Promise((resolve) => {
+    request.signal.addEventListener("abort", () => resolve(Response.json({ messages: [] })), { once: true })
+  })
+}
+
 test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on demand and retains deleted-worktree identity", async (projectionVersion) => {
   const root = await mkdtemp(path.join(tmpdir(), "spool-capture-"))
   const directory = path.join(root, "historical-session")
@@ -44,6 +53,8 @@ test.each([undefined, 1, 2])("collector upgrades checkpoint %s, captures on dema
   let onList: (() => Promise<void>) | undefined
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
     const pathname = new URL(request.url).pathname
+    const delivered = delivery(request)
+    if (delivered) return delivered
     if (pathname === "/v1/sync/source") {
       registrations++
       expect(request.method).toBe("PUT")
@@ -249,6 +260,8 @@ test.each([429, 503])("source registration retries HTTP %s once and stays regist
   let connections = 0
   let lists = 0
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const delivered = delivery(request)
+    if (delivered) return delivered
     switch (new URL(request.url).pathname) {
       case "/v1/sync/source":
         registrations++
@@ -278,7 +291,8 @@ test.each([429, 503])("source registration retries HTTP %s once and stays regist
     while (!lists && Date.now() < deadline) await Bun.sleep(10)
     expect(lists).toBe(1)
     expect(registrations).toBe(2)
-    expect(connections).toBe(2)
+    // Delivery connects at once; each capture failure drops the connection.
+    expect(connections).toBe(3)
     detach = collector.attach({ ...ctx })
     collector.repair()
     await Bun.sleep(100)
@@ -296,6 +310,9 @@ test.each([429, 503])("source registration retries HTTP %s once and stays regist
 test.each(["source_alias_conflict", "source_alias_mismatch", "unknown_conflict", null])("source assignment %s disables capture until reload without a revision-conflict retry", async (code) => {
   let calls = 0
   const server = Bun.serve({ hostname: "127.0.0.1", port: 0, async fetch(request) {
+    const delivered = delivery(request)
+    if (delivered) return delivered
+    if (new URL(request.url).pathname === "/api/info") return Response.json({ pid: process.pid })
     calls++
     expect(new URL(request.url).pathname).toBe("/v1/sync/source")
     return Response.json(code === null ? null : { error: { code, detail: "SECRET_ERROR_BODY" } }, { status: 409 })
@@ -315,7 +332,7 @@ test.each(["source_alias_conflict", "source_alias_mismatch", "unknown_conflict",
     collector.repair()
     await Bun.sleep(600)
     expect(calls).toBe(1)
-    expect(logs.mock.calls.map(([line]) => JSON.parse(String(line)))).toEqual([
+    expect(logs.mock.calls.map(([line]) => JSON.parse(String(line))).filter((line) => line.event !== "connected")).toEqual([
       { component: "spool", event: "sync_failed", operation: "source_register", code: code === "source_alias_conflict" || code === "source_alias_mismatch" ? code : "http_409" },
       { component: "spool", event: "disabled_until_reload" },
     ])

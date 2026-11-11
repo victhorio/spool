@@ -12,6 +12,7 @@ use sqlx::{FromRow, PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
 
 use crate::{
+    delivery,
     error::ApiError,
     reference::{self, Reference},
     snapshot::valid_id,
@@ -195,6 +196,7 @@ struct FindRow {
     message_count: i64,
     score: i32,
     shared: bool,
+    status: String,
     hit_position: Option<i32>,
     hit_offset: Option<i64>,
     hit_excerpt: Option<String>,
@@ -279,7 +281,9 @@ async fn find(
          (SELECT count(*) FROM messages m WHERE m.source_id = s.source_id \
           AND m.session_id = s.session_id) AS message_count, ",
         reference::shared!("s"),
-        " AS shared, "
+        " AS shared, ",
+        delivery::status!(),
+        " AS status, "
     ));
     if terms.is_empty() {
         sql.push("0");
@@ -366,7 +370,7 @@ async fn find(
         response["sessions"].as_array_mut().unwrap().push(json!({
             "session": session, "url": reader.link(&session, None), "title": row.title.chars().take(512).collect::<String>(),
             "repository": row.repository, "revision": row.revision.to_string(),
-            "captured_at": row.captured_at, "message_count": row.message_count, "match": matched,
+            "captured_at": row.captured_at, "message_count": row.message_count, "status": row.status, "match": matched,
         }));
         // Reserve the continuation before accepting an entry: it can be several KiB.
         response["next_cursor"] = json!(cursor);

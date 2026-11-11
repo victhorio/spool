@@ -23,17 +23,21 @@ use uuid::Uuid;
 
 use crate::{
     access::{self, Access},
-    artifacts, device,
+    artifacts,
+    delivery::{self, Mailbox},
+    device,
     error::ApiError,
     reference::{self, Reference},
     snapshot::valid_id,
 };
 
 /// The web reader and its API. Every request requires a Cloudflare Access assertion.
-/// Archive reads use `read`, which should be a read-only pool; device approval writes.
+/// Archive reads use `read`, which should be a read-only pool; device approval
+/// and sending messages write.
 pub(crate) fn router(
     write: PgPool,
     read: PgPool,
+    mailbox: Mailbox,
     access: Access,
     assets: impl AsRef<FilePath>,
 ) -> anyhow::Result<Router> {
@@ -54,6 +58,7 @@ pub(crate) fn router(
         .merge(artifacts::reader_routes())
         .with_state(read)
         .merge(device::reader_routes().with_state(write))
+        .merge(delivery::reader_routes().with_state(mailbox))
         .route_service("/", ServeFile::new(index.clone()))
         .route_service("/sessions/{*reference}", ServeFile::new(index.clone()))
         .route_service("/device", ServeFile::new(index.clone()))
@@ -187,13 +192,15 @@ struct SessionRow {
     revision: i64,
     info: String,
     received_at: DateTime<Utc>,
+    status: String,
 }
 
 const SESSION_COLUMNS: &str = concat!(
     "SELECT s.source_id, sources.label AS source_label, sources.alias, s.session_id, ",
     reference::shared!("s"),
-    " AS shared, s.revision, s.info::text AS info, s.received_at \
-     FROM sessions s JOIN sources ON sources.id = s.source_id WHERE s.deleted_at IS NULL"
+    " AS shared, s.revision, s.info::text AS info, s.received_at, ",
+    delivery::status!(),
+    " AS status FROM sessions s JOIN sources ON sources.id = s.source_id WHERE s.deleted_at IS NULL"
 );
 
 #[derive(Serialize)]
@@ -205,6 +212,7 @@ struct Session {
     revision: String,
     info: Box<RawValue>,
     received_at: DateTime<Utc>,
+    status: String,
 }
 
 fn raw(value: String) -> Result<Box<RawValue>, ApiError> {
@@ -227,6 +235,7 @@ impl SessionRow {
             revision: self.revision.to_string(),
             info: raw(self.info)?,
             received_at: self.received_at,
+            status: self.status,
         })
     }
 }

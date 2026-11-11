@@ -1,8 +1,9 @@
 # Spool
 
 Spool archives coding-agent sessions across machines, starting with OpenCode.
-It captures sessions and provides a read-only browser and agent search/read tools,
-and holds artifacts: documents agents publish for people to read.
+It captures sessions and provides a browser and agent search/read tools, holds
+artifacts (documents agents publish for people to read), and delivers messages
+from the owner and agents to sessions on machines that are online.
 Built-in reader-agent orchestration and session resume remain out of scope.
 
 ## Architecture
@@ -24,6 +25,7 @@ verifies itself.
 [Browser](docs/browser.md) covers the reader's access boundary and API.
 [Retrieval](docs/retrieval.md) covers repository identity and agent tools.
 [Artifacts](docs/artifacts.md) covers documents agents publish for people to read.
+[Messages](docs/messages.md) covers messaging sessions on online machines.
 [Development](docs/development.md) covers the isolated local stack in `dev/`.
 OpenCode's public exports, not its private SQLite schema, define what Spool
 archives. SDK dependencies are pinned for reproducible builds, not to restrict

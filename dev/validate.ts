@@ -32,12 +32,14 @@ let loseAcknowledgement: { session: string; mutate: () => void } | undefined
 const proxy = Bun.serve({
   hostname: "127.0.0.1", port: 0,
   async fetch(request) {
-    const body = request.method === "POST" ? await request.text() : undefined
-    const envelope: Envelope | undefined = body ? JSON.parse(body) : undefined
-    if (envelope && intercept) await intercept(envelope, request)
     const url = new URL(request.url)
+    const body = request.method === "POST" ? await request.text() : undefined
+    const envelope: Envelope | undefined = body && url.pathname.endsWith("/snapshot") ? JSON.parse(body) : undefined
+    if (envelope && intercept) await intercept(envelope, request)
+    // Message polls wait up to 25 seconds for a message.
+    const timeout = url.pathname === "/v1/poll" ? 60_000 : 5_000
     const response = await fetch(`${stack.url}${url.pathname}${url.search}`, {
-      method: request.method, headers: request.headers, body, redirect: "error", signal: AbortSignal.timeout(5_000),
+      method: request.method, headers: request.headers, body, redirect: "error", signal: AbortSignal.timeout(timeout),
     }).catch(() => Response.json({ error: { code: "injected_outage" } }, { status: 503 }))
     if (envelope) records.push({ session: envelope.info.id, metadata: envelope.info.metadata, supplied: envelope.upsert_messages.length, status: response.status })
     if (envelope?.info.id === loseAcknowledgement?.session && loseAcknowledgement && response.ok) {

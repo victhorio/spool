@@ -5,7 +5,8 @@ const { Model, Plugin, Provider } = await import(sdk) as typeof import("../../pl
 
 export const providerID = "spool-retrieval-fixture"
 export const toolNames = ["spool_find_sessions", "spool_search_messages", "spool_read_messages",
-  "spool_create_artifact", "spool_update_artifact", "spool_edit_artifact", "spool_find_artifacts", "spool_read_artifact"]
+  "spool_create_artifact", "spool_update_artifact", "spool_edit_artifact", "spool_find_artifacts", "spool_read_artifact",
+  "spool_send_message"]
 
 export default Plugin.define({
   id: "spool-retrieval-fixture",

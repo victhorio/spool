@@ -1,9 +1,10 @@
-import { memo, useCallback, useEffect, useRef, useState } from "react"
+import { memo, useCallback, useEffect, useRef, useState, type FormEvent } from "react"
 import {
   ArchiveError,
   linkedSession,
   object,
   read,
+  sendMessage,
   sessionHref,
   sessionKey,
   sessionPath,
@@ -85,6 +86,8 @@ function linkedIndex(): number | null {
   const index = /^#([1-9][0-9]{0,5})$/.exec(window.location.hash)?.[1]
   return index ? Number(index) : null
 }
+
+const statusLabels = { running: "Running", idle: "Online" } as const
 
 function errorText(error: unknown): string {
   return error instanceof ArchiveError
@@ -331,6 +334,9 @@ export function App() {
               title={`${title(session)}\n${session.source_label}`}
             >
               <span className="session-title">{title(session)}</span>
+              {session.status === "running" && (
+                <span className="running-dot" role="img" aria-label="Running" />
+              )}
             </a>
           ))}
           {nextCursor && !listError && (
@@ -373,7 +379,6 @@ export function App() {
           <span className="topbar-title">
             {selected ? title(selected) : selection ? "Session" : "Archive"}
           </span>
-          <span className="read-only">Read only</span>
         </header>
         {selection ? (
           <Conversation key={selection} reference={selection} onOpen={open} />
@@ -506,6 +511,12 @@ const Conversation = memo(function Conversation({
                     timeStyle: "short",
                   }).format(updated(transcript))}
                 </time>
+                {transcript.status !== "offline" && (
+                  <>
+                    <span aria-hidden="true">·</span>
+                    <span className="session-status">{statusLabels[transcript.status]}</span>
+                  </>
+                )}
               </div>
             </div>
             <div className="messages">
@@ -565,7 +576,62 @@ const Conversation = memo(function Conversation({
             <span />
           </div>
         )}
+        {transcript && transcript.status !== "offline" && (
+          <Composer session={sessionKey(transcript)} />
+        )}
       </div>
     </div>
   )
 })
+
+/** Sends the owner's message to a session whose machine is online. */
+function Composer({ session }: { session: string }) {
+  const [text, setText] = useState("")
+  const [busy, setBusy] = useState(false)
+  const [outcome, setOutcome] = useState<{ error: boolean; text: string }>()
+
+  async function submit(event: FormEvent) {
+    event.preventDefault()
+    if (!text.trim() || busy) return
+    setBusy(true)
+    setOutcome(undefined)
+    try {
+      await sendMessage(session, text)
+      setText("")
+      setOutcome({ error: false, text: "Sent. Reload to see it once the session saves it." })
+    } catch (error) {
+      setOutcome({ error: true, text: error instanceof Error ? error.message : String(error) })
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <form className="composer" onSubmit={submit}>
+      <textarea
+        aria-label="Message"
+        placeholder="Message this session…"
+        rows={3}
+        value={text}
+        onChange={(event) => setText(event.target.value)}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" && (event.metaKey || event.ctrlKey)) {
+            event.preventDefault()
+            event.currentTarget.form?.requestSubmit()
+          }
+        }}
+      />
+      <div className="composer-row">
+        <p
+          className={outcome?.error ? "composer-note problem" : "composer-note"}
+          role={outcome?.error ? "alert" : "status"}
+        >
+          {outcome?.text}
+        </p>
+        <button type="submit" disabled={busy || !text.trim()}>
+          Send
+        </button>
+      </div>
+    </form>
+  )
+}
