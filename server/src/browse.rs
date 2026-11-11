@@ -158,7 +158,8 @@ enum Cursor {
         source_id: Uuid,
         session_id: String,
     },
-    MessagesV1 {
+    /// Messages before `position`: the reader opens a session at its end.
+    MessagesV2 {
         source_id: Uuid,
         session_id: String,
         revision: i64,
@@ -391,7 +392,9 @@ struct Transcript {
     #[serde(flatten)]
     session: Session,
     messages: Vec<Box<RawValue>>,
-    next_cursor: Option<String>,
+    /// The first message's index, as the agent tools number messages.
+    first_index: i32,
+    earlier_cursor: Option<String>,
 }
 
 #[derive(FromRow)]
@@ -410,13 +413,13 @@ async fn session(
     let Query(page) = query.map_err(|_| ApiError::malformed())?;
     let (page, limit) = page_limit(page, 100, 200)?;
     let cursor = page.cursor.as_deref().map(Cursor::decode).transpose()?;
-    let after = match cursor {
-        Some(Cursor::MessagesV1 {
+    let before = match cursor {
+        Some(Cursor::MessagesV2 {
             source_id,
             session_id,
             revision,
             position,
-        }) if revision > 0 && position >= 0 => Some((source_id, session_id, revision, position)),
+        }) if revision > 0 && position > 0 => Some((source_id, session_id, revision, position)),
         None => None,
         _ => return Err(ApiError::malformed()),
     };
@@ -439,7 +442,7 @@ async fn session(
     let row = reference::one(rows, |row| {
         (row.source_id, row.alias.as_deref(), row.session_id.as_str())
     })?;
-    let position = match after {
+    let position = match before {
         Some((source, session, revision, position))
             if source == row.source_id && session == row.session_id =>
         {
@@ -449,12 +452,12 @@ async fn session(
             position
         }
         Some(_) => return Err(ApiError::malformed()),
-        None => -1,
+        None => i32::MAX,
     };
     let (source, session) = (row.source_id, row.session_id.clone());
     let mut rows: Vec<MessageRow> = sqlx::query_as(
         "SELECT position, payload::text AS payload FROM messages \
-         WHERE source_id = $1 AND session_id = $2 AND position > $3 ORDER BY position LIMIT $4",
+         WHERE source_id = $1 AND session_id = $2 AND position < $3 ORDER BY position DESC LIMIT $4",
     )
     .bind(source)
     .bind(&session)
@@ -466,10 +469,10 @@ async fn session(
     tx.commit()
         .await
         .map_err(|error| ApiError::database("browse.commit", error))?;
-    let next_cursor = if rows.len() > usize::from(limit) {
+    let earlier_cursor = if rows.len() > usize::from(limit) {
         rows.pop();
         rows.last().map(|message| {
-            Cursor::MessagesV1 {
+            Cursor::MessagesV2 {
                 source_id: source,
                 session_id: session,
                 revision: row.revision,
@@ -480,12 +483,15 @@ async fn session(
     } else {
         None
     };
+    rows.reverse();
+    let first_index = rows.first().map_or(1, |message| message.position + 1);
     Ok(Json(Transcript {
         session: row.response()?,
         messages: rows
             .into_iter()
             .map(|row| raw(row.payload))
             .collect::<Result<_, _>>()?,
-        next_cursor,
+        first_index,
+        earlier_cursor,
     }))
 }

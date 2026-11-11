@@ -776,6 +776,7 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
         paged, *rows,
         "keyset must cross source boundaries without dropping colliding session IDs"
     );
+    // Pages run backward from the end; archived order is m3, m1, m2.
     let path = format!("{url}/api/sessions/{A}/same");
     let response = client
         .get(&path)
@@ -786,30 +787,47 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
     privacy(&response);
     let text = response.text().await.unwrap();
     assert!(text.contains(RAW_INFO));
+    let latest: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(latest.as_object().unwrap().len(), 11);
+    assert_eq!(latest["session"], format!("{A}/same"));
+    assert_eq!(latest["info"]["unknown"]["text"], "x\0y");
+    assert_eq!(
+        (&latest["messages"][0]["id"], &latest["first_index"]),
+        (&json!("m2"), &json!(3))
+    );
+    let cursor = latest["earlier_cursor"].as_str().unwrap();
+    let second = get(client, &format!("{path}?limit=1&cursor={cursor}")).await;
+    assert_eq!(
+        (&second["messages"][0]["id"], &second["first_index"]),
+        (&json!("m1"), &json!(2))
+    );
+    let text = client
+        .get(&path)
+        .query(&[
+            ("limit", "1"),
+            ("cursor", second["earlier_cursor"].as_str().unwrap()),
+        ])
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
     assert!(text.contains(RAW_MESSAGE));
     let first: Value = serde_json::from_str(&text).unwrap();
-    assert_eq!(first.as_object().unwrap().len(), 10);
-    assert_eq!(first["session"], format!("{A}/same"));
-    assert_eq!(first["info"]["unknown"]["text"], "x\0y");
+    assert_eq!(
+        (&first["messages"][0]["id"], &first["first_index"]),
+        (&json!("m3"), &json!(1))
+    );
     assert_eq!(first["messages"][0]["parts"][0]["text"], "a\0b");
-    assert_eq!(first["messages"][0]["id"], "m3");
-    let cursor = first["next_cursor"].as_str().unwrap();
-    let second = get(client, &format!("{path}?limit=1&cursor={cursor}")).await;
-    assert_eq!(second["messages"][0]["id"], "m1");
-    let last = get(
-        client,
-        &format!(
-            "{path}?limit=1&cursor={}",
-            second["next_cursor"].as_str().unwrap()
-        ),
-    )
-    .await;
-    assert_eq!(last["messages"][0]["id"], "m2");
-    assert_eq!(last["next_cursor"], Value::Null);
+    assert_eq!(first["earlier_cursor"], Value::Null);
+    let all = get(client, &path).await;
+    assert_eq!(all["messages"].as_array().unwrap().len(), 3);
+    assert_eq!(all["messages"][0]["id"], "m3");
     let other = get(client, &format!("{url}/api/sessions/{B}/same")).await;
     assert_eq!(other["info"]["source"], B.to_string());
     assert_eq!(other["messages"], json!([]));
-    assert_eq!(other["next_cursor"], Value::Null);
+    assert_eq!(other["earlier_cursor"], Value::Null);
     let bare = get(client, &format!("{url}/api/sessions/aaa")).await;
     assert_eq!(
         (&bare["source_id"], &bare["session"]),
@@ -914,7 +932,7 @@ async fn api_contract(client: &Client, url: &str, pool: &PgPool) {
         )
         .await;
     }
-    let forged = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"kind":"messages_v1","source_id":A,"session_id":"same","revision":1,"position":-1})).unwrap());
+    let forged = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&json!({"kind":"messages_v2","source_id":A,"session_id":"same","revision":1,"position":0})).unwrap());
     error(
         client
             .get(&path)
@@ -1025,17 +1043,18 @@ async fn limits(client: &Client, url: &str, pool: &PgPool) {
     let path = format!("{url}/api/sessions/{B}/limit_000");
     let messages = get(client, &path).await;
     assert_eq!(messages["messages"].as_array().unwrap().len(), 100);
-    assert!(messages["next_cursor"].is_string());
+    assert!(messages["earlier_cursor"].is_string());
     let max = get(client, &format!("{path}?limit=200")).await;
     assert_eq!(max["messages"].as_array().unwrap().len(), 200);
-    let tail = get(
+    assert_eq!(max["messages"][0]["id"], "m5");
+    let head = get(
         client,
-        &format!("{path}?cursor={}", max["next_cursor"].as_str().unwrap()),
+        &format!("{path}?cursor={}", max["earlier_cursor"].as_str().unwrap()),
     )
     .await;
-    assert_eq!(tail["messages"].as_array().unwrap().len(), 5);
-    assert_eq!(tail["messages"][0]["id"], "m200");
-    assert_eq!(tail["next_cursor"], Value::Null);
+    assert_eq!(head["messages"].as_array().unwrap().len(), 5);
+    assert_eq!(head["messages"][4]["id"], "m4");
+    assert_eq!(head["earlier_cursor"], Value::Null);
 }
 
 async fn device_login(client: &Client, url: &str, pool: &PgPool) {

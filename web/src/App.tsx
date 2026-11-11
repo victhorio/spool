@@ -1,4 +1,12 @@
-import { memo, useCallback, useEffect, useRef, useState, type FormEvent } from "react"
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type FormEvent,
+} from "react"
 import {
   ArchiveError,
   linkedSession,
@@ -421,6 +429,8 @@ const Conversation = memo(function Conversation({
   const reached = useRef<number | null>(null)
   const lifetime = useRef<AbortController | null>(null)
   const column = useRef<HTMLDivElement>(null)
+  // Distance from the bottom to keep while earlier messages are added above; null opens at the end.
+  const fromBottom = useRef<number | null>(null)
   const path = sessionPath(reference)
 
   useEffect(() => {
@@ -432,7 +442,7 @@ const Conversation = memo(function Conversation({
     setStale(false)
     setLoading(true)
     reached.current = null
-    column.current?.scrollTo(0, 0)
+    fromBottom.current = 0
     void read<Transcript>(path, controller.signal)
       .then((transcript) => {
         setTranscript(transcript)
@@ -455,29 +465,39 @@ const Conversation = memo(function Conversation({
     return () => window.removeEventListener("hashchange", onHashChange)
   }, [])
 
-  // A linked message may be past the first page: keep loading until it is shown.
+  // A session opens at its end; adding earlier messages keeps what is in view in place.
+  useLayoutEffect(() => {
+    const element = column.current
+    if (!transcript || !element || fromBottom.current === null) return
+    element.scrollTop = element.scrollHeight - element.clientHeight - fromBottom.current
+    fromBottom.current = null
+  }, [transcript])
+
+  // A linked message may be before the latest page: keep loading until it is shown.
   useEffect(() => {
     if (!transcript || !target || reached.current === target) return
-    if (target > transcript.messages.length) {
-      if (transcript.next_cursor && !error) void more()
+    if (target < transcript.first_index) {
+      if (transcript.earlier_cursor && !error) void earlier()
       return
     }
     reached.current = target
     document.getElementById(String(target))?.scrollIntoView({ block: "start" })
   }, [transcript, target, error])
 
-  async function more() {
-    if (!transcript?.next_cursor || loadingMore || stale) return
+  async function earlier() {
+    if (!transcript?.earlier_cursor || loadingMore || stale) return
     setLoadingMore(true)
     setError("")
     const signal = lifetime.current!.signal
     try {
       const page = await read<Transcript>(
-        `${path}?cursor=${encodeURIComponent(transcript.next_cursor)}`,
+        `${path}?cursor=${encodeURIComponent(transcript.earlier_cursor)}`,
         signal,
       )
+      const element = column.current!
+      fromBottom.current = element.scrollHeight - element.clientHeight - element.scrollTop
       setTranscript((current) =>
-        current ? { ...page, messages: [...current.messages, ...page.messages] } : page,
+        current ? { ...page, messages: [...page.messages, ...current.messages] } : page,
       )
     } catch (error) {
       if (!signal.aborted) {
@@ -519,20 +539,6 @@ const Conversation = memo(function Conversation({
                 )}
               </div>
             </div>
-            <div className="messages">
-              {transcript.messages.map((message, index) => (
-                <Message
-                  key={message.id}
-                  index={index + 1}
-                  linked={index + 1 === target}
-                  message={message}
-                  previous={transcript.messages[index - 1]}
-                />
-              ))}
-            </div>
-            {transcript.messages.length === 0 && (
-              <p className="loading-note">No settled messages in this session yet.</p>
-            )}
           </>
         )}
         {error && (
@@ -550,7 +556,7 @@ const Conversation = memo(function Conversation({
               <button
                 className="subtle-button"
                 onClick={() => {
-                  if (transcript && !stale) void more()
+                  if (transcript && !stale) void earlier()
                   else setAttempt((attempt) => attempt + 1)
                 }}
               >
@@ -559,17 +565,33 @@ const Conversation = memo(function Conversation({
             )}
           </div>
         )}
-        {transcript?.next_cursor && !stale && !error && (
+        {transcript?.earlier_cursor && !stale && !error && (
           <button
             className="load-more subtle-button"
             disabled={loadingMore}
-            onClick={() => void more()}
+            onClick={() => void earlier()}
           >
-            {loadingMore ? "Loading…" : "Continue reading"}
-            <span aria-hidden="true">↓</span>
+            {loadingMore ? "Loading…" : "Show earlier messages"}
+            <span aria-hidden="true">↑</span>
           </button>
         )}
-        {transcript && !transcript.next_cursor && transcript.messages.length > 0 && (
+        {transcript && (
+          <div className="messages">
+            {transcript.messages.map((message, index) => (
+              <Message
+                key={message.id}
+                index={transcript.first_index + index}
+                linked={transcript.first_index + index === target}
+                message={message}
+                previous={transcript.messages[index - 1]}
+              />
+            ))}
+          </div>
+        )}
+        {transcript?.messages.length === 0 && (
+          <p className="loading-note">No settled messages in this session yet.</p>
+        )}
+        {transcript && transcript.messages.length > 0 && (
           <div className="end-mark">
             <span />
             <SpoolMark />

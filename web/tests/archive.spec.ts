@@ -47,18 +47,19 @@ test("links name sessions by ID, open a linked message and accept older link for
   page,
 }) => {
   // A qualified link to a unique ID is shortened once loaded.
-  await page.goto(`${selection("laptop", "ses_paged")}#150`)
-  await expect(page).toHaveURL("/sessions/ses_paged#150")
-  const linked = page.locator('[id="150"]')
+  // Message 50 is before the latest page, so the reader loads back to it.
+  await page.goto(`${selection("laptop", "ses_paged")}#50`)
+  await expect(page).toHaveURL("/sessions/ses_paged#50")
+  const linked = page.locator('[id="50"]')
   await expect(linked).toBeInViewport()
-  await expect(linked).toContainText("Conversation entry 149")
+  await expect(linked).toContainText("Conversation entry 049")
   await expect(linked).toContainClass("linked")
   await expect(page.locator("[data-message-id]")).toHaveCount(200)
   await page.screenshot({ path: path.join(artifacts, "spool-linked-message.png") })
-  await page.locator('[id="148"]').hover()
-  await page.getByRole("link", { name: "Link to message 148" }).click()
-  await expect(page).toHaveURL("/sessions/ses_paged#148")
-  await expect(page.locator('[id="148"]')).toContainClass("linked")
+  await page.locator('[id="48"]').hover()
+  await page.getByRole("link", { name: "Link to message 48" }).click()
+  await expect(page).toHaveURL("/sessions/ses_paged#48")
+  await expect(page.locator('[id="48"]')).toContainClass("linked")
   await expect(linked).not.toContainClass("linked")
 
   // An ID that several sources archived asks which one.
@@ -110,21 +111,23 @@ test("read Markdown, reasoning, tool inputs/results and compaction with the keyb
   await page.screenshot({ path: path.join(artifacts, "spool-expanded.png") })
 })
 
-test("paginate messages in order without losing or duplicating the tail", async ({ page }) => {
+test("open at the end and page back in order, keeping the view in place", async ({ page }) => {
   await page.goto(selection("laptop", "ses_paged"))
-  await expect(page.getByText("Conversation entry 000", { exact: true })).toBeVisible()
+  await expect(page.getByText("Conversation entry 202", { exact: true })).toBeInViewport()
   await expect(page.locator("[data-message-id]")).toHaveCount(100)
-  await page.getByRole("button", { name: "Continue reading" }).click()
+  await page.getByRole("button", { name: "Show earlier messages" }).click()
   await expect(page.locator("[data-message-id]")).toHaveCount(200)
-  await page.getByRole("button", { name: "Continue reading" }).click()
+  await expect(page.getByText("Conversation entry 103", { exact: true })).toBeInViewport()
+  await page.getByRole("button", { name: "Show earlier messages" }).click()
   await expect(page.locator("[data-message-id]")).toHaveCount(203)
+  await expect(page.locator('[id="1"]')).toContainText("Conversation entry 000")
   expect(await page.locator(".user-text").allTextContents()).toEqual(
     Array.from(
       { length: 203 },
       (_, index) => `Conversation entry ${String(index).padStart(3, "0")}`,
     ),
   )
-  await expect(page.getByRole("button", { name: "Continue reading" })).toHaveCount(0)
+  await expect(page.getByRole("button", { name: "Show earlier messages" })).toHaveCount(0)
 })
 
 test("an archive mutation between pages asks for a reload instead of mixing revisions", async ({
@@ -144,7 +147,7 @@ test("an archive mutation between pages asks for a reload instead of mixing revi
     },
   )
   expect(response.status()).toBe(200)
-  await page.getByRole("button", { name: "Continue reading" }).click()
+  await page.getByRole("button", { name: "Show earlier messages" }).click()
   await expect(page.getByRole("alert")).toContainText("This session changed.")
   await expect(page.locator("[data-message-id]")).toHaveCount(100)
   await page.getByRole("button", { name: "Reload session" }).click()

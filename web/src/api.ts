@@ -24,8 +24,10 @@ export interface SessionPage {
 }
 
 export interface Transcript extends Session {
+  /** The latest messages loaded so far, starting at message `first_index`. */
   messages: (Document & { id: string })[]
-  next_cursor: string | null
+  first_index: number
+  earlier_cursor: string | null
 }
 
 export class ArchiveError extends Error {

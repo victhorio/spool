@@ -4,8 +4,9 @@ The reader shows recent session titles first, with a source filter and
 title/directory/source matching across the archive. It loads 50 sessions initially;
 older sessions load only on request. ⌘K focuses search. Selecting a session opens its conversation
 at `/sessions/{reference}`, using the same [session reference](retrieval.md#session-references)
-as the agent tools, such as `/sessions/ses_…`. `#12` opens message 12, the tools' message index:
-the reader loads pages until that message is shown, then scrolls to and highlights it. Each
+as the agent tools, such as `/sessions/ses_…`. A conversation opens at its latest
+messages, and earlier ones load on request above them. `#12` opens message 12, the tools' message index:
+the reader loads earlier pages until that message is shown, then scrolls to and highlights it. Each
 message's number, shown on hover, links to it. A reference that names several sources lists them
 to choose from; a longer reference than needed is replaced by the shortest one once loaded.
 Earlier `/#source={uuid}&session={id}` links still open. It does not change the
@@ -86,14 +87,17 @@ omitted/return 404; revoked sources' already archived sessions remain readable.
   downloading the whole inventory into the browser, but still scans source
   metadata per request; there is no indexed search projection in this version.
 - `GET /api/sessions/{reference}?limit=100&cursor=…` returns
-  `{source_id, source_label, session_id, session, revision, info, received_at, status, messages, next_cursor}`.
+  `{source_id, source_label, session_id, session, revision, info, received_at, status, messages, first_index, earlier_cursor}`.
   A reference that matches several sources returns 409 `ambiguous_session` with
-  `candidates`, as for the agent tools. The limit is 1–200. Messages follow archived order. Each page reads metadata and
+  `candidates`, as for the agent tools. The limit is 1–200. Without a cursor it
+  returns the session's latest messages; `earlier_cursor` returns the page
+  before. Each page's messages follow archived order, and `first_index` is the
+  first one's message index. Each page reads metadata and
   messages in one repeatable-read transaction. Cursors bind source, session,
   revision and position; if an upload changes the revision between pages, the API
   returns 409 and the reader asks for a reload rather than mixing snapshots.
 
-Revisions are decimal strings; `next_cursor` is opaque or null. Malformed paths,
+Revisions are decimal strings; cursors are opaque or null. Malformed paths,
 limits and cursors return 400, missing sessions return 404, and database failures
 return generic 503 errors. Error bodies use `{error: {code: "…"}}`.
 
