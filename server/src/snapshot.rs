@@ -557,41 +557,33 @@ pub(crate) async fn accept(
             .await
             .map_err(ApiError::database("snapshot.project"))?;
     }
-    if !created {
-        sqlx::query(
-            "UPDATE sessions SET revision = $3, \
-             info = CASE WHEN info_hash IS DISTINCT FROM $5 THEN $4::json ELSE info END, \
-             info_hash = $5, upstream_version = $6, collector_version = $7, captured_at = $8, received_at = now() \
-             WHERE source_id = $1 AND session_id = $2",
-        )
-        .bind(source)
-        .bind(session)
-        .bind(revision)
-        .bind(envelope.info.get())
-        .bind(&snapshot.info_hash)
-        .bind(&envelope.upstream_version)
-        .bind(&envelope.collector_version)
-        .bind(envelope.captured_at)
-        .execute(&mut *tx)
-        .await.map_err(ApiError::database("snapshot.update"))?;
-    }
+    // A session is indexed only once every message has its projection.
     let retrieval = snapshot.retrieval.as_ref();
     sqlx::query(
-        "UPDATE sessions SET retrieval_title = CASE WHEN NOT EXISTS \
+        "UPDATE sessions SET revision = $3, \
+         info = CASE WHEN info_hash IS DISTINCT FROM $5 THEN $4::json ELSE info END, \
+         info_hash = $5, upstream_version = $6, collector_version = $7, captured_at = $8, received_at = now(), \
+         retrieval_title = CASE WHEN NOT EXISTS \
          (SELECT 1 FROM messages WHERE source_id = $1 AND session_id = $2 AND \
          (retrieval_role IS NULL OR retrieval_text IS NULL OR conversation_text IS NULL OR tool_text IS NULL \
          OR conversation_spans IS NULL OR tool_spans IS NULL)) \
-         THEN $3 ELSE NULL END, repository = COALESCE(NULLIF($4, ''), repository), activity = $5 \
+         THEN $9 ELSE NULL END, repository = COALESCE(NULLIF($10, ''), repository), activity = $11 \
          WHERE source_id = $1 AND session_id = $2",
     )
     .bind(source)
     .bind(session)
+    .bind(revision)
+    .bind(envelope.info.get())
+    .bind(&snapshot.info_hash)
+    .bind(&envelope.upstream_version)
+    .bind(&envelope.collector_version)
+    .bind(envelope.captured_at)
     .bind(retrieval.map(|retrieval| retrieval.title.as_str()))
     .bind(retrieval.and_then(|retrieval| retrieval.repository.as_deref()))
     .bind(retrieval.map(|retrieval| retrieval.activity as i64))
     .execute(&mut *tx)
     .await
-    .map_err(ApiError::database("snapshot.metadata"))?;
+    .map_err(ApiError::database("snapshot.update"))?;
     tx.commit()
         .await
         .map_err(ApiError::database("snapshot.commit"))?;

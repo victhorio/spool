@@ -235,13 +235,11 @@ async fn find(State(pool): State<PgPool>, request: Request) -> Result<Json<Value
     {
         return Err(ApiError::malformed());
     }
+    // Rank and page the sessions first, then look up details and evidence for
+    // only the page: a common term can match nearly every session.
     let mut sql = QueryBuilder::new(concat!(
         "WITH ranked AS (SELECT s.source_id, sources.alias, s.session_id, s.revision, \
-         s.retrieval_title AS title, s.repository, s.captured_at, s.activity, \
-         (SELECT count(*) FROM messages m WHERE m.source_id = s.source_id \
-          AND m.session_id = s.session_id) AS message_count, ",
-        reference::shared!("s"),
-        " AS shared, ",
+         s.retrieval_title AS title, s.repository, s.captured_at, s.activity, ",
         delivery::status!(),
         " AS status, "
     ));
@@ -267,17 +265,7 @@ async fn find(State(pool): State<PgPool>, request: Request) -> Result<Json<Value
         matches(&mut sql, search_column(query.include_tools), &terms);
         sql.push("))");
     }
-    sql.push(") SELECT s.*, ");
-    if terms.is_empty() {
-        sql.push("NULL::integer AS hit_position, NULL::bigint AS hit_offset, NULL::text AS hit_excerpt FROM ranked s");
-    } else {
-        sql.push("hit.position AS hit_position, hit.hit_offset, hit.hit_excerpt FROM ranked s LEFT JOIN LATERAL \
-            (SELECT m.position, evidence.hit_offset, evidence.hit_excerpt FROM messages m");
-        passage(&mut sql, &terms[0], query.include_tools);
-        sql.push(" WHERE m.source_id = s.source_id AND m.session_id = s.session_id AND ");
-        matches(&mut sql, search_column(query.include_tools), &terms);
-        sql.push(" ORDER BY m.position DESC LIMIT 1) hit ON true");
-    }
+    sql.push("), page AS (SELECT * FROM ranked s");
     if let Some(after) = after {
         sql.push(" WHERE (s.score, s.activity, s.source_id, s.session_id) < (")
             .push_bind(after.score)
@@ -289,8 +277,26 @@ async fn find(State(pool): State<PgPool>, request: Request) -> Result<Json<Value
             .push_bind(after.session)
             .push(")");
     }
-    sql.push(" ORDER BY s.score DESC, s.activity DESC, s.source_id DESC, s.session_id DESC LIMIT ")
-        .push_bind(limit as i64 + 1);
+    const ORDER: &str =
+        " ORDER BY s.score DESC, s.activity DESC, s.source_id DESC, s.session_id DESC";
+    sql.push(ORDER).push(" LIMIT ").push_bind(limit as i64 + 1);
+    sql.push(concat!(
+        ") SELECT s.*, (SELECT count(*) FROM messages m WHERE m.source_id = s.source_id \
+         AND m.session_id = s.session_id) AS message_count, ",
+        reference::shared!("s"),
+        " AS shared, "
+    ));
+    if terms.is_empty() {
+        sql.push("NULL::integer AS hit_position, NULL::bigint AS hit_offset, NULL::text AS hit_excerpt FROM page s");
+    } else {
+        sql.push("hit.position AS hit_position, hit.hit_offset, hit.hit_excerpt FROM page s LEFT JOIN LATERAL \
+            (SELECT m.position, evidence.hit_offset, evidence.hit_excerpt FROM messages m");
+        passage(&mut sql, &terms[0], query.include_tools);
+        sql.push(" WHERE m.source_id = s.source_id AND m.session_id = s.session_id AND ");
+        matches(&mut sql, search_column(query.include_tools), &terms);
+        sql.push(" ORDER BY m.position DESC LIMIT 1) hit ON true");
+    }
+    sql.push(ORDER);
     let coverage = coverage(&pool).await?;
     let mut response = json!({"sessions": [], "coverage": coverage, "next_cursor": null});
     let mut stream = sql.build_query_as::<FindRow>().fetch(&pool);

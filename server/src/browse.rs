@@ -141,27 +141,33 @@ struct Activity {
 }
 
 impl SessionRow {
-    fn overview(&self) -> (i64, String) {
+    /// The session's activity time, if its title, directory or source label
+    /// contains `search`, which is lowercase.
+    fn overview(&self, search: &str) -> Option<i64> {
         let metadata = serde_json::from_str::<Metadata<'_>>(&self.info).unwrap_or_default();
-        let activity = metadata
-            .time
-            .and_then(|time| serde_json::from_str::<Activity>(time.get()).ok())
-            .and_then(|time| time.updated)
-            .filter(|updated| updated.is_finite() && updated.abs() <= 8.64e15)
-            .map(|updated| updated as i64)
-            .unwrap_or_else(|| self.received_at.timestamp_millis());
-        let title = metadata
-            .title
-            .and_then(|title| serde_json::from_str::<String>(title.get()).ok())
-            .unwrap_or_default();
-        let directory = metadata
-            .location
-            .and_then(|location| serde_json::from_str::<Location>(location.get()).ok())
-            .and_then(|location| location.directory)
-            .unwrap_or_default();
-        (
-            activity,
-            format!("{title} {directory} {}", self.source_label).to_lowercase(),
+        if !search.is_empty() {
+            let title = metadata
+                .title
+                .and_then(|title| serde_json::from_str::<String>(title.get()).ok())
+                .unwrap_or_default();
+            let directory = metadata
+                .location
+                .and_then(|location| serde_json::from_str::<Location>(location.get()).ok())
+                .and_then(|location| location.directory)
+                .unwrap_or_default();
+            let text = format!("{title} {directory} {}", self.source_label).to_lowercase();
+            if !text.contains(search) {
+                return None;
+            }
+        }
+        Some(
+            metadata
+                .time
+                .and_then(|time| serde_json::from_str::<Activity>(time.get()).ok())
+                .and_then(|time| time.updated)
+                .filter(|updated| updated.is_finite() && updated.abs() <= 8.64e15)
+                .map(|updated| updated as i64)
+                .unwrap_or_else(|| self.received_at.timestamp_millis()),
         )
     }
 }
@@ -207,9 +213,11 @@ async fn sessions(
         .await
         .map_err(ApiError::database("browse.sessions"))?
     {
-        let (activity, text) = row.overview();
+        let Some(activity) = row.overview(&search) else {
+            continue;
+        };
         let key = (activity, row.source_id, row.session_id.clone());
-        if !text.contains(&search) || after.as_ref().is_some_and(|after| &key >= after) {
+        if after.as_ref().is_some_and(|after| &key >= after) {
             continue;
         }
         recent.insert(key, row);

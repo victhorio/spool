@@ -71,23 +71,27 @@ async fn authenticate(pool: &PgPool, headers: &HeaderMap) -> Result<Uuid, ApiErr
     if parts.next().is_some() {
         return Err(unauthorized());
     }
-    let expected: Option<Vec<u8>> =
-        sqlx::query_scalar("SELECT token_hash FROM sources WHERE id = $1 AND revoked_at IS NULL")
-            .bind(source)
-            .fetch_optional(pool)
-            .await
-            .map_err(ApiError::database("auth.lookup"))?;
+    // last_seen_at is kept to the minute, so most requests only read.
+    let expected: Option<(Vec<u8>, bool)> = sqlx::query_as(
+        "SELECT token_hash, last_seen_at IS NULL OR last_seen_at < now() - interval '1 minute' \
+         FROM sources WHERE id = $1 AND revoked_at IS NULL",
+    )
+    .bind(source)
+    .fetch_optional(pool)
+    .await
+    .map_err(ApiError::database("auth.lookup"))?;
     let actual = Sha256::digest(&secret);
-    if !expected
-        .as_deref()
-        .is_some_and(|expected| bool::from(expected.ct_eq(actual.as_slice())))
-    {
+    let Some((_, stale)) =
+        expected.filter(|(expected, _)| bool::from(expected.ct_eq(actual.as_slice())))
+    else {
         return Err(unauthorized());
+    };
+    if stale {
+        sqlx::query("UPDATE sources SET last_seen_at = now() WHERE id = $1")
+            .bind(source)
+            .execute(pool)
+            .await
+            .map_err(ApiError::database("auth.touch"))?;
     }
-    sqlx::query("UPDATE sources SET last_seen_at = now() WHERE id = $1")
-        .bind(source)
-        .execute(pool)
-        .await
-        .map_err(ApiError::database("auth.touch"))?;
     Ok(source)
 }

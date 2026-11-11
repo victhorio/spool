@@ -35,10 +35,16 @@ export async function resolveRepository(directory: unknown, remote?: string): Pr
   if (typeof directory !== "string" || !path.isAbsolute(directory) || directory.includes("\0")) return null
   try {
     if (!(await stat(directory)).isDirectory()) return null
-    const names = (await git(directory, ["remote"])).split("\n").filter(Boolean)
-    const selected = remote ?? (names.includes("origin") ? "origin" : names.length === 1 ? names[0] : undefined)
-    if (!selected || !names.includes(selected)) return null
-    const fetchURL = await git(directory, ["remote", "get-url", "--", selected])
-    return normalizeRepository(fetchURL)
+    // One process lists every remote, with its fetch URL after any insteadOf rewriting.
+    const fetchURLs = new Map<string, string | undefined>()
+    for (const line of (await git(directory, ["remote", "-v"])).split("\n")) {
+      const [name, entry] = line.split("\t", 2)
+      if (!name) continue
+      const fetchURL = entry?.endsWith(" (fetch)") ? entry.slice(0, -" (fetch)".length) : undefined
+      fetchURLs.set(name, fetchURL ?? fetchURLs.get(name))
+    }
+    const selected = remote ?? (fetchURLs.has("origin") ? "origin" : fetchURLs.size === 1 ? fetchURLs.keys().next().value : undefined)
+    const fetchURL = selected === undefined ? undefined : fetchURLs.get(selected)
+    return fetchURL === undefined ? null : normalizeRepository(fetchURL)
   } catch { return null }
 }
