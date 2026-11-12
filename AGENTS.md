@@ -32,7 +32,7 @@ allocations, and use measured workloads to guide more involved optimizations.
 
 Use synthetic sessions for fixtures. Never commit real conversations or
 credentials or use installed agent state for tests. Validation must not call live
-models. Do not add a README until preparing the project for public release.
+models.
 
 ## Docs
 
