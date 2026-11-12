@@ -276,7 +276,7 @@ try {
   assert.equal(online.session, target.id)
   const sent = await execute<{ sent: boolean; status: string }>(second, "spool_send_message", { session: online.session, text: "Summarize the archive for me." })
   assert.deepEqual(sent, { sent: true, status: "idle" })
-  const expectedPrompt = `<spool>This message was sent to you from an agent in ${sharedID} in ${secondary.alias} through spool_send_message.</spool>\n\nSummarize the archive for me.`
+  const expectedPrompt = `<spool>This message was sent to you from an agent in ${sharedID} in ${secondary.alias} through spool_send_message. It can read this session, so message it back only if it asked you to.</spool>\n\nSummarize the archive for me.`
   const answered = await waitFor("message delivered and answered", async () => {
     const result = await first.client.experimental.session.export({ sessionID: target.id })
     const index = result.messages.findIndex((message) => message.type === "user" && message.text === expectedPrompt)

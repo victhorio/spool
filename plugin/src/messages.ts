@@ -13,7 +13,7 @@ const passed = ["malformed_request", "not_found", "session_offline", "unauthoriz
 /** The prompt for a delivered message; one from another agent says where it came from. */
 export function prompt(message: Delivery): string {
   if (!message.from) return message.text
-  return `<spool>This message was sent to you from an agent in ${message.from.session} in ${message.from.source} through spool_${toolName}.</spool>\n\n${message.text}`
+  return `<spool>This message was sent to you from an agent in ${message.from.session} in ${message.from.source} through spool_${toolName}. It can read this session, so message it back only if it asked you to.</spool>\n\n${message.text}`
 }
 
 /**
@@ -85,7 +85,7 @@ export async function send(archive: Archive, input: unknown, from: string, signa
 export function messageTools(archive: Archive): Tool[] {
   return [{
     name: toolName,
-    description: "Send a message to an agent in another session. It arrives as a prompt that says it came from you, steering the agent if it is running. The session's machine must be online: find_sessions reports each session's `status`, `running`, `idle` or `offline`. The result only confirms it was sent; read the session later to see what the agent did.",
+    description: "Send a message to an agent in another session. It arrives as a prompt that says it came from you, interrupting the agent if it is running. Send one only when the user asks or that agent must act on it; it can read your session, so don't send acknowledgements, status updates or replies that ask nothing. The session's machine must be online: find_sessions reports each session's `status`, `running`, `idle` or `offline`. The result only confirms it was sent; read the session later to see what the agent did.",
     input: {
       type: "object", additionalProperties: false, required: ["session", "text"],
       properties: {
